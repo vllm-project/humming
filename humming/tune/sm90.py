@@ -66,9 +66,7 @@ class Sm90Heuristics(DeviceHeuristics):
         gemm_type: GemmType,
     ) -> bool:
         return (
-            gemm_type == GemmType.INDEXED
-            and layer_config.a_dtype.num_bits == 16
-            and not use_batch_invariant
+            gemm_type == GemmType.INDEXED and layer_config.a_dtype.num_bits == 16 and not use_batch_invariant
         )
 
     @classmethod
@@ -125,15 +123,9 @@ class Sm90Heuristics(DeviceHeuristics):
             return False
         if layer_config.use_packed_k_layout:
             return False
-        if (
-            layer_config.input_scale_group_size == 0
-            and layer_config.weight_scale_group_size == 0
-        ):
+        if layer_config.input_scale_group_size == 0 and layer_config.weight_scale_group_size == 0:
             return False
-        return not (
-            layer_config.use_fused_e8m0_scale
-            and layer_config.input_scale_group_size == 0
-        )
+        return not (layer_config.use_fused_e8m0_scale and layer_config.input_scale_group_size == 0)
 
     @classmethod
     def get_tuning_decision(
@@ -149,20 +141,30 @@ class Sm90Heuristics(DeviceHeuristics):
             use_batch_invariant,
             gemm_type,
         )
+        tune_grouped_scale = cls._uses_grouped_scale_candidates(layer_config)
+        # The grouped-scale path only needs the SM count for the >=128-SM
+        # H200 calibrations; degrade gracefully when no live device exists
+        # (unlike indexed-A16, which hard-requires it).
+        include_grid_size = tune_indexed_a16
+        if tune_grouped_scale and not include_grid_size:
+            try:
+                current_device.sm_count  # noqa: B018
+            except Exception:  # noqa: BLE001
+                pass
+            else:
+                include_grid_size = True
         problem = cls._make_problem(
             layer_config,
             shape_m,
             use_f16_accum,
             use_batch_invariant,
             gemm_type,
-            include_grid_size=tune_indexed_a16,
+            include_grid_size=include_grid_size,
         )
-        if cls._uses_grouped_scale_candidates(layer_config):
+        if tune_grouped_scale:
             return select_grouped_scale(problem)
         if not tune_indexed_a16:
-            raise ValueError(
-                "decision traces are only available for migrated SM90 policies"
-            )
+            raise ValueError("decision traces are only available for migrated SM90 policies")
         return select_indexed_a16(
             problem,
             cls.candidate_policy,
@@ -177,9 +179,9 @@ class Sm90Heuristics(DeviceHeuristics):
         use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
     ):
-        use_candidates = cls._uses_grouped_scale_candidates(
-            layer_config
-        ) or cls._uses_indexed_a16_policy(layer_config, use_batch_invariant, gemm_type)
+        use_candidates = cls._uses_grouped_scale_candidates(layer_config) or cls._uses_indexed_a16_policy(
+            layer_config, use_batch_invariant, gemm_type
+        )
         if use_candidates:
             return cls.get_tuning_decision(
                 layer_config,
@@ -203,9 +205,7 @@ class Sm90Heuristics(DeviceHeuristics):
                 gemm_type,
                 config["num_stages"],
                 warp_shape=config["warp_shape"],
-                reduce_overlap_last_stage_only=config.get(
-                    "reduce_overlap_last_stage_only", False
-                ),
+                reduce_overlap_last_stage_only=config.get("reduce_overlap_last_stage_only", False),
                 use_mbarrier=config.get("use_mbarrier", False),
                 use_warp_spec=config.get("use_warp_spec", False),
                 num_write_splits=config.get("num_write_splits", 1),

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import math
 import sys
 from pathlib import Path
 
@@ -200,7 +199,7 @@ def main() -> int:
     from humming import dtypes
     from humming.config import GemmType, LayerConfig, MmaType
     from humming.tune.candidate import DeviceProfile, TuningProblem
-    from humming.tune.sm90 import Sm90Heuristics
+    from humming.tune.sm90_policies import select_grouped_scale
 
     # Old implementation: import the module file from the main repo branch.
     old_module = _load_module(
@@ -238,15 +237,21 @@ def main() -> int:
                     use_batch_invariant=False,
                 )
                 try:
-                    # get_config (not get_tuning_decision): the bench layer
-                    # defaults to use_packed_k_layout=True which routes MoE
-                    # W4A8 through the legacy seed path, matching how the
-                    # runtime consumes it today.
-                    new_cfg = Sm90Heuristics.get_config(
-                        layer,
+                    # Direct grouped-scale policy call with the H200 device
+                    # profile so the >=128-SM calibrations engage exactly as
+                    # they will post-migration.
+                    problem = TuningProblem(
+                        layer_config=layer,
                         shape_m=shape_m,
                         gemm_type=gemm_type,
+                        device=DeviceProfile(
+                            name="sm90",
+                            sm_version=90,
+                            num_sms=NUM_SMS,
+                            max_smem_size=227 * 1024,
+                        ),
                     )
+                    new_cfg = select_grouped_scale(problem).to_config()
                 except Exception as exc:  # noqa: BLE001
                     new_cfg = {"error": repr(exc)}
                 shape = {
@@ -298,7 +303,7 @@ def main() -> int:
     )
     lines.append(header)
     lines.append("|" + "---|" * 8)
-    for shape, old_cfg, new_cfg, field_diffs in rows:
+    for shape, _old_cfg, _new_cfg, field_diffs in rows:
         per_expert = shape["shape_m"] / NUM_EXPERTS
         tag_shape = f"{shape['label']} N{shape['shape_n']} K{shape['shape_k']}"
         if not field_diffs:
@@ -352,51 +357,50 @@ def main() -> int:
     lines.append("## Analysis conclusions")
     lines.append("")
     lines.append(
-        "1. Small/mid M (64-2048, per_expert_m < 8): old picks the wide tile\n"
-        "   (block_m 8-24, block_n 512, block_k 64, warp_n 64, ctas 2,\n"
-        "   stages 3). Fully covered by K3 (wide-tile candidate) + K1\n"
-        "   (2-CTA cap). The warp_n 64 and stages 3 differences are part of\n"
-        "   the K3 tile definition itself."
+        "Post-migration state (calibrations implemented and enabled at\n"
+        "num_sms >= 128):"
+    )
+    lines.append("")
+    lines.append(
+        "1. Small/mid M (64-2048, per_expert_m < 8): both pick the K3 wide\n"
+        "   tile (block_n 512, block_k 64, warp_n 64, ctas 2, stages 3).\n"
+        "   Remaining diff is block_m only (old 8/8/8/8/16 vs new\n"
+        "   8/8/8/16/24): the old moe_block_size threshold table\n"
+        "   (8,0.7)(16,0.8)(32,0.9)(48,0.9)(64,0.9) picks smaller tiles than\n"
+        "   the new measured argmin (_select_sm90_block_m). Accepted as\n"
+        "   generic policy behavior — block_m within one tile step, same\n"
+        "   tile family and residency."
     )
     lines.append(
-        "2. Large M (16384, per_expert_m ~57): old picks (64, 256, 128)\n"
-        "   warp (64, 32, 128), ctas 1, stream-K off. Covered by K2 with\n"
-        "   block_m 64 (per_expert_m < 96); the new measured block_m (88)\n"
-        "   differs from the old threshold table but K2 fixes block_m to\n"
-        "   128|64 by per_expert_m, so the old value is reproduced."
+        "2. Large M (16384, per_expert_m ~57): exact match — (64, 256, 128),\n"
+        "   warp (64, 32, 128), ctas 1, stream-K off (K2)."
     )
     lines.append(
-        "3. Mid M (4096-8192, per_expert_m 14-28): old picks (32, 128, 128)\n"
-        "   warp_k 64, ctas 2. The block_k 128 comes from the old\n"
-        "   num_warps==4 K-doubling branch (warp_k 64 -> block_k 128), and\n"
-        "   ctas 2 from the 2-CTA cap. K1 covers ctas; the K-doubling is a\n"
-        "   legacy-seed-path behavior that the grouped-scale candidates do\n"
-        "   not replicate (they prefer k256 at block_m<=32 or k128 at 48).\n"
-        "   This is the num_warps==4 K-doubling suspect: NOT ported. The new\n"
-        "   tile (n128 k256 / k128) is legal and resource-equivalent; the\n"
-        "   oracle KEEP list did not include this branch, so it is accepted\n"
-        "   as a deliberate behavioral change (documented, not calibrated)."
+        "3. Mid M (4096-8192, per_expert_m 14-28): old (32, 128, 128)\n"
+        "   warp_k 64 vs new (32, 128, 256) / (48, 128, 128). The block_k\n"
+        "   difference at M=4096 comes from the old num_warps==4 K-doubling\n"
+        "   branch (warp_k 64 -> block_k 128) which the candidate ladder\n"
+        "   does not replicate (prefers k256 at block_m<=32). NOT ported:\n"
+        "   the oracle KEEP list excluded it; new tiles are legal and\n"
+        "   resource-equivalent. The block_m 32 vs 48 difference at M=8192\n"
+        "   is the same threshold-table-vs-measured-argmin effect as (1)."
     )
     lines.append(
-        "4. moe_block_size threshold table (8,0.7)(16,0.8)(32,0.9)(48,0.9)\n"
-        "   (64,0.9): only affects block_m at mid M (new picks 32/48/88 by\n"
-        "   measured argmin). K2 overrides block_m at large M, so the table\n"
-        "   only survives through the new measured block-m selection, which\n"
-        "   the PR accepts (generic policy behavior)."
+        "4. per_expert_m>=96 block_m 128 branch: fires only at M >= ~28k\n"
+        "   (288 experts), outside the bench sweep; included in K2."
     )
     lines.append(
-        "5. per_expert_m>=96 block_m 128 branch: fires only at M >= ~28k\n"
-        "   (per_expert >= 96 with 288 experts), outside the bench sweep;\n"
-        "   included in K2 candidate generation anyway."
+        "5. num_sms absent from new configs: the grouped-scale policy does\n"
+        "   not emit a num_sms field (unlike the legacy seed path which\n"
+        "   computed a launch-grid target). The kernel runtime derives the\n"
+        "   grid from the config; no H200 calibration depended on the\n"
+        "   emitted value."
     )
     lines.append(
-        "6. num_sms absent from new configs: grouped-scale policy currently\n"
-        "   receives num_sms=None (sm90.get_tuning_decision only sets\n"
-        "   include_grid_size for indexed-A16). Supporting change: pass\n"
-        "   include_grid_size=True for the grouped-scale branch so K1/K2/K3\n"
-        "   gating on device.num_sms >= 128 can work."
+        "6. Gate check: at num_sms=114 (H100 PCIe) all three calibrations\n"
+        "   are disabled and selection matches the pre-migration generic\n"
+        "   behavior exactly."
     )
-
     text = "\n".join(lines)
     if args.write:
         args.write.write_text(text + "\n")

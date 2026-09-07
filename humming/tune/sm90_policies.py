@@ -22,6 +22,18 @@ class Sm90CandidatePolicy:
     max_indexed_threads_for_three_ctas: int = 256
 
 
+# H200 W4A8 MoE calibrations (PR#76 migration). The three KEEP rules from
+# the Sm90H200Heuristics oracle sweep only pay off on large grids; 114-SM
+# H100 PCIe must keep the generic grouped-scale behavior, so they are
+# enabled by an SM-count gate instead of a device-name dispatch.
+_GROUPED_SCALE_CALIBRATION_MIN_SMS = 128
+
+
+def _grouped_scale_calibrations_enabled(problem: TuningProblem) -> bool:
+    num_sms = problem.device.num_sms
+    return num_sms is not None and num_sms >= _GROUPED_SCALE_CALIBRATION_MIN_SMS
+
+
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class _IndexedOption:
     candidate: ScheduleCandidate
@@ -109,28 +121,18 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
     # Long-K layers need more routed rows before wider N tiles pay off.
     wide_tile_min_shape_m = 64 if layer_config.shape_k > 4096 else 16
     use_wide_indexed_tile = (
-        tune_indexed_a16
-        and block_shape_m <= 64
-        and problem.shape_m >= wide_tile_min_shape_m
+        tune_indexed_a16 and block_shape_m <= 64 and problem.shape_m >= wide_tile_min_shape_m
     )
     if use_wide_indexed_tile:
         warp_shape_n = 64
         # N=512 spills its accumulator at two-CTA residency from M=48 onward.
-        if (
-            layer_config.shape_k <= 512
-            and layer_config.shape_n >= 2048
-            and block_shape_m < 48
-        ):
+        if layer_config.shape_k <= 512 and layer_config.shape_n >= 2048 and block_shape_m < 48:
             block_shape_n = 512
             block_shape_k = 64
         else:
             block_shape_n = 256
             block_shape_k = 128
-    elif (
-        layer_config.shape_n <= 4096
-        and not problem.use_batch_invariant
-        and block_shape_m <= 64
-    ):
+    elif layer_config.shape_n <= 4096 and not problem.use_batch_invariant and block_shape_m <= 64:
         block_shape_n = 128
         block_shape_k = warp_shape_k * 2
         if block_shape_m <= 32:
@@ -201,6 +203,138 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
     return config
 
 
+def _grouped_scale_ctas_per_sm(
+    problem: TuningProblem,
+    analysis: CandidateAnalysis,
+) -> int:
+    """K1: cap grouped-scale MoE residency at 2 CTAs on large grids.
+
+    The H200 W4A8 sweep showed a third resident CTA steals smem pipeline
+    stages without adding usable occupancy at 132 SMs; the same trade-off
+    holds on any >=128-SM GH100-class grid. Resource limits mirror
+    _indexed_a16_ctas_per_sm: threads + resident smem bound the residency.
+    """
+    if problem.device.num_sms is None:
+        return analysis.candidate.num_ctas_per_sm
+    resource_limit = 1
+    if analysis.num_threads <= 512 and analysis.smem_size * 2 <= problem.device.resident_smem_size:
+        resource_limit = 2
+    resource_limit = min(resource_limit, analysis.thread_smem_cta_limit)
+    grid_limit = math.ceil(analysis.num_output_tiles / problem.device.num_sms)
+    return max(1, min(2, resource_limit, grid_limit))
+
+
+def _analyze_grouped_scale_candidate(
+    problem: TuningProblem,
+    candidate: ScheduleCandidate,
+    *,
+    calibrations: bool,
+) -> CandidateAnalysis:
+    analysis = analyze_candidate(problem, candidate)
+    if not calibrations or not analysis.legal:
+        return analysis
+    if "num_ctas_per_sm" in candidate._explicit_fields:
+        # Calibration candidates (K2's single-CTA large-M tile, K3's
+        # two-CTA wide tile) pin residency explicitly; only clamp, never
+        # raise, so the measured occupancy survives.
+        clamped = min(
+            candidate.num_ctas_per_sm,
+            _grouped_scale_ctas_per_sm(problem, analysis),
+        )
+        if clamped == candidate.num_ctas_per_sm:
+            return analysis
+        candidate = candidate.with_updates(num_ctas_per_sm=clamped)
+        return analyze_candidate(problem, candidate)
+    candidate = candidate.with_updates(num_ctas_per_sm=_grouped_scale_ctas_per_sm(problem, analysis))
+    return analyze_candidate(problem, candidate)
+
+
+def _large_per_expert_m_candidate(
+    problem: TuningProblem,
+    block_shape_m: int,
+) -> ScheduleCandidate | None:
+    """K2: large per-expert token counts prefer generic large-N tiles.
+
+    Ports the H200 sweep result that (block_m 128|64, block_n 256,
+    warp_n 32, block_k 128) with a single resident CTA and stream-K off
+    beats the H20-calibrated (64, 128) two-CTA tile by ~25% once each
+    expert holds >= 48 routed rows.
+    """
+    layer_config = problem.layer_config
+    if not layer_config.num_experts:
+        return None
+    per_expert_m = problem.shape_m / layer_config.num_experts
+    if per_expert_m < 48 or layer_config.shape_n % 256:
+        return None
+    block_m = 128 if per_expert_m >= 96 else min(block_shape_m, 64)
+    config = {
+        "block_shape": (block_m, 256, 128),
+        "warp_shape": (block_m, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": problem.use_f16_accum,
+        "num_stages": 4,
+        "num_ctas_per_sm": 1,
+    }
+    if problem.gemm_type != GemmType.INDEXED:
+        config["use_warp_spec"] = True
+        config["use_tma"] = True
+        config["use_mbarrier"] = True
+    return ScheduleCandidate.from_config(
+        "grouped_scale_large_m_n256_k128",
+        config,
+    )
+
+
+def _small_m_wide_tile_candidate(
+    problem: TuningProblem,
+    block_shape_m: int,
+) -> ScheduleCandidate | None:
+    """K3: small-M W4A8 wide-N tile for memory-bound expert batches.
+
+    Ports the H200 small-M sweep result: when the routed batch is small
+    (few rows per expert) and activations are 8-bit with int4 weights, a
+    (block_n 512, block_k 64, warp_n 64) tile at two resident CTAs feeds
+    the 132-SM grid far better than the default 128-N tile. Guards use
+    candidate analysis (waves / output tiles / SM count) instead of the
+    legacy hand-written grid estimates; conservative by construction —
+    the candidate simply loses the priority race when it does not fit.
+    """
+    layer_config = problem.layer_config
+    if problem.device.num_sms is None:
+        return None
+    # Routed (MoE) layers only: dense W4A8 follows the generic policy.
+    if not layer_config.num_experts:
+        return None
+    if (
+        layer_config.a_dtype.num_bits != 8
+        or not layer_config.b_dtype.is_integer_type
+        or layer_config.b_dtype.num_bits != 4
+        or problem.use_batch_invariant
+    ):
+        return None
+    if layer_config.shape_n % 512 or layer_config.shape_k % 64:
+        return None
+    # Small routed batch: fewer than ~8 rows per expert.
+    if problem.shape_m > 8 * layer_config.num_experts:
+        return None
+    config = {
+        "block_shape": (block_shape_m, 512, 64),
+        "warp_shape": (block_shape_m, 64, 64),
+        "use_stream_k": not problem.use_batch_invariant,
+        "use_f16_accum": problem.use_f16_accum,
+        "num_stages": 3,
+        "num_ctas_per_sm": 2,
+    }
+    if problem.gemm_type != GemmType.INDEXED:
+        config["use_warp_spec"] = True
+        config["use_tma"] = True
+        config["use_mbarrier"] = True
+    return ScheduleCandidate.from_config(
+        "grouped_scale_small_m_n512_k64",
+        config,
+    )
+
+
 def select_grouped_scale(
     problem: TuningProblem,
 ) -> TuningDecision:
@@ -219,11 +353,19 @@ def select_grouped_scale(
         max_block_m,
     )
     block_ks = (256, 128, 64) if block_shape_m <= 32 else (128, 64)
-    use_multicast = (
-        problem.gemm_type == GemmType.DENSE and problem.shape_m / block_shape_m >= 4
-    )
+    use_multicast = problem.gemm_type == GemmType.DENSE and problem.shape_m / block_shape_m >= 4
+    calibrations = _grouped_scale_calibrations_enabled(problem)
 
     candidates = []
+    # High-priority H200 calibrations first; the generic measured-priority
+    # ladder follows as fallbacks.
+    if calibrations:
+        large_m = _large_per_expert_m_candidate(problem, block_shape_m)
+        if large_m is not None:
+            candidates.append(fit_pipeline_stages(problem, large_m))
+        small_m = _small_m_wide_tile_candidate(problem, block_shape_m)
+        if small_m is not None:
+            candidates.append(fit_pipeline_stages(problem, small_m))
     # Candidate order records measured preference; legality supplies fallbacks.
     for block_shape_n, warp_shape_n in ((128, 32), (64, 16)):
         for block_shape_k in block_ks:
@@ -258,24 +400,33 @@ def select_grouped_scale(
                 )
                 candidates.append(fit_pipeline_stages(problem, candidate))
 
-    analyses = tuple(analyze_candidate(problem, candidate) for candidate in candidates)
+    analyses = tuple(
+        _analyze_grouped_scale_candidate(
+            problem,
+            candidate,
+            calibrations=calibrations,
+        )
+        for candidate in candidates
+    )
     selected = next(
         (analysis for analysis in analyses if analysis.legal),
         None,
     )
     if selected is None:
-        rejected = {
-            analysis.candidate.candidate_id: analysis.rejection_reasons
-            for analysis in analyses
-        }
+        rejected = {analysis.candidate.candidate_id: analysis.rejection_reasons for analysis in analyses}
         raise AssertionError(f"no legal grouped-scale SM90 schedule: {rejected}")
 
+    reason = "selected the first legal measured-priority candidate"
+    if calibrations and selected.candidate.candidate_id.startswith("grouped_scale_large_m"):
+        reason = "selected the large per-expert-M 256-N tile (H200 calibration)"
+    elif calibrations and selected.candidate.candidate_id.startswith("grouped_scale_small_m"):
+        reason = "selected the small-M wide 512-N tile (H200 calibration)"
     return TuningDecision(
         problem=problem,
         family="grouped_scale",
         selected=selected.candidate,
         considered=analyses,
-        reason="selected the first legal measured-priority candidate",
+        reason=reason,
     )
 
 
@@ -334,9 +485,7 @@ def _half_k_candidate(
     warp_shape = source.warp_shape
     smaller_block_k = block_shape[2] // 2
     scale_groups_align = all(
-        not group_size
-        or group_size % smaller_block_k == 0
-        or smaller_block_k % group_size == 0
+        not group_size or group_size % smaller_block_k == 0 or smaller_block_k % group_size == 0
         for group_size in (
             problem.layer_config.input_scale_group_size,
             problem.layer_config.weight_scale_group_size,
@@ -439,12 +588,9 @@ def select_indexed_a16(
         if (
             base_analysis.candidate.num_ctas_per_sm == 1
             and half_analysis.legal
-            and half_analysis.candidate.num_ctas_per_sm
-            > base_analysis.candidate.num_ctas_per_sm
+            and half_analysis.candidate.num_ctas_per_sm > base_analysis.candidate.num_ctas_per_sm
         ):
-            eligible_reasons[half_option] = (
-                "halved K because it increased CTA residency"
-            )
+            eligible_reasons[half_option] = "halved K because it increased CTA residency"
 
     for option in options:
         if option.transform != "split_n_widen_k":
@@ -456,15 +602,12 @@ def select_indexed_a16(
         if (
             parent_reason is not None
             and analysis.legal
-            and analysis.candidate.num_ctas_per_sm
-            > parent_analysis.candidate.num_ctas_per_sm
+            and analysis.candidate.num_ctas_per_sm > parent_analysis.candidate.num_ctas_per_sm
             and analysis.waves is not None
             and parent_analysis.waves is not None
             and analysis.waves <= parent_analysis.waves
         ):
-            eligible_reasons[option] = (
-                f"{parent_reason}; split N and widened K without adding a grid wave"
-            )
+            eligible_reasons[option] = f"{parent_reason}; split N and widened K without adding a grid wave"
     selected = max(
         eligible_reasons,
         key=lambda option: option.priority,
@@ -483,9 +626,6 @@ def select_indexed_a16(
         problem=problem,
         family="indexed_a16",
         selected=final_candidate,
-        considered=tuple(
-            final_analysis if option is selected else analyses[option]
-            for option in options
-        ),
+        considered=tuple(final_analysis if option is selected else analyses[option] for option in options),
         reason=eligible_reasons[selected],
     )
