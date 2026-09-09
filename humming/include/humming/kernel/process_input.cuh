@@ -11,15 +11,23 @@ struct ProcessInputConfig {
   using SourceType = typename Config::SourceType;
   using TargetType = typename Config::TargetType;
   using ActivationImpl = typename Config::Activation;
-  static constexpr QuantizationMode kQuantization = Config::kQuantMode;
+  static constexpr InputQuantizationMode kQuantization = Config::kQuantMode;
   static constexpr bool kUseTilePartition = Config::kUseTilePartition;
-  static constexpr bool kDynamicTokenMode = kQuantization == QuantizationMode::DynamicToken;
-  static constexpr bool kDynamicGroupMode = kQuantization == QuantizationMode::DynamicGroup || kQuantization == QuantizationMode::StaticTensorDynamicGroup;
-  static constexpr bool kDynamicGroupTokenMode = kQuantization == QuantizationMode::DynamicGroupToken;
-  static constexpr bool kStaticTensorScale = kQuantization == QuantizationMode::StaticTensor || kQuantization == QuantizationMode::StaticTensorDynamicGroup;
+  static constexpr bool kDynamicTokenMode = kQuantization == InputQuantizationMode::DynamicToken;
+  static constexpr bool kDynamicGroupMode = kQuantization == InputQuantizationMode::DynamicGroup || kQuantization == InputQuantizationMode::StaticTensorDynamicGroup;
+  static constexpr bool kDynamicGroupTokenMode = kQuantization == InputQuantizationMode::DynamicGroupToken;
+  static constexpr bool kStaticTensorScale = kQuantization == InputQuantizationMode::StaticTensor || kQuantization == InputQuantizationMode::StaticTensorDynamicGroup;
   static constexpr bool kDynamicGroupScale = kDynamicGroupMode || kDynamicGroupTokenMode;
   static constexpr bool kStagedGroupToken = kDynamicGroupTokenMode && kUseTilePartition;
-  static constexpr ScaleMode kConfiguredScaleMode = kDynamicTokenMode ? ScaleMode::DynamicToken : kDynamicGroupTokenMode ? ScaleMode::DynamicGroupToken : kDynamicGroupMode ? ScaleMode::DynamicGroup : ScaleMode::Static;
+
+  static constexpr ScaleMode configured_scale_mode() {
+    if constexpr (kDynamicTokenMode) return ScaleMode::DynamicToken;
+    if constexpr (kDynamicGroupTokenMode) return ScaleMode::DynamicGroupToken;
+    if constexpr (kDynamicGroupMode) return ScaleMode::DynamicGroup;
+    return ScaleMode::Static;
+  }
+
+  static constexpr ScaleMode kConfiguredScaleMode = configured_scale_mode();
   static constexpr ScaleMode kScaleMode = kStagedGroupToken ? ScaleMode::DynamicGroup : kConfiguredScaleMode;
   static constexpr bool kDynamicOutputScale = kScaleMode == ScaleMode::DynamicGroup || kScaleMode == ScaleMode::DynamicGroupToken;
   static constexpr bool kFusedGroupToken = kScaleMode == ScaleMode::DynamicGroupToken;
@@ -49,7 +57,7 @@ struct ProcessInputConfig {
   static constexpr QuantizationPhase kPhase = Config::kQuantizationPhase;
   static constexpr GroupScaleLayout kGroupScaleLayout = Config::kScaleLayout;
   static constexpr bool kUsePdl = Config::kUsePdl;
-  static constexpr bool kQuantize = kQuantization != QuantizationMode::Disabled;
+  static constexpr bool kQuantize = kQuantization != InputQuantizationMode::Disabled;
   static constexpr uint32_t kOutputPacking = kQuantize ? 8 / TargetType::kBits : 1;
   static constexpr bool kAllowByteOutput = std::is_same<TargetType, Float8E3M4>::value;
   static constexpr uint32_t kTilesPerBlock = Config::kTilesPerBlock;
@@ -344,6 +352,7 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
     uint32_t max_tokens_per_expert,
     uint64_t group_scale_stride) {
   using Layout = typename Config::Layout;
+  using OutputScaleType = typename Config::ConfiguredDynamicGroupScaleType;
   using ScaleLayout = InputLayout<
       Layout::kType,
       1,
@@ -412,8 +421,8 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
       if (lane == 0) token_scales[output_row] = token_scale;
       for (uint32_t group = lane; group < kGroupsPerToken; group += 32) {
         float scale = token_scale > 0.f ? decode_scale<M3BFloat16>(input[group]) / token_scale : 0.f;
-        uint64_t scale_index = group_scale_index<Config, Float8E4M3>(output_row, group, group_scale_stride);
-        store_scale<Float8E4M3>(group_scales, scale_index, encode_scale<Float8E4M3>(scale));
+        uint64_t scale_index = group_scale_index<Config, OutputScaleType>(output_row, group, group_scale_stride);
+        store_scale<OutputScaleType>(group_scales, scale_index, encode_scale<OutputScaleType>(scale));
       }
     }
   }

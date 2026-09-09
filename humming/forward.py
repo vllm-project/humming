@@ -2,8 +2,8 @@ import json
 
 import torch
 
-from humming import ops
-from humming.config import LayerConfig, MmaType
+from humming import dtypes, ops
+from humming.config import GemmType, LayerConfig, MmaType
 from humming.tune import get_heuristics_class
 
 
@@ -59,14 +59,14 @@ def may_process_input(
     use_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     config.check_device(inputs.device)
-    should_quantize = config.a_dtype.num_bits != 16
+    should_quantize = config.input_quant_mode.should_quantize
     quant_mode = "none"
     quant_dtype = None
     quant_group_size = None
     group_scale_dtype = None
     if should_quantize:
         assert config.as_dtype is not None
-        quant_mode = "dynamic_group" if config.input_scale_group_size > 0 else "dynamic_token"
+        quant_mode = config.input_quant_mode.value
         quant_dtype = str(config.a_dtype)
         quant_group_size = config.input_scale_group_size or None
         group_scale_dtype = str(config.as_dtype)
@@ -140,6 +140,7 @@ def humming_forward(
     weight_scale_2: torch.Tensor | None = None,
     outputs: torch.Tensor | None = None,
     input_scale: torch.Tensor | None = None,
+    input_scale_2: torch.Tensor | None = None,
     sorted_ids: torch.Tensor | None = None,
     expert_ids: torch.Tensor | None = None,
     num_tokens_padded: torch.Tensor | None = None,
@@ -152,25 +153,80 @@ def humming_forward(
     hadamard_block_size: int | None = None,
     use_pdl: bool | None = None,
 ) -> torch.Tensor:
+    parsed_compute_config = compute_config
+    if isinstance(parsed_compute_config, str) and parsed_compute_config:
+        parsed_compute_config = json.loads(parsed_compute_config)
+
     m_major_scale = False
     if config.input_scale_group_size > 0:
-        parsed_compute_config = compute_config
-        if isinstance(parsed_compute_config, str) and parsed_compute_config:
-            parsed_compute_config = json.loads(parsed_compute_config)
         if isinstance(parsed_compute_config, dict):
             m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
 
-    if input_scale is None:
+    gemm_type = None
+    if isinstance(parsed_compute_config, dict):
+        gemm_type_value = parsed_compute_config.get("gemm_type")
+        if gemm_type_value is not None:
+            gemm_type = GemmType(gemm_type_value)
+
+    inputs_are_quantized = False
+    if config.input_quant_mode.should_quantize:
+        quantized_torch_dtype = dtypes.torch_dtype_map.get(config.a_dtype, torch.uint8)
+        inputs_are_quantized = inputs.dtype == quantized_torch_dtype
+        if config.a_dtype.num_bits == 4:
+            inputs_are_quantized = inputs.dtype == torch.uint8
+
+    needs_transform = hadamard_block_size is not None and hadamard_block_size > 1
+    should_process = False
+    if not inputs_are_quantized:
+        should_process = config.input_quant_mode.should_quantize
+        if needs_transform:
+            should_process = True
+    if should_process:
+        group_scales = input_scale if config.input_quant_mode.uses_group_scale else None
+        token_scales = input_scale_2 if config.input_quant_mode.has_secondary_scale else input_scale
+
+        process_inputs = inputs
+        process_layout = "normal"
+        process_expert_layout = None
+        flatten_grouped_padded = False
+        if config.input_quant_mode.has_static_tensor_scale and config.num_experts > 0:
+            if gemm_type == GemmType.GROUPED_CONTIGUOUS:
+                process_layout = "grouped"
+                process_expert_layout = expert_layout
+            elif gemm_type == GemmType.GROUPED_MASKED:
+                assert expert_layout is not None, "grouped_masked input processing requires expert_layout"
+                assert inputs.ndim == 2 and inputs.size(0) % config.num_experts == 0
+                process_inputs = inputs.view(config.num_experts, -1, inputs.size(-1))
+                process_layout = "grouped_padded"
+                process_expert_layout = expert_layout
+                flatten_grouped_padded = True
+            elif gemm_type == GemmType.INDEXED and config.num_experts > 1:
+                raise ValueError(
+                    "indexed GEMM cannot use per-expert static input scales because "
+                    "its quantized inputs are shared across experts"
+                )
+
         inputs, group_scales, token_scales = may_process_input(
             config,
-            inputs=inputs,
+            inputs=process_inputs,
+            group_scales=group_scales,
+            token_scales=token_scales,
             hadamard_block_size=hadamard_block_size,
+            layout=process_layout,
+            expert_layout=process_expert_layout,
             m_major_scale=m_major_scale,
             use_pdl=use_pdl,
         )
-        if token_scales is not None:
+        if flatten_grouped_padded:
+            inputs = inputs.view(-1, inputs.size(-1))
+            if group_scales is not None and not m_major_scale:
+                group_scales = group_scales.view(-1, group_scales.size(-1))
+            if token_scales is not None and config.input_quant_mode.has_dynamic_token_scale:
+                token_scales = token_scales.reshape(-1)
+        if token_scales is not None and config.input_quant_mode.has_dynamic_token_scale:
             token_scales = token_scales.unsqueeze(-1)
-        input_scale = group_scales if group_scales is not None else token_scales
+        input_scale = group_scales if config.input_quant_mode.uses_group_scale else token_scales
+        input_scale_2 = token_scales if config.input_quant_mode.has_secondary_scale else None
         if input_scale is not None:
             input_scale = _prepare_input_scale(config, input_scale)
 
@@ -187,6 +243,7 @@ def humming_forward(
         weight=weight,
         outputs=outputs,
         input_scale=input_scale,
+        input_scale_2=input_scale_2,
         weight_scale=weight_scale,
         zero_point=zero_point,
         bias=bias,

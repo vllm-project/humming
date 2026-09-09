@@ -317,6 +317,7 @@ class Sm120Heuristics(Sm89Heuristics):
             use_warp_spec=False,
             use_tma_a=False,
             use_tma_as=False,
+            use_tma_as2=False,
             use_tma_b=True,
             use_tma_c=False,
             use_tma_bs=False,

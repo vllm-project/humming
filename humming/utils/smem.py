@@ -38,8 +38,8 @@ def _stage_storage_bytes(layer_config: LayerConfig, block_shape, is_mxmma: bool)
     b_bits = layer_config.b_dtype.num_bits
     bs_bits = (layer_config.bs_dtype or layer_config.c_dtype).num_bits
 
-    has_input_scale = a_bits != 16
-    is_group_input_scale = has_input_scale and layer_config.input_scale_group_size > 0
+    has_input_scale = layer_config.has_input_scale
+    is_group_input_scale = has_input_scale and layer_config.is_group_input_scale
     is_group_or_block_ws = layer_config.is_group_weight_scale or layer_config.is_block_weight_scale
     has_stage_zp = layer_config.has_zero_point and not layer_config.is_channel_weight_scale
     zp_bits = 16 if layer_config.is_fp_zero_point else max(4, _next_pow2(b_bits))
@@ -52,8 +52,10 @@ def _stage_storage_bytes(layer_config: LayerConfig, block_shape, is_mxmma: bool)
     if is_group_input_scale:
         num_groups_a = math.ceil(block_k / layer_config.input_scale_group_size)
         if is_mxmma:
+            assert layer_config.as_dtype is not None
             ng_storage = math.ceil(num_groups_a / 4) * 4
-            as_bytes = math.ceil(ng_storage * block_m * bs_bits / 8 / _INT4) * _INT4
+            as_bits = layer_config.as_dtype.num_bits
+            as_bytes = math.ceil(ng_storage * block_m * as_bits / 8 / _INT4) * _INT4
         else:
             as_bytes = (num_groups_a * block_m // 4) * _INT4
         fields.append((as_bytes, 128))
@@ -89,7 +91,6 @@ def estimate_smem_size_layer(
 ) -> int:
     block_m, block_n, block_k = block_shape
     is_mxmma = layer_config.mma_type == MmaType.MXMMA
-    a_bits = layer_config.a_dtype.num_bits
     bs_bits = (layer_config.bs_dtype or layer_config.c_dtype).num_bits
     zp_bits = 16 if layer_config.is_fp_zero_point else max(4, _next_pow2(layer_config.b_dtype.num_bits))
 
@@ -100,7 +101,13 @@ def estimate_smem_size_layer(
     channel_bs_bytes = (block_n * bs_bits // 8) if layer_config.is_channel_weight_scale else 0
     channel_bs2_bytes = (block_n * 16 // 8) if layer_config.is_channel_weight_scale_2 else 0
     bias_bytes = (block_n * 2) if layer_config.has_bias else 0
-    channel_as_bytes = (block_m * 4) if (a_bits != 16 and layer_config.input_scale_group_size == 0) else 0
+    has_channel_input_scale = (
+        layer_config.has_input_scale
+        and not layer_config.is_group_input_scale
+        and not layer_config.is_tensor_input_scale
+    )
+    has_channel_input_scale |= layer_config.has_input_scale_2 and not layer_config.is_tensor_input_scale_2
+    channel_as_bytes = (block_m * 4) if has_channel_input_scale else 0
 
     struct_a = _struct_size(
         [

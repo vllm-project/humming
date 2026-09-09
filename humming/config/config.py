@@ -7,7 +7,7 @@ import torch
 
 from humming import dtypes
 from humming.config.base import BaseHummingConfig
-from humming.config.enum import GemmType, MmaType, WeightScale2Type, WeightScaleType
+from humming.config.enum import GemmType, InputQuantizationMode, MmaType, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo, current_device
 
 
@@ -34,6 +34,7 @@ class LayerConfig(BaseHummingConfig):
     c_dtype: dtypes.DataType
     bs_dtype: dtypes.DataType | None = None
     as_dtype: dtypes.DataType | None = None
+    input_quant_mode: InputQuantizationMode | str | None = None
 
     # quant param config
     input_scale_group_size: int = 0
@@ -66,6 +67,12 @@ class LayerConfig(BaseHummingConfig):
         "has_channel_weight_scale",
         "has_tensor_weight_scale",
         "has_input_scale",
+        "has_input_scale_2",
+        "is_group_input_scale",
+        "is_token_input_scale",
+        "is_tensor_input_scale",
+        "is_token_input_scale_2",
+        "is_tensor_input_scale_2",
         "use_native_dequant",
     )
 
@@ -102,7 +109,13 @@ class LayerConfig(BaseHummingConfig):
         assert self.sm_version is not None
         if self.sm_version // 10 != 12:
             return False
-        if not (self.is_group_weight_scale or self.is_channel_weight_scale):
+        if self.input_quant_mode == InputQuantizationMode.DynamicGroupToken:
+            if self.a_dtype not in (dtypes.float4e2m1, dtypes.float4e0m3):
+                return False
+            if self.input_scale_group_size != 16:
+                return False
+        is_channel_or_tensor_weight_scale = self.is_channel_weight_scale or self.is_tensor_weight_scale
+        if not (self.is_group_weight_scale or is_channel_or_tensor_weight_scale):
             return False
         if (
             self.is_group_weight_scale
@@ -112,7 +125,7 @@ class LayerConfig(BaseHummingConfig):
             return False
         if self.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4):
             return self.input_scale_group_size in (0, 32) and (
-                self.is_channel_weight_scale
+                is_channel_or_tensor_weight_scale
                 or self.weight_scale_group_size == 32
                 and self.bs_dtype == dtypes.float8e8m0
             )
@@ -121,7 +134,7 @@ class LayerConfig(BaseHummingConfig):
                 return False
 
             return self.input_scale_group_size in (0, 16, 32) and (
-                self.is_channel_weight_scale
+                is_channel_or_tensor_weight_scale
                 or self.weight_scale_group_size == 16
                 and self.bs_dtype in (dtypes.float8e8m0, dtypes.float8e4m3)
                 or self.weight_scale_group_size == 32
@@ -171,7 +184,25 @@ class LayerConfig(BaseHummingConfig):
                 value = dtypes.DataType.from_str(value)
             setattr(self, f"{name}_dtype", value)
 
-        self.has_input_scale = self.a_dtype.num_bits != 16
+        if isinstance(self.input_quant_mode, str):
+            self.input_quant_mode = InputQuantizationMode(self.input_quant_mode)
+        elif self.input_quant_mode is None:
+            if self.a_dtype.num_bits == 16:
+                self.input_quant_mode = InputQuantizationMode.Disabled
+            elif self.input_scale_group_size > 0:
+                self.input_quant_mode = InputQuantizationMode.DynamicGroup
+            else:
+                self.input_quant_mode = InputQuantizationMode.DynamicToken
+
+        self.has_input_scale = self.input_quant_mode.should_quantize
+        self.has_input_scale_2 = self.input_quant_mode.has_secondary_scale
+        self.is_group_input_scale = self.input_quant_mode.uses_group_scale
+        self.is_token_input_scale = self.input_quant_mode == InputQuantizationMode.DynamicToken
+        self.is_tensor_input_scale = self.input_quant_mode == InputQuantizationMode.StaticTensor
+        self.is_token_input_scale_2 = self.input_quant_mode == InputQuantizationMode.DynamicGroupToken
+        self.is_tensor_input_scale_2 = self.input_quant_mode == InputQuantizationMode.StaticTensorDynamicGroup
+        assert self.has_input_scale == (self.a_dtype.num_bits != 16)
+        assert self.is_group_input_scale == (self.input_scale_group_size > 0)
         self.bs_dtype = self.bs_dtype or self.c_dtype
 
         if isinstance(self.b_dtype, dtypes.IntegerType):
@@ -194,8 +225,13 @@ class LayerConfig(BaseHummingConfig):
                 self.mma_type = MmaType.MXMMA
             else:
                 self.mma_type = MmaType.MMA
+        if self.has_input_scale_2:
+            assert self.mma_type == MmaType.MXMMA, f"{self.input_quant_mode.value} requires mma_type='mxmma'"
         if self.mma_type == MmaType.MXMMA and self.is_group_weight_scale and self.input_scale_group_size > 0:
             assert self.input_scale_group_size == self.weight_scale_group_size
+        if self.input_quant_mode == InputQuantizationMode.DynamicGroupToken:
+            assert self.a_dtype in (dtypes.float4e2m1, dtypes.float4e0m3)
+            assert self.input_scale_group_size == 16
 
         if not self.has_input_scale:
             self.as_dtype = None
@@ -209,6 +245,11 @@ class LayerConfig(BaseHummingConfig):
                     self.as_dtype = dtypes.float8e8m0
             else:
                 self.as_dtype = dtypes.float32
+
+        if self.input_quant_mode == InputQuantizationMode.DynamicGroupToken:
+            assert self.as_dtype == dtypes.float8e4m3
+        if self.mma_type == MmaType.MXMMA and self.is_group_input_scale and self.is_group_weight_scale:
+            assert self.as_dtype == self.bs_dtype
 
         is_channel_scale_2 = self.weight_scale_2_type == WeightScale2Type.CHANNEL
 
@@ -388,6 +429,7 @@ class TuningConfig(BaseHummingConfig):
     use_tma: bool | None = None
     use_tma_a: bool | None = None
     use_tma_as: bool | None = None
+    use_tma_as2: bool | None = None
     use_tma_b: bool | None = None
     use_tma_c: bool | None = None
     use_tma_bs: bool | None = None
@@ -413,6 +455,7 @@ class TuningConfig(BaseHummingConfig):
     _name_map = {
         "use_mbarrier": "kUseMBarrier",
         "use_tma_as": "kUseTmaAS",
+        "use_tma_as2": "kUseTmaAS2",
         "use_tma_bs": "kUseTmaBS",
         "use_tma_bs2": "kUseTmaBS2",
         "use_tma_bzp": "kUseTmaBZP",

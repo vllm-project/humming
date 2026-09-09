@@ -13,7 +13,7 @@
 #include "./mapped_file.h"
 #include "./utils.h"
 
-enum class QuantizationMode : uint32_t {
+enum class InputQuantizationMode : uint32_t {
   Disabled = 0,
   StaticTensor = 1,
   DynamicToken = 2,
@@ -28,9 +28,9 @@ enum class QuantizationPhase : uint32_t {
   Quantize = 2,
 };
 
-inline QuantizationMode process_input_quantization_mode(uint32_t id) {
-  ASSERT_CHECK(id <= static_cast<uint32_t>(QuantizationMode::DynamicGroupToken), "invalid quantization mode: ", id);
-  return static_cast<QuantizationMode>(id);
+inline InputQuantizationMode process_input_quantization_mode(uint32_t id) {
+  ASSERT_CHECK(id <= static_cast<uint32_t>(InputQuantizationMode::DynamicGroupToken), "invalid quantization mode: ", id);
+  return static_cast<InputQuantizationMode>(id);
 }
 
 inline QuantizationPhase process_input_quantization_phase(uint32_t id) {
@@ -52,7 +52,7 @@ struct ProcessInputKernelData {
   uint32_t layout;
   uint32_t layout_width;
   bool use_tile_partition;
-  QuantizationMode quant_mode;
+  InputQuantizationMode quant_mode;
   QuantizationPhase quantization_phase;
   uint32_t scale_layout;
   uint32_t output_packing;
@@ -232,19 +232,19 @@ inline void check_process_input_index(
   check_process_input_tensor(tensor, name, device, dtype);
 }
 
-inline bool has_static_tensor_scale(QuantizationMode mode) {
-  return mode == QuantizationMode::StaticTensor ||
-         mode == QuantizationMode::StaticTensorDynamicGroup;
+inline bool has_static_tensor_scale(InputQuantizationMode mode) {
+  return mode == InputQuantizationMode::StaticTensor ||
+         mode == InputQuantizationMode::StaticTensorDynamicGroup;
 }
 
-inline bool has_dynamic_token_scale(QuantizationMode mode) {
-  return mode == QuantizationMode::DynamicToken || mode == QuantizationMode::DynamicGroupToken;
+inline bool has_dynamic_token_scale(InputQuantizationMode mode) {
+  return mode == InputQuantizationMode::DynamicToken || mode == InputQuantizationMode::DynamicGroupToken;
 }
 
-inline bool has_dynamic_group_scale(QuantizationMode mode) {
-  return mode == QuantizationMode::DynamicGroup ||
-         mode == QuantizationMode::StaticTensorDynamicGroup ||
-         mode == QuantizationMode::DynamicGroupToken;
+inline bool has_dynamic_group_scale(InputQuantizationMode mode) {
+  return mode == InputQuantizationMode::DynamicGroup ||
+         mode == InputQuantizationMode::StaticTensorDynamicGroup ||
+         mode == InputQuantizationMode::DynamicGroupToken;
 }
 
 inline ProcessInputShape process_input_shape(
@@ -315,7 +315,7 @@ inline void check_process_input_output(
     const Tensor &outputs) {
   auto expected_shape = process_input_output_shape(data, inputs, shape);
   ScalarType dtype = dtype_id_to_tensor_dtype(data.source_dtype_id);
-  if (data.quant_mode != QuantizationMode::Disabled)
+  if (data.quant_mode != InputQuantizationMode::Disabled)
     dtype = dtype_id_to_tensor_dtype(data.target_dtype_id);
   check_process_input_tensor(outputs, "outputs", inputs.get_device(), dtype);
   ASSERT_CHECK(outputs.dim() == static_cast<int64_t>(expected_shape.size()), "invalid output rank");
@@ -519,7 +519,7 @@ inline void launch_process_input_impl(
     ASSERT_CHECK(
         primary.quantization_phase == QuantizationPhase::Fused,
         "single-stage process-input kernel must use the fused phase");
-    bool token_scale = primary.quant_mode == QuantizationMode::DynamicToken;
+    bool token_scale = primary.quant_mode == InputQuantizationMode::DynamicToken;
     void *output_scales = token_scale ? public_token_scales : public_group_scales;
     launch_process_input_main(
         primary, primary_kernel.func, inputs, outputs, group_scales, token_scales,
@@ -527,7 +527,7 @@ inline void launch_process_input_impl(
   } else {
     ProcessInputKernelLaunchData secondary_kernel = get_or_load_process_input_kernel(secondary_id, context);
     ProcessInputKernelData &secondary = secondary_kernel.metadata;
-    if (primary.quant_mode == QuantizationMode::DynamicToken) {
+    if (primary.quant_mode == InputQuantizationMode::DynamicToken) {
       ASSERT_CHECK(
           primary.quantization_phase == QuantizationPhase::CollectAbsmax &&
               secondary.quantization_phase == QuantizationPhase::Quantize,
@@ -539,7 +539,7 @@ inline void launch_process_input_impl(
           secondary, secondary_kernel.func, inputs, outputs, group_scales, token_scales,
           expert_layout, indices, shape, public_token_scales);
     } else {
-      bool valid_finalizer = primary.quant_mode == QuantizationMode::DynamicGroupToken;
+      bool valid_finalizer = primary.quant_mode == InputQuantizationMode::DynamicGroupToken;
       valid_finalizer = valid_finalizer && primary.quantization_phase == QuantizationPhase::Fused;
       valid_finalizer = valid_finalizer && secondary.is_finalizer;
       valid_finalizer = valid_finalizer && secondary.quantization_phase == QuantizationPhase::Fused;

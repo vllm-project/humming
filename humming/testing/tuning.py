@@ -36,6 +36,7 @@ SAMPLED_TUNING_VALUES = {
 TMA_FIELDS = (
     "use_tma_a",
     "use_tma_as",
+    "use_tma_as2",
     "use_tma_b",
     "use_tma_c",
     "use_tma_bs",
@@ -198,12 +199,15 @@ def _generate_transfer_candidates(
             continue
         if compute_config.gemm_type.value == "indexed":
             tma_values.update(use_tma_a=False, use_tma_as=False, use_tma_c=False)
+            tma_values["use_tma_as2"] = False
         if not (
             layer_config.has_input_scale
             and layer_config.input_scale_group_size > 0
             and compute_config.use_m_major_input_scale
         ):
             tma_values["use_tma_as"] = False
+        if not layer_config.has_input_scale_2 or layer_config.is_tensor_input_scale_2:
+            tma_values["use_tma_as2"] = False
         if not _is_legal_multicast_transfer(compute_config, sm_version, signature, tma_values):
             continue
         config = base | signature | tma_values | {"use_tma": use_tma}

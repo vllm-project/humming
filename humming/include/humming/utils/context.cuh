@@ -10,6 +10,7 @@ struct KernelParams {
   const void *a;
   const void *b;
   const void *as;
+  const void *as2;
   const void *bs;
   const void *bzp;
   const void *bias;

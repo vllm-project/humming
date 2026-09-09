@@ -264,7 +264,7 @@ class CompressedTensorsInputSchema(BaseInputSchema):
     type: str
     num_bits: int
     dynamic: bool | str
-    group_size: int
+    group_size: int = 0
     symmetric: bool = True
 
     def __post_init__(self):
@@ -276,6 +276,8 @@ class CompressedTensorsInputSchema(BaseInputSchema):
             "nvfp4-pack-quantized",
             "mxfp4-pack-quantized",
         ]
+        if not self.symmetric:
+            raise ValueError("asymmetric input quantization is not supported by humming")
         self.input_scale_key = "input_global_scale" if "nvfp4" in self.format else "input_scale"
 
     def get_activation_bits(self):
@@ -296,14 +298,6 @@ class CompressedTensorsInputSchema(BaseInputSchema):
                 dtype=torch.float32,
                 input_scale_name=self.input_scale_key,
             )
-            if not self.symmetric:
-                assert self.type == "int" and self.num_bits == 8
-                tensors_attrs |= self._get_input_scale_attrs(
-                    num_experts=num_experts,
-                    stack_size=stack_size,
-                    dtype=torch.int8,
-                    input_scale_name="input_zero_point",
-                )
 
         return tensors_attrs
 
@@ -327,7 +321,32 @@ class CompressedTensorsInputSchema(BaseInputSchema):
         else:
             raise ValueError(f"unsupported {self.type}{self.num_bits}")
 
-        a_dtype = self.get_fallback_input_dtype(origin_a_dtype, sm_version)
-        group_size = self.group_size if a_dtype == dtypes.float4e2m1 else 0
-        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=group_size)
-        return schema, {}
+        a_dtype = self.get_fallback_input_dtype(origin_a_dtype, self.group_size, sm_version)
+        group_size = self.group_size if a_dtype == origin_a_dtype else 0
+        static_tensor = self.dynamic is False or self.dynamic == "local"
+        if a_dtype is None:
+            quant_mode = "none"
+        elif group_size > 0:
+            if static_tensor:
+                quant_mode = "static_tensor_dynamic_group"
+            elif "nvfp4" in self.format:
+                quant_mode = "dynamic_group_token"
+            else:
+                quant_mode = "dynamic_group"
+        else:
+            quant_mode = "static_tensor" if static_tensor else "dynamic_token"
+        schema = HummingInputSchema(
+            a_dtype=a_dtype,
+            input_scale_group_size=group_size,
+            input_quant_mode=quant_mode,
+        )
+        if schema.static_tensor_scale_name is None:
+            return schema, {}
+        output_tensors = self._convert_static_tensor_scale(
+            tensors,
+            source_name=self.input_scale_key,
+            target_name=schema.static_tensor_scale_name,
+            num_experts=num_experts,
+            reciprocal="nvfp4" in self.format,
+        )
+        return schema, output_tensors

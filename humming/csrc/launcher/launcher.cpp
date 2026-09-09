@@ -117,6 +117,7 @@ Tensor launch_kernel_impl(
     Tensor bs,
     std::optional<Tensor> bs2_,
     std::optional<Tensor> as_,
+    std::optional<Tensor> as2_,
     std::optional<Tensor> bzp_,
     std::optional<Tensor> bias_,
     std::optional<Tensor> c_,
@@ -152,6 +153,7 @@ Tensor launch_kernel_impl(
     check_tensor_b(b, kernel_data, dev);
     check_tensor_c(c, kernel_data, dev, shape_m, top_k);
     check_tensor_as(as_, kernel_data, dev, shape_m, top_k);
+    check_tensor_as2(as2_, kernel_data, dev, shape_m);
     check_tensor_bs(bs, kernel_data, dev);
     check_tensor_bzp(bzp_, kernel_data, dev);
     check_tensor_bias(bias_, kernel_data, dev);
@@ -164,6 +166,7 @@ Tensor launch_kernel_impl(
   void *b_ptr = b.data_ptr();
   void *c_ptr = c.data_ptr();
   void *as_ptr = as_.has_value() ? as_->data_ptr() : nullptr;
+  void *as2_ptr = as2_.has_value() ? as2_->data_ptr() : nullptr;
   void *bs_ptr = bs.data_ptr();
   void *bzp_ptr = bzp_.has_value() ? bzp_->data_ptr() : nullptr;
   void *bias_ptr = bias_.has_value() ? bias_->data_ptr() : nullptr;
@@ -177,6 +180,7 @@ Tensor launch_kernel_impl(
 
   auto tensor_map_a = make_tma_desc_a(a, kernel_data);
   auto tensor_map_as = make_tma_desc_as(as_, kernel_data);
+  auto tensor_map_as2 = make_tma_desc_as2(as2_, kernel_data);
   auto tensor_map_b = make_tma_desc_b(b, kernel_data);
   auto tensor_map_c = make_tma_desc_c(c, kernel_data);
   auto tensor_map_bs = make_tma_desc_bs(bs, kernel_data);
@@ -199,6 +203,7 @@ Tensor launch_kernel_impl(
       kernel_data.use_tma_b ? to_void_ptr(&tensor_map_b) : to_void_ptr(&b_ptr),
       kernel_data.use_tma_c ? to_void_ptr(&tensor_map_c) : to_void_ptr(&c_ptr),
       kernel_data.use_tma_as ? to_void_ptr(&tensor_map_as) : to_void_ptr(&as_ptr),
+      kernel_data.use_tma_as2 ? to_void_ptr(&tensor_map_as2) : to_void_ptr(&as2_ptr),
       kernel_data.use_tma_bs ? to_void_ptr(&tensor_map_bs) : to_void_ptr(&bs_ptr),
       kernel_data.use_tma_bzp ? to_void_ptr(&tensor_map_bzp) : to_void_ptr(&bzp_ptr),
       kernel_data.use_tma_bias ? to_void_ptr(&tensor_map_bias) : to_void_ptr(&bias_ptr),
@@ -302,9 +307,13 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getBool("IS_TENSOR_WEIGHT_SCALE_2"),
       reader.getBool("HAS_ZERO_POINT"),
       reader.getBool("HAS_BIAS"),
+      reader.getBool("HAS_INPUT_SCALE_2"),
+      reader.getBool("IS_TENSOR_INPUT_SCALE"),
+      reader.getBool("IS_TENSOR_INPUT_SCALE_2"),
       reader.getBool("USE_M_MAJOR_INPUT_SCALE"),
       reader.getBool("USE_TMA_A"),
       reader.getBool("USE_TMA_AS"),
+      reader.getBool("USE_TMA_AS2"),
       reader.getBool("USE_TMA_B"),
       reader.getBool("USE_TMA_C"),
       reader.getBool("USE_TMA_BS"),
@@ -342,6 +351,7 @@ Tensor launch_kernel(
     Tensor bs,
     std::optional<Tensor> bs2_,
     std::optional<Tensor> as_,
+    std::optional<Tensor> as2_,
     std::optional<Tensor> bzp_,
     std::optional<Tensor> bias_,
     std::optional<Tensor> c_,
@@ -358,7 +368,7 @@ Tensor launch_kernel(
   ASSERT_CHECK(configs_t.get_device() < 0, "configs must be a CPU tensor.");
   IntArrayRef configs(static_cast<int64_t *>(configs_t.data_ptr()),
                       static_cast<size_t>(configs_t.numel()));
-  return launch_kernel_impl(configs, a, b, bs, bs2_, as_, bzp_, bias_, c_, sorted_ids_, expert_ids_,
+  return launch_kernel_impl(configs, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c_, sorted_ids_, expert_ids_,
                             num_tokens_padded_, expert_layout_, locks_, top_k, valid_shape_m, should_check_tensor);
 }
 
@@ -369,6 +379,7 @@ void launch_kernel_out(
     Tensor bs,
     std::optional<Tensor> bs2_,
     std::optional<Tensor> as_,
+    std::optional<Tensor> as2_,
     std::optional<Tensor> bzp_,
     std::optional<Tensor> bias_,
     Tensor c,
@@ -381,19 +392,19 @@ void launch_kernel_out(
     int64_t valid_shape_m,
     bool should_check_tensor = true) {
   if (!a.is_cuda()) return;
-  (void)launch_kernel(configs_t, a, b, bs, bs2_, as_, bzp_, bias_, c, sorted_ids_, expert_ids_,
+  (void)launch_kernel(configs_t, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c, sorted_ids_, expert_ids_,
                       num_tokens_padded_, expert_layout_, locks, top_k, valid_shape_m, should_check_tensor);
 }
 
 COMMON_TORCH_LIBRARY(humming, m) {
   m.def(
       "launch_kernel(Tensor configs, Tensor a, Tensor b, Tensor bs, "
-      "Tensor? bs2, Tensor? as_, Tensor? bzp, Tensor? bias, Tensor? c, "
+      "Tensor? bs2, Tensor? as_, Tensor? as2, Tensor? bzp, Tensor? bias, Tensor? c, "
       "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
       "Tensor? locks, SymInt top_k, SymInt valid_shape_m, bool should_check_tensor = True) -> Tensor");
   m.def(
       "launch_kernel.out(Tensor configs, Tensor a, Tensor b, Tensor bs, "
-      "Tensor? bs2, Tensor? as_, Tensor? bzp, Tensor? bias, Tensor(a!) c, "
+      "Tensor? bs2, Tensor? as_, Tensor? as2, Tensor? bzp, Tensor? bias, Tensor(a!) c, "
       "Tensor? sorted_ids, Tensor? expert_ids, Tensor? num_tokens_padded, Tensor? expert_layout, "
       "Tensor(b!) locks, SymInt top_k, SymInt valid_shape_m, bool should_check_tensor = True) -> ()");
   m.def("register_kernel(str cubin_path) -> (int, str)");

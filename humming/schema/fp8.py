@@ -137,6 +137,22 @@ class Fp8InputSchema(BaseInputSchema):
         num_experts: int | None = None,
         sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, sm_version)
-        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=0)
-        return schema, {}
+        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, 0, sm_version)
+        if a_dtype is None:
+            quant_mode = "none"
+        else:
+            quant_mode = "static_tensor" if self.activation_scheme == "static" else "dynamic_token"
+        schema = HummingInputSchema(
+            a_dtype=a_dtype,
+            input_scale_group_size=0,
+            input_quant_mode=quant_mode,
+        )
+        if schema.static_tensor_scale_name is None:
+            return schema, {}
+        output_tensors = self._convert_static_tensor_scale(
+            tensors,
+            source_name="input_scale",
+            target_name=schema.static_tensor_scale_name,
+            num_experts=num_experts,
+        )
+        return schema, output_tensors

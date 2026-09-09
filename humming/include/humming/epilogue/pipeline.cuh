@@ -19,6 +19,7 @@ private:
   using GmemWriter = EpilogueGmemWriter<Ctx, ArithClass>;
 
   static constexpr bool kIsGroupedGemm = Ctx::kIsGroupedGemm;
+  static constexpr bool kHasTensorInputScale = Ctx::kIsTensorInputScale || Ctx::kIsTensorInputScale2;
   static constexpr uint32_t kNumWriteSplits = Ctx::kNumWriteSplits;
 
 public:
@@ -95,6 +96,10 @@ public:
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t current_shape_m, uint32_t m_offset) {
     gmem_writer.seek(m_block_id, n_block_id, current_shape_m, m_offset);
+    if constexpr (kHasTensorInputScale) {
+      const uint32_t *as_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorInputScale2 ? ctx.params.as2 : ctx.params.as);
+      arith.as[0] = as_ptr[Ctx::kIsDenseGemm ? 0 : expert_id];
+    }
     if constexpr (Ctx::kHasTensorWeightScale) {
       const uint32_t *gs_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorWeightScale2 ? ctx.params.bs2 : ctx.params.bs);
       arith.gs = gs_ptr[Ctx::kIsDenseGemm ? 0 : expert_id];

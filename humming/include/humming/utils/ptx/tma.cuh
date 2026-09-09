@@ -33,6 +33,14 @@ CUDA_INLINE void tma_load_1d(const void *desc_ptr, void *smem_ptr, void *mbar_pt
   }
 };
 
+CUDA_INLINE void tma_prefetch_1d(const void *desc_ptr, uint32_t crd0) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  asm volatile("cp.async.bulk.prefetch.tensor.1d.L2.global [%0, {%1}];"
+               :
+               : "l"(gmem_int_desc), "r"(crd0)
+               : "memory");
+}
+
 CUDA_INLINE void tma_prefetch_2d(const void *desc_ptr, uint32_t crd0, uint32_t crd1) {
   uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
   asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];"

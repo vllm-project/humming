@@ -1,5 +1,11 @@
 from humming.config.config import ComputeConfig, LayerConfig, TuningConfig
-from humming.config.enum import GemmType, MmaType, WeightScale2Type, WeightScaleType
+from humming.config.enum import (
+    GemmType,
+    InputQuantizationMode,
+    MmaType,
+    WeightScale2Type,
+    WeightScaleType,
+)
 from humming.config.mma import MmaOpClass
 
 __all__ = [
@@ -7,6 +13,7 @@ __all__ = [
     "ComputeConfig",
     "TuningConfig",
     "MmaType",
+    "InputQuantizationMode",
     "WeightScaleType",
     "WeightScale2Type",
     "GemmType",

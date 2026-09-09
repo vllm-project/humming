@@ -6,11 +6,12 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from humming import dtypes
+from humming.config import InputQuantizationMode
 from humming.device import DeviceInfo
 from humming.kernel.process_input import ProcessInputKernel
 from humming.ops.utils import init_humming_launcher, register_op
 
-from .enums import ActivationType, GroupScaleLayout, LayoutType, QuantizationMode
+from .enums import ActivationType, GroupScaleLayout, LayoutType
 from .plan import select_process_input_plan
 
 QUANT_DTYPE_MIN_SM_VERSION = {
@@ -28,7 +29,7 @@ QUANT_DTYPE_MIN_SM_VERSION = {
 class _ProcessInput:
     inputs: torch.Tensor
     outputs: torch.Tensor | None = None
-    quant_mode: QuantizationMode | str = "none"
+    quant_mode: InputQuantizationMode | str = "none"
     quant_dtype: dtypes.DataType | None = None
     quant_group_size: int | None = None
     group_scales: torch.Tensor | None = None
@@ -59,7 +60,7 @@ class _ProcessInput:
         assert self.inputs.is_contiguous() and self.inputs.size(-1) > 0
         self.layout = LayoutType(self.layout)
         self.group_scale_layout = GroupScaleLayout(self.group_scale_layout)
-        self.quant_mode = QuantizationMode(self.quant_mode)
+        self.quant_mode = InputQuantizationMode(self.quant_mode)
         self.should_quantize = self.quant_mode.should_quantize
         assert self.should_quantize == (self.quant_dtype is not None), "quant_dtype must match quant_mode"
         valid_quant_dtype = not self.should_quantize or self.quant_dtype in QUANT_DTYPE_MIN_SM_VERSION
@@ -207,7 +208,7 @@ class _ProcessInput:
 
         if uses_group:
             if self.quant_mode.dynamic_scale_mode == "group_token":
-                assert group_scale_dtype == dtypes.float8e4m3
+                assert group_scale_dtype in (dtypes.float32, dtypes.float8e4m3)
             if self.group_scale_layout == GroupScaleLayout.MxPacked:
                 assert group_scale_dtype in (dtypes.float8e4m3, dtypes.float8e8m0)
                 scale_shape = ((self.num_quant_groups + 3) // 4, self.group_scale_stride, 4)
@@ -232,7 +233,7 @@ class _ProcessInput:
                 assert self.token_scales.shape == self.output_leading_shape
                 assert self.token_scales.dtype == torch.float32
                 self.validate_tensor(self.token_scales)
-        elif not self.quant_mode.uses_token_scale:
+        elif not self.quant_mode.uses_tensor_scale:
             assert self.token_scales is None, "token_scales is not used by quant_mode"
 
     def select_schedule(self) -> None:

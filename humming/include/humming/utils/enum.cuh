@@ -1,6 +1,16 @@
 #pragma once
 
 
+enum class InputQuantizationMode : uint32_t {
+  Disabled = 0,
+  StaticTensor = 1,
+  DynamicToken = 2,
+  DynamicGroup = 3,
+  StaticTensorDynamicGroup = 4,
+  DynamicGroupToken = 5,
+};
+
+
 enum class WeightScaleType : uint32_t {
   GROUP,
   BLOCK,

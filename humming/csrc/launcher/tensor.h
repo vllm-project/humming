@@ -39,8 +39,6 @@ inline void check_tensor_common(
   if (expected_shape_.has_value()) {
     auto &expected_shape = expected_shape_.value();
     if (expected_shape.size() == 1 && expected_shape[0] == 1) {
-      int64_t actual = tensor.dim();
-      int64_t expected = 1;
       ASSERT_CHECK(tensor.dim() == 0 || tensor.dim() == 1, name, ".dim() != expected_shape.size() => ",
                    tensor.dim(), " not in [0, 1]");
       if (tensor.dim() == 1) {
@@ -98,7 +96,10 @@ inline void check_tensor_c(Tensor &tensor, KernelData &kernel_data, int64_t dev,
 };
 
 inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m, int64_t top_k) {
-  if (get_dtype_num_bits(kernel_data.a_dtype_id) == 16) return;
+  if (get_dtype_num_bits(kernel_data.a_dtype_id) == 16) {
+    ASSERT_CHECK(!tensor.has_value(), "as must be none when input quantization is disabled");
+    return;
+  }
   ASSERT_CHECK(tensor.has_value(), "as must not be none for 4b or 8b activation");
 
   uint32_t problem_shape_k = kernel_data.problem_shape_k;
@@ -118,6 +119,9 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
       expected_shape = {shape_m, (int64_t)CEIL_DIV(num_groups, 4)};
     }
     check_tensor_common(tensor.value(), "as", dev, ScalarType::Int, expected_shape);
+  } else if (kernel_data.is_tensor_input_scale) {
+    std::vector<int64_t> expected_shape = {kernel_data.num_experts > 0 ? kernel_data.num_experts : 1};
+    check_tensor_common(tensor.value(), "as", dev, ScalarType::Float, expected_shape);
   } else {
     std::vector<int64_t> expected_shape;
     if (kernel_data.use_m_major_input_scale && group_size > 0) {
@@ -127,6 +131,21 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
     }
     check_tensor_common(tensor.value(), "as", dev, ScalarType::Float, expected_shape);
   }
+};
+
+inline void check_tensor_as2(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m) {
+  if (!kernel_data.has_input_scale_2) {
+    ASSERT_CHECK(!tensor.has_value(), "as2 is not used by input_quant_mode");
+    return;
+  }
+  ASSERT_CHECK(tensor.has_value(), "as2 must not be none for the configured input_quant_mode");
+  std::vector<int64_t> expected_shape;
+  if (kernel_data.is_tensor_input_scale_2) {
+    expected_shape = {kernel_data.num_experts > 0 ? kernel_data.num_experts : 1};
+  } else {
+    expected_shape = {shape_m, 1};
+  }
+  check_tensor_common(tensor.value(), "as2", dev, ScalarType::Float, expected_shape);
 };
 
 inline void check_tensor_bs(Tensor &tensor, KernelData &kernel_data, int64_t dev) {
@@ -290,12 +309,20 @@ inline CUtensorMap make_tma_desc_as(std::optional<Tensor> &tensor_, KernelData &
     return make_tma_desc(tensor, {block_shape_m, CEIL_DIV(num_groups, 4)}, 0, "as");
   }
   if (group_size == 0) {
-    tensor = torch_view_shape(tensor, {1, -1});
-  } else {
-    tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
+    tensor = torch_view_shape(tensor, {-1});
+    return make_tma_desc(tensor, {block_shape_m}, 0, "as");
   }
 
+  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
   return make_tma_desc(tensor, {block_shape_m, num_groups}, 0, "as");
+}
+
+inline CUtensorMap make_tma_desc_as2(std::optional<Tensor> &tensor_, KernelData &kernel_data) {
+  if (!tensor_.has_value() || !kernel_data.use_tma_as2) return CUtensorMap();
+
+  auto tensor = tensor_.value();
+  tensor = torch_view_shape(tensor, {-1});
+  return make_tma_desc(tensor, {kernel_data.block_shape_m}, 0, "as2");
 }
 
 inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {

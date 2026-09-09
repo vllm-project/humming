@@ -34,6 +34,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaB>::Type B,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaC>::Type C,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaAS>::Type AS,
+    const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaAS2>::Type AS2,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBS>::Type BS,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBZP>::Type BZP,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBias>::Type Bias,
@@ -74,7 +75,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
   const KernelParams params{
       shape_m, top_k, use_int64_expert_layout,
-      param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(BS),
+      param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(AS2), param_to_ptr(BS),
       param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), param_to_ptr(BS2),
       sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr,
       tensor_map_buffer, locks};

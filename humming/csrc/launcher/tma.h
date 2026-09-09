@@ -47,7 +47,7 @@ inline CUtensorMap make_tma_desc(
     gmem_dims[i] = static_cast<uint64_t>(tensor.size(ndim - 1 - i));
   }
 
-  std::vector<uint64_t> gmem_strides(ndim - 1);
+  std::vector<uint64_t> gmem_strides(ndim > 1 ? ndim - 1 : 1);
   for (int i = 0; i < ndim - 1; ++i) {
     gmem_strides[i] = static_cast<uint64_t>(tensor.stride(ndim - 2 - i) * elsize);
   }

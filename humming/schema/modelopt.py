@@ -248,7 +248,26 @@ class ModeloptNvfp4InputSchema(ModeloptInputSchema):
         num_experts: int | None = None,
         sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, sm_version)
+        a_dtype = self.get_fallback_input_dtype(dtypes.float4e2m1, 16, sm_version)
         group_size = 16 if a_dtype == dtypes.float4e2m1 else 0
-        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=group_size)
-        return schema, {}
+        if a_dtype is None:
+            quant_mode = "none"
+        elif group_size > 0:
+            quant_mode = "dynamic_group_token" if self.dynamic else "static_tensor_dynamic_group"
+        else:
+            quant_mode = "dynamic_token" if self.dynamic else "static_tensor"
+
+        schema = HummingInputSchema(
+            a_dtype=a_dtype,
+            input_scale_group_size=group_size,
+            input_quant_mode=quant_mode,
+        )
+        if schema.static_tensor_scale_name is None:
+            return schema, {}
+        output_tensors = self._convert_static_tensor_scale(
+            tensors,
+            source_name="input_scale",
+            target_name=schema.static_tensor_scale_name,
+            num_experts=num_experts,
+        )
+        return schema, output_tensors

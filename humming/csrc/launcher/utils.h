@@ -141,9 +141,13 @@ struct KernelData {
   bool is_tensor_weight_scale_2;
   bool has_zero_point;
   bool has_bias;
+  bool has_input_scale_2;
+  bool is_tensor_input_scale;
+  bool is_tensor_input_scale_2;
   bool use_m_major_input_scale;
   bool use_tma_a;
   bool use_tma_as;
+  bool use_tma_as2;
   bool use_tma_b;
   bool use_tma_c;
   bool use_tma_bs;

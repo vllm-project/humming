@@ -233,6 +233,7 @@ class BaseInputSchema:
     def get_fallback_input_dtype(
         self,
         a_dtype: dtypes.DataType | None,
+        group_size: int = 0,
         sm_version: int | tuple[int, int] | None = None,
     ) -> dtypes.DataType | None:
         if sm_version is None:
@@ -249,8 +250,9 @@ class BaseInputSchema:
         elif a_dtype == dtypes.float8e5m2:
             a_dtype_order = [dtypes.float8e5m2]
         elif a_dtype == dtypes.float4e2m1:
-            # NOTE: float4e2m1 isn't fully tested now, so disable it
-            a_dtype_order = [dtypes.float8e4m3]
+            a_dtype_order = [dtypes.float4e2m1]
+            if group_size == 0:
+                a_dtype_order.append(dtypes.float8e4m3)
         elif a_dtype == dtypes.int8:
             a_dtype_order = [dtypes.int8]
         elif a_dtype == dtypes.int4:
@@ -289,6 +291,21 @@ class BaseInputSchema:
 
         self.may_add_expert_dim(tensor_meta, num_experts)
         return tensor_meta
+
+    @staticmethod
+    def _convert_static_tensor_scale(
+        tensors: dict[str, torch.Tensor],
+        source_name: str,
+        target_name: str,
+        num_experts: int | None = None,
+        reciprocal: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Convert checkpoint per-stack scales to Humming per-tensor scales."""
+        scale = tensors[source_name].view(num_experts or 1, -1).float()
+        if reciprocal:
+            scale = scale.reciprocal()
+        scale = scale.amax(dim=-1)
+        return {target_name: scale.contiguous()}
 
     def get_tensors_attrs(
         self,

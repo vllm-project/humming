@@ -10,7 +10,7 @@ from filelock import FileLock
 
 import humming.utils.jit as jit_utils
 from humming import dtypes, ops
-from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
+from humming.config import ComputeConfig, GemmType, InputQuantizationMode, LayerConfig, MmaType, TuningConfig
 from humming.device import current_device
 from humming.kernel.humming import HummingKernel
 from humming.schema import HummingWeightSchema
@@ -85,9 +85,7 @@ class KernelTestCase:
     @property
     def uses_m_major_input_scale(self) -> bool:
         return self.compute_config.use_m_major_input_scale or (
-            self.layer_config.has_input_scale
-            and self.layer_config.input_scale_group_size == 0
-            and self.layer_config.mma_type != MmaType.MXMMA
+            self.layer_config.is_token_input_scale and self.layer_config.mma_type != MmaType.MXMMA
         )
 
 
@@ -204,14 +202,19 @@ class KernelTestRunner:
     def prepare_inputs(
         self,
         inputs_orig: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         config = self.layer_config
         shape_k = config.shape_k - config.pad_shape_k
         assert inputs_orig.shape[1] == shape_k
 
         if config.a_dtype.num_bits == 16:
             inputs = inputs_orig.to(dtypes.torch_dtype_map[config.a_dtype])
-            return inputs.float(), inputs, None
+            return inputs.float(), inputs, None, None
+
+        static_scale = None
+        if config.input_quant_mode.has_static_tensor_scale:
+            target_maximum = 448.0 if config.a_dtype == dtypes.float8e4m3 else 127.0
+            static_scale = (inputs_orig.abs().amax() / target_maximum).reshape(1).float()
 
         def process(m_major_scale: bool = False):
             scale_layout = "row_major"
@@ -219,31 +222,43 @@ class KernelTestRunner:
                 scale_layout = "m_major"
                 if str(config.as_dtype) in ("float8e4m3", "float8e8m0"):
                     scale_layout = "mx_packed"
-            quant_mode = "dynamic_group" if config.input_scale_group_size > 0 else "dynamic_token"
             result = ops.process_input(
                 inputs_orig,
-                quant_mode=quant_mode,
+                quant_mode=config.input_quant_mode.value,
                 quant_dtype=str(config.a_dtype),
                 quant_group_size=config.input_scale_group_size or None,
                 group_scale_dtype=str(config.as_dtype),
                 group_scale_layout=scale_layout,
+                token_scales=static_scale,
             )
-            scale = result[1]
-            if scale is None:
-                assert result[2] is not None
-                scale = result[2].unsqueeze(-1)
-            return result[0], scale
+            return result
 
-        inputs, scale_ref = process()
+        inputs, group_scale_ref, token_scale_ref = process()
         use_m_major_input_layout = self.test_case.uses_m_major_input_scale and (
             config.input_scale_group_size > 0 or config.mma_type == MmaType.MXMMA
         )
         if use_m_major_input_layout:
-            _, input_scale = process(m_major_scale=True)
+            _, input_scale, input_scale_2 = process(m_major_scale=True)
         elif config.mma_type == MmaType.MXMMA and config.input_scale_group_size > 0:
-            input_scale = scale_ref.view(torch.int32).contiguous()
+            assert group_scale_ref is not None
+            input_scale = group_scale_ref.view(torch.int32).contiguous()
+            input_scale_2 = token_scale_ref
         else:
-            input_scale = scale_ref
+            input_scale = group_scale_ref if group_scale_ref is not None else token_scale_ref
+            input_scale_2 = token_scale_ref if config.input_quant_mode.has_secondary_scale else None
+
+        if config.input_quant_mode.has_dynamic_token_scale and input_scale_2 is not None:
+            input_scale_2 = input_scale_2.unsqueeze(-1)
+        if config.input_quant_mode == InputQuantizationMode.DynamicToken and input_scale is not None:
+            input_scale = input_scale.unsqueeze(-1)
+        if config.input_quant_mode.has_static_tensor_scale:
+            tensor_scale = static_scale
+            if config.num_experts:
+                tensor_scale = tensor_scale.expand(config.num_experts).contiguous()
+            if config.input_quant_mode.has_secondary_scale:
+                input_scale_2 = tensor_scale
+            else:
+                input_scale = tensor_scale
 
         if config.a_dtype.num_bits == 4:
             codes = ops.unpack_weight(inputs.view(torch.int32), 4)
@@ -265,9 +280,17 @@ class KernelTestRunner:
         else:
             dequant_inputs = inputs.float()
 
-        group_size = config.input_scale_group_size or shape_k
-        inputs_ref = dequant_inputs.float() * scale_ref.float().repeat_interleave(group_size, 1)
-        return inputs_ref, inputs, input_scale
+        if group_scale_ref is not None:
+            scale_ref = group_scale_ref.float()
+            if token_scale_ref is not None:
+                scale_ref = scale_ref * token_scale_ref.float().reshape(-1, 1)
+            group_size = config.input_scale_group_size
+        else:
+            assert token_scale_ref is not None
+            scale_ref = token_scale_ref.float().reshape(-1, 1)
+            group_size = shape_k
+        inputs_ref = dequant_inputs.float() * scale_ref.repeat_interleave(group_size, 1)
+        return inputs_ref, inputs, input_scale, input_scale_2
 
     def _sample_inputs(
         self,
@@ -509,8 +532,12 @@ class KernelTestRunner:
             block_shape_m = max_kernel[1]["block_shape"][0]
             base_problem = self._prepare_problem(max_shape_m, base_inputs, base_topk_ids, block_shape_m)
             base_problem_inputs, base_launch_tensors, base_output_ids = base_problem
-            _, inputs, input_scale = self.prepare_inputs(base_problem_inputs)
-            base_launch_tensors |= {"inputs": inputs, "input_scale": input_scale}
+            _, inputs, input_scale, input_scale_2 = self.prepare_inputs(base_problem_inputs)
+            base_launch_tensors |= {
+                "inputs": inputs,
+                "input_scale": input_scale,
+                "input_scale_2": input_scale_2,
+            }
             base_outputs = self._launch_kernel(max_shape_m, base_launch_tensors, max_kernel[0])
             base_outputs = base_outputs[base_output_ids].view(max_shape_m, output_top_k, -1)
 
@@ -523,8 +550,12 @@ class KernelTestRunner:
             moe_block_size = test_kernel[1]["block_shape"][0]
             problem = self._prepare_problem(shape_m, inputs, topk_ids, moe_block_size)
             problem_inputs, launch_tensors, output_ids = problem
-            inputs_ref, inputs, input_scale = self.prepare_inputs(problem_inputs)
-            launch_tensors |= {"inputs": inputs, "input_scale": input_scale}
+            inputs_ref, inputs, input_scale, input_scale_2 = self.prepare_inputs(problem_inputs)
+            launch_tensors |= {
+                "inputs": inputs,
+                "input_scale": input_scale,
+                "input_scale_2": input_scale_2,
+            }
             outputs_ref = self.make_reference(inputs_ref, topk_ids, output_ids)
 
             for kernel in kernels[shape_m]:
@@ -534,7 +565,11 @@ class KernelTestRunner:
                     kernel_problem = self._prepare_problem(shape_m, problem_inputs, topk_ids, block_shape_m)
                     _, kernel_launch_tensors, kernel_output_ids = kernel_problem
                     assert torch.equal(kernel_output_ids, output_ids)
-                    kernel_launch_tensors |= {"inputs": inputs, "input_scale": input_scale}
+                    kernel_launch_tensors |= {
+                        "inputs": inputs,
+                        "input_scale": input_scale,
+                        "input_scale_2": input_scale_2,
+                    }
 
                 result = self._run_kernel(shape_m, kernel_launch_tensors, kernel, outputs_ref, output_ids)
 

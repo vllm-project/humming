@@ -5,13 +5,13 @@ import jinja2
 import torch
 
 from humming import dtypes
+from humming.config import InputQuantizationMode
 from humming.config.base import BaseHummingConfig
 from humming.jit.runtime import KernelRuntime
 from humming.ops.input.enums import (
     ActivationType,
     GroupScaleLayout,
     LayoutType,
-    QuantizationMode,
     QuantizationPhase,
 )
 
@@ -98,7 +98,7 @@ class ProcessInputKernel(KernelRuntime, BaseHummingConfig):
     activation_impl: str = ""
 
     # Quantization
-    quant_mode: QuantizationMode | str = QuantizationMode.DynamicGroup
+    quant_mode: InputQuantizationMode | str = InputQuantizationMode.DynamicGroup
     group_scale_dtype: str = "float32"
     scale_layout: GroupScaleLayout | str = GroupScaleLayout.RowMajor
     quantization_phase: QuantizationPhase | str = QuantizationPhase.Fused
@@ -116,7 +116,7 @@ class ProcessInputKernel(KernelRuntime, BaseHummingConfig):
     def __post_init__(self):
         self.activation_type = ActivationType(self.activation_type)
         self.layout = LayoutType(self.layout)
-        self.quant_mode = QuantizationMode(self.quant_mode)
+        self.quant_mode = InputQuantizationMode(self.quant_mode)
         self.quantization_phase = QuantizationPhase(self.quantization_phase)
         self.scale_layout = GroupScaleLayout(self.scale_layout)
         super().__post_init__()
@@ -132,7 +132,7 @@ class ProcessInputKernel(KernelRuntime, BaseHummingConfig):
     def init_kernel(self):
         is_finalizer = isinstance(self, ProcessInputScaleKernel)
         if is_finalizer:
-            assert self.quant_mode == QuantizationMode.DynamicGroupToken
+            assert self.quant_mode == InputQuantizationMode.DynamicGroupToken
             assert self.use_tile_partition
             assert self.quantization_phase == QuantizationPhase.Fused
             assert 1 <= self.finalize_tokens_per_block <= 32

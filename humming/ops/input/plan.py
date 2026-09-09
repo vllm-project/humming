@@ -3,7 +3,9 @@
 import dataclasses
 import math
 
-from .enums import ActivationType, QuantizationMode
+from humming.config import InputQuantizationMode
+
+from .enums import ActivationType
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,7 +278,7 @@ def _raw_tile_score(operation, device, plan: ProcessInputPlan):
     columns = min(operation.hidden_size, plan.tiles_per_block * operation.tile_size)
     idle = plan.threads * plan.values_per_thread - columns
     underfilled = operation.schedule_rows < 2 * device.sm_count
-    if operation.quant_mode == QuantizationMode.StaticTensor:
+    if operation.quant_mode == InputQuantizationMode.StaticTensor:
         target_threads = 128 if underfilled else 256
         target_columns = min(operation.hidden_size, 8 * target_threads)
         return (

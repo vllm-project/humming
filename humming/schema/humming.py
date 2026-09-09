@@ -4,6 +4,7 @@ from typing import Any, ClassVar
 import torch
 
 from humming import dtypes
+from humming.config import InputQuantizationMode
 from humming.config.enum import WeightScale2Type, WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.utils.weight import dequantize_weight, quantize_weight
@@ -318,11 +319,13 @@ class HummingInputSchema(BaseInputSchema):
     a_dtype: dtypes.DataType | None = None
     input_scale_group_size: int = 0
     input_scale_dtype: dtypes.DataType | None = None
+    input_quant_mode: InputQuantizationMode | str | None = None
 
     KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {
         "a_dtype": ["input_dtype", "dtype"],
         "input_scale_group_size": ["group_size"],
         "input_scale_dtype": ["scale_dtype"],
+        "input_quant_mode": ["quant_mode", "quantization_mode"],
     }
 
     def __post_init__(self):
@@ -330,11 +333,21 @@ class HummingInputSchema(BaseInputSchema):
             self.a_dtype = dtypes.DataType.from_str(str(self.a_dtype))
         if isinstance(self.input_scale_dtype, str):
             self.input_scale_dtype = dtypes.DataType.from_str(str(self.input_scale_dtype))
+        if isinstance(self.input_quant_mode, str):
+            self.input_quant_mode = InputQuantizationMode(self.input_quant_mode)
 
     def get_activation_bits(self):
         if self.a_dtype is None:
             return 16
         return self.a_dtype.num_bits
+
+    @property
+    def static_tensor_scale_name(self) -> str | None:
+        if self.input_quant_mode == InputQuantizationMode.StaticTensor:
+            return "input_scale"
+        if self.input_quant_mode == InputQuantizationMode.StaticTensorDynamicGroup:
+            return "input_scale_2"
+        return None
 
     def get_tensors_attrs(
         self,
@@ -343,7 +356,13 @@ class HummingInputSchema(BaseInputSchema):
         num_experts: int | None = None,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
-        return {}
+        if self.static_tensor_scale_name is None:
+            return {}
+        return self._get_input_scale_attrs(
+            num_experts=num_experts,
+            dtype=torch.float32,
+            input_scale_name=self.static_tensor_scale_name,
+        )
 
     def _convert_humming(
         self,
@@ -354,4 +373,13 @@ class HummingInputSchema(BaseInputSchema):
         num_experts: int | None = None,
         sm_version: int | tuple[int, int] | None = None,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
-        return self, {}
+        schema = dataclasses.replace(self)
+        if self.static_tensor_scale_name is None:
+            return schema, {}
+        tensors = self._convert_static_tensor_scale(
+            tensors,
+            source_name=self.static_tensor_scale_name,
+            target_name=self.static_tensor_scale_name,
+            num_experts=num_experts,
+        )
+        return schema, tensors

@@ -336,6 +336,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
                     assert mma_k // gs in (1, 2, 4)
             if self.input_scale_group_size > 0 and self.weight_scale_group_size > 0:
                 assert self.input_scale_group_size == self.weight_scale_group_size
+                if self.is_group_weight_scale:
+                    err_msg = "MXMMA input and weight per-group scales must use the same dtype"
+                    assert self.as_dtype == self.bs_dtype, err_msg
             return
 
         if self.input_scale_group_size > 0:
@@ -427,10 +430,18 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         assert self.gemm_type is not None, "gemm_type must be specify for MoE GEMM"
+        if self.is_indexed_gemm and self.num_experts > 1:
+            assert not self.input_quant_mode.has_static_tensor_scale, (
+                "indexed GEMM cannot use per-expert static input scales because "
+                "its quantized inputs are shared across experts"
+            )
         if self.reduce_overlap_last_stage_only:
             assert not self.is_indexed_gemm, "reduce_overlap_last_stage_only does not support indexed GEMM"
 
-        if self.has_input_scale and self.input_scale_group_size == 0 and self.mma_type != MmaType.MXMMA:
+        if self.is_tensor_input_scale:
+            self.use_tma_as = False
+            self.use_m_major_input_scale = False
+        elif self.has_input_scale and self.input_scale_group_size == 0 and self.mma_type != MmaType.MXMMA:
             self.use_m_major_input_scale = True
         if self.mma_type == MmaType.MXMMA and self.input_scale_group_size == 0:
             self.use_tma_as = False
@@ -439,11 +450,16 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.use_tma_as and self.is_indexed_gemm:
             self.use_tma_as = False
             self.use_m_major_input_scale = True
+        if not self.has_input_scale_2 or self.is_tensor_input_scale_2:
+            self.use_tma_as2 = False
+        elif self.use_tma_as2 and self.is_indexed_gemm:
+            self.use_tma_as2 = False
 
         if self.is_indexed_gemm:
             assert not self.use_tma_a, "indexed GEMM does not support TMA input loads"
             assert not self.use_tma_c, "indexed GEMM does not support TMA output stores"
             assert not self.use_tma_as, "indexed GEMM does not support TMA input scale loads"
+            assert not self.use_tma_as2, "indexed GEMM does not support TMA secondary input scale loads"
 
         if self.multi_cast_size_a * self.multi_cast_size_b > 1:
             assert self.sm_version in (90, 100, 103)

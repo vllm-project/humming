@@ -14,16 +14,6 @@ enum class ScaleMode : uint32_t {
 };
 
 
-enum class QuantizationMode : uint32_t {
-  Disabled = 0,
-  StaticTensor = 1,
-  DynamicToken = 2,
-  DynamicGroup = 3,
-  StaticTensorDynamicGroup = 4,
-  DynamicGroupToken = 5,
-};
-
-
 enum class QuantizationPhase : uint32_t {
   Fused = 0,
   CollectAbsmax = 1,

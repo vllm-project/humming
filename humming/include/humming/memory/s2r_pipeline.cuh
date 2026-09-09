@@ -21,9 +21,11 @@ private:
   static constexpr uint32_t kPartMmaShapeK = Ctx::kPartMmaShapeK;
   static constexpr uint32_t kNumStages = Ctx::TuningConfig::kNumStages;
 
-  static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsChannelInputScale = kHasInputScale && Ctx::kInputScaleGroupSize == 0;
-  static constexpr bool kIsGroupInputScale = kHasInputScale && Ctx::kInputScaleGroupSize > 0;
+  static constexpr bool kHasInputScale = Ctx::kHasInputScale;
+  static constexpr bool kHasInputScale2 = Ctx::kHasInputScale2;
+  static constexpr bool kIsChannelInputScale = kHasInputScale && !Ctx::kIsGroupInputScale && !Ctx::kIsTensorInputScale;
+  static constexpr bool kIsChannelInputScale2 = kHasInputScale2 && !Ctx::kIsTensorInputScale2;
+  static constexpr bool kIsGroupInputScale = kHasInputScale && Ctx::kIsGroupInputScale;
   static constexpr bool kIsChannelWeightScale = Ctx::kIsChannelWeightScale;
   static constexpr bool kIsChannelWeightScale2 = Ctx::kIsChannelWeightScale2;
   static constexpr bool kIsGroupWeightScale = Ctx::kIsGroupWeightScale;
@@ -36,6 +38,7 @@ private:
   using LoaderA = S2RMemoryLoaderA<Ctx>;
   using LoaderB = S2RMemoryLoaderB<Ctx>;
   using LoaderAS = S2RMemoryLoaderAS<Ctx>;
+  using LoaderAS2 = S2RMemoryLoaderAS<Ctx, true>;
   using LoaderBS = S2RMemoryLoaderBS<Ctx>;
   using LoaderBZP = S2RMemoryLoaderBZP<Ctx>;
   using LoaderBias = S2RMemoryLoaderBias<Ctx>;
@@ -47,6 +50,7 @@ public:
   LoaderA loader_a;
   LoaderB loader_b;
   LoaderAS loader_as;
+  LoaderAS2 loader_as2;
   LoaderBS loader_bs;
   LoaderBZP loader_bzp;
   LoaderBias loader_bias;
@@ -54,7 +58,7 @@ public:
   CUDA_INLINE
   S2RMemoryPipeline(Ctx &ctx, MMA &mma, Epilogue &epilogue)
       : ctx(ctx), mma(mma), epilogue(epilogue),
-        loader_a(ctx), loader_b(ctx), loader_as(ctx),
+        loader_a(ctx), loader_b(ctx), loader_as(ctx), loader_as2(ctx),
         loader_bs(ctx), loader_bzp(ctx), loader_bias(ctx) {
   }
 
@@ -91,6 +95,7 @@ public:
   CUDA_INLINE void load_channel(uint32_t slice_id) {
     auto &smem = ctx.smem;
     if constexpr (kIsChannelInputScale) loader_as.load(smem.as_c, epilogue.arith.regs_as_as_ptr(), -1);
+    if constexpr (kIsChannelInputScale2) loader_as2.load(smem.as_c, epilogue.arith.regs_as_as_ptr(), -1);
     if constexpr (kIsChannelWeightScale) loader_bs.load(smem.bs_c, epilogue.arith.regs_bs_as_ptr(), -1);
     if constexpr (kIsChannelWeightScale2) loader_bias.load(smem.bs2_c, epilogue.arith.regs_bs2_as_ptr(), 1);
     if constexpr (kHasBias) loader_bias.load(smem.bias, epilogue.arith.regs_bias_as_ptr(), slice_id == 0);

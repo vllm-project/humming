@@ -3,7 +3,7 @@
 #include <humming/utils/all.cuh>
 
 
-template <class Ctx>
+template <class Ctx, bool kSecondary = false>
 class S2RMemoryLoaderAS {
 private:
   using MmaOpClass = typename Ctx::MmaOpClass;
@@ -13,9 +13,11 @@ private:
 
   static constexpr bool kUseWgmma = Ctx::kUseWgmma;
   static constexpr bool kUseMxmma = Ctx::kUseMxmma;
-  static constexpr bool kHasInputScale = ElementA::kBits != 16;
-  static constexpr bool kIsChannelScale = kHasInputScale && Ctx::kInputScaleGroupSize == 0;
-  static constexpr bool kIsGroupScale = kHasInputScale && Ctx::kInputScaleGroupSize > 0;
+  static constexpr bool kConfiguredInputScale = kSecondary ? Ctx::kHasInputScale2 : Ctx::kHasInputScale;
+  static constexpr bool kIsTensorScale = kSecondary ? Ctx::kIsTensorInputScale2 : Ctx::kIsTensorInputScale;
+  static constexpr bool kHasInputScale = kConfiguredInputScale && !kIsTensorScale;
+  static constexpr bool kIsChannelScale = kHasInputScale && (kSecondary || !Ctx::kIsGroupInputScale);
+  static constexpr bool kIsGroupScale = kHasInputScale && !kSecondary && Ctx::kIsGroupInputScale;
   static constexpr bool kMMajorInputScale = Ctx::kUseMMajorInputScale && kIsGroupScale;
 
   static constexpr uint32_t kGroupSize = kIsGroupScale ? Ctx::kInputScaleGroupSize : BlockShape::K;
