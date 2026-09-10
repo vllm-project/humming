@@ -70,6 +70,14 @@ class AWQWeightSchema(BaseWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        return HummingWeightSchema(
+            b_dtype=dtypes.DataType.from_str(f"uint{self.bits}"),
+            bs_dtype=dtypes.DataType.from_torch_dtype(param_dtype),
+            weight_scale_group_size=self.group_size,
+            has_zero_point=self.zero_point,
+        )
+
     def _unpack_and_uninterleave(self, tensor: torch.Tensor):
         num_experts = tensor.size(0) if tensor.ndim == 3 else None
         tensor = tensor.cuda()
@@ -89,11 +97,7 @@ class AWQWeightSchema(BaseWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
-        schema = HummingWeightSchema(
-            b_dtype=dtypes.DataType.from_str(f"uint{self.bits}"),
-            weight_scale_group_size=self.group_size,
-            has_zero_point=self.zero_point,
-        )
+        schema = self.to_humming_schema(param_dtype)
 
         weight = tensors["qweight"]
         weight = self._unpack_and_uninterleave(weight)

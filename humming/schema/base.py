@@ -4,8 +4,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
-from humming import dtypes
-from humming.device import current_device
 from humming.utils.math import round_up
 
 if TYPE_CHECKING:
@@ -93,6 +91,9 @@ class BaseWeightSchema:
         has_bias: bool = False,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
+        raise NotImplementedError
+
+    def to_humming_schema(self, param_dtype: torch.dtype) -> "HummingWeightSchema":
         raise NotImplementedError
 
     def process_loaded_weight(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
@@ -231,50 +232,6 @@ class BaseInputSchema:
     def get_activation_bits(self):
         raise NotImplementedError
 
-    def get_fallback_input_dtype(
-        self,
-        a_dtype: dtypes.DataType | None,
-        group_size: int = 0,
-        sm_version: int | tuple[int, int] | None = None,
-    ) -> dtypes.DataType | None:
-        if sm_version is None:
-            sm_version = current_device.sm_version
-        if isinstance(sm_version, tuple):
-            sm_version = sm_version[0] * 10 + sm_version[1]
-        assert isinstance(sm_version, int)
-
-        a_dtype_order: list[dtypes.DataType] = []
-        if a_dtype is None or a_dtype in [dtypes.float16, dtypes.bfloat16]:
-            return a_dtype
-        elif a_dtype == dtypes.float8e4m3:
-            a_dtype_order = [dtypes.float8e4m3]
-        elif a_dtype == dtypes.float8e5m2:
-            a_dtype_order = [dtypes.float8e5m2]
-        elif a_dtype == dtypes.float4e2m1:
-            a_dtype_order = [dtypes.float4e2m1]
-            if group_size == 0:
-                a_dtype_order.append(dtypes.float8e4m3)
-        elif a_dtype == dtypes.int8:
-            a_dtype_order = [dtypes.int8]
-        elif a_dtype == dtypes.int4:
-            a_dtype_order = [dtypes.int4, dtypes.float8e4m3, dtypes.int8]
-        else:
-            raise ValueError(f"unsupported a_dtype: {a_dtype}")
-
-        for dtype in a_dtype_order:
-            if dtype == dtypes.float8e4m3 and sm_version >= 89:
-                return dtype
-            elif dtype == dtypes.float8e5m2 and sm_version >= 89:
-                return dtype
-            elif dtype == dtypes.float4e2m1 and sm_version >= 120:
-                return dtype
-            elif dtype == dtypes.int8:
-                return dtype
-            elif dtype == dtypes.int4 and sm_version >= 80:
-                return dtype
-
-        return None
-
     def _get_input_scale_attrs(
         self,
         num_experts: int | None = None,
@@ -315,6 +272,9 @@ class BaseInputSchema:
     ) -> dict[str, dict[str, Any]]:
         return {}
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> "HummingInputSchema":
+        raise NotImplementedError
+
     def convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
@@ -322,7 +282,6 @@ class BaseInputSchema:
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
-        sm_version: int | tuple[int, int] | None = None,
         device: int | torch.device | None = None,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
         with torch.cuda.device(device):
@@ -332,7 +291,6 @@ class BaseInputSchema:
                 shape_k_stacks,
                 param_dtype,
                 num_experts,
-                sm_version,
             )
 
     def _convert_humming(
@@ -342,7 +300,6 @@ class BaseInputSchema:
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
-        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
         raise NotImplementedError
 

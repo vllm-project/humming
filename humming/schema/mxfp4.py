@@ -50,6 +50,13 @@ class Mxfp4WeightSchema(BaseWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        return HummingWeightSchema(
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            weight_scale_group_size=32,
+        )
+
     def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
@@ -58,11 +65,7 @@ class Mxfp4WeightSchema(BaseWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
-        schema = HummingWeightSchema(
-            b_dtype=dtypes.float4e2m1,
-            bs_dtype=dtypes.float8e8m0,
-            weight_scale_group_size=32,
-        )
+        schema = self.to_humming_schema(param_dtype)
 
         weight = tensors["weight"].view(torch.int32)
         weight_scale = tensors["weight_scale"]

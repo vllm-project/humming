@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from humming import dtypes
+from humming.config import InputQuantizationMode, WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
@@ -65,6 +66,23 @@ class Fp8WeightSchema(BaseWeightSchema):
         shape_k = tensors["weight"].size(-1)
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
+
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        if self.weight_block_size is None:
+            return HummingWeightSchema(
+                b_dtype=dtypes.float8e4m3,
+                bs_dtype=dtypes.float32,
+                weight_scale_type=WeightScaleType.TENSOR,
+            )
+
+        block_size_n, block_size_k = self.weight_block_size
+        return HummingWeightSchema(
+            b_dtype=dtypes.float8e4m3,
+            bs_dtype=dtypes.float32,
+            weight_scale_group_size=block_size_k,
+            weight_scale_group_size_n=block_size_n,
+            weight_scale_type=WeightScaleType.BLOCK,
+        )
 
     def _convert_humming(
         self,
@@ -128,6 +146,18 @@ class Fp8InputSchema(BaseInputSchema):
             return self._get_input_scale_attrs(num_experts, stack_size)
         return {}
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingInputSchema:
+        quant_mode = (
+            InputQuantizationMode.StaticTensor
+            if self.activation_scheme == "static"
+            else InputQuantizationMode.DynamicToken
+        )
+        return HummingInputSchema(
+            a_dtype=dtypes.float8e4m3,
+            input_scale_group_size=0,
+            input_quant_mode=quant_mode,
+        )
+
     def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
@@ -135,18 +165,8 @@ class Fp8InputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
-        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, 0, sm_version)
-        if a_dtype is None:
-            quant_mode = "none"
-        else:
-            quant_mode = "static_tensor" if self.activation_scheme == "static" else "dynamic_token"
-        schema = HummingInputSchema(
-            a_dtype=a_dtype,
-            input_scale_group_size=0,
-            input_quant_mode=quant_mode,
-        )
+        schema = self.to_humming_schema(param_dtype)
         if schema.static_tensor_scale_name is None:
             return schema, {}
         output_tensors = self._convert_static_tensor_scale(

@@ -180,6 +180,9 @@ class HummingWeightSchema(BaseWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> "HummingWeightSchema":
+        return dataclasses.replace(self)
+
     @classmethod
     def quant_tensor(
         cls,
@@ -269,7 +272,7 @@ class HummingWeightSchema(BaseWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
-        schema = dataclasses.replace(self)
+        schema = self.to_humming_schema(param_dtype)
         is_tensor_only = self.weight_scale_type == WeightScaleType.TENSOR
         if self.has_tensor_weight_scale:
             if is_tensor_only and "weight_scale" not in tensors and "global_scale" in tensors:
@@ -363,6 +366,9 @@ class HummingInputSchema(BaseInputSchema):
             input_scale_name=self.static_tensor_scale_name,
         )
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> "HummingInputSchema":
+        return dataclasses.replace(self)
+
     def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
@@ -370,9 +376,8 @@ class HummingInputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
-        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
-        schema = dataclasses.replace(self)
+        schema = self.to_humming_schema(param_dtype)
         if self.static_tensor_scale_name is None:
             return schema, {}
         tensors = self._convert_static_tensor_scale(
