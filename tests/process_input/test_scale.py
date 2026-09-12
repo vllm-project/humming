@@ -72,6 +72,7 @@ def test_quantization_scales(
         expected,
         quant_mode=quant_mode,
         quant_dtype=quant_dtype,
+        group_scale_dtype=group_scale_dtype,
         quant_group_size=quant_group_size,
         use_m_major_input_scale=use_m_major_input_scale,
     )

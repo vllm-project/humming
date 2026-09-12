@@ -573,14 +573,19 @@ class ProcessInputProblemConfig(BaseHummingConfig):
         dtype = self.quant_dtype or self.input_dtype
         return dtypes.torch_dtype_map.get(dtype, torch.uint8)
 
-    def get_group_scale_shape(self, rows: int) -> tuple[int, ...]:
-        groups = self.hidden_size // self.quant_group_size
-        if not self.use_m_major_input_scale:
-            return rows, round_up(groups, 4) if self.group_scale_dtype.num_bits == 8 else groups
-        stride = round_up(rows, 4)
+    @property
+    def group_scale_torch_dtype(self) -> torch.dtype:
         if self.group_scale_dtype.num_bits == 8:
-            return (groups + 3) // 4, stride, 4
-        return groups, stride
+            return torch.int32
+        return dtypes.torch_dtype_map[self.group_scale_dtype]
+
+    def get_group_scale_shape(self, rows: int) -> tuple[int, int]:
+        groups = self.hidden_size // self.quant_group_size
+        if self.group_scale_dtype.num_bits == 8:
+            groups = (groups + 3) // 4
+        if self.use_m_major_input_scale:
+            return groups, round_up(rows, 4)
+        return rows, groups
 
 
 @dataclasses.dataclass(kw_only=True, unsafe_hash=True)

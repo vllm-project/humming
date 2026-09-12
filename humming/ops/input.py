@@ -44,7 +44,7 @@ def _prepare_process_input_op(
         assert scatter_idx is not None and scatter_idx.ndim == 2, "scatter requires 2D scatter_idx"
         scatter_width = int(scatter_idx.size(1))
 
-    if group_scale_dtype is None and group_scales is not None:
+    if group_scale_dtype is None and group_scales is not None and group_scales.dtype != torch.int32:
         group_scale_dtype = dtypes.DataType.from_torch_dtype(group_scales.dtype)
 
     config = ProcessInputProblemConfig(
@@ -82,7 +82,7 @@ def _prepare_process_input_op(
     if config.quant_mode.has_group_scale and group_scales is None:
         allocated_group_scales = torch.empty(
             config.get_group_scale_shape(num_output_rows),
-            dtype=dtypes.torch_dtype_map[config.group_scale_dtype],
+            dtype=config.group_scale_torch_dtype,
             device=inputs.device,
         )
 
@@ -137,6 +137,11 @@ def process_input(
     use_m_major_input_scale: bool = False,
     use_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Process inputs and return quantization scales.
+
+    FP8 group scales store four consecutive groups per int32, low byte first.
+    Their numerical format is selected by group_scale_dtype, not the tensor dtype.
+    """
     options = dict(
         quant_mode=quant_mode,
         quant_dtype=quant_dtype,

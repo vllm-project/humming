@@ -150,19 +150,16 @@ def tensor_round_to(tensor: torch.Tensor, dtype: dtypes.DataType, round_mode: st
 
 def apply_scale_layout_ref(group_scales: torch.Tensor, use_m_major_input_scale: bool = False):
     rows, groups = group_scales.shape
-    pad_rows = round_up(rows, 4) - rows if use_m_major_input_scale else 0
-    if group_scales.dtype == torch.float32:
-        if use_m_major_input_scale:
-            pad_shape = (0, 0, 0, pad_rows)
-            return torch.nn.functional.pad(group_scales, pad_shape).T.contiguous()
-        return group_scales
+    if group_scales.element_size() == 1:
+        pad_columns = round_up(groups, 4) - groups
+        group_scales = torch.nn.functional.pad(group_scales.view(torch.uint8), (0, pad_columns))
+        group_scales = group_scales.view(torch.int32)
 
-    dtype = group_scales.dtype
-    pad_shape = (0, round_up(groups, 4) - groups, 0, pad_rows)
-    group_scales = torch.nn.functional.pad(group_scales.view(torch.uint8), pad_shape)
     if use_m_major_input_scale:
-        group_scales = group_scales.reshape(rows + pad_rows, -1, 4).permute(1, 0, 2).contiguous()
-    return group_scales.view(dtype)
+        pad_rows = round_up(rows, 4) - rows
+        group_scales = torch.nn.functional.pad(group_scales, (0, 0, 0, pad_rows))
+        group_scales = group_scales.T.contiguous()
+    return group_scales
 
 
 def quant_input_ref(
@@ -355,21 +352,18 @@ def skip_if_process_input_unsupported(quant_dtype=None, group_scale_dtype=None):
             pytest.skip(f"{dtype} requires SM100+")
 
 
-def _unpack_group_scales(
+def unpack_group_scales(
     group_scales: torch.Tensor,
     num_rows: int,
     num_groups: int,
+    group_scale_dtype: dtypes.DataType | str,
     use_m_major_input_scale: bool = False,
 ) -> torch.Tensor:
-    if not use_m_major_input_scale:
-        return group_scales[:num_rows, :num_groups]
-
-    if group_scales.dtype == torch.float32:
-        return group_scales[:num_groups, :num_rows].T
-
-    group_scales = group_scales[:, :num_rows].permute(1, 0, 2)
-    group_scales = group_scales.reshape(num_rows, -1)
-    return group_scales[:, :num_groups]
+    if use_m_major_input_scale:
+        group_scales = group_scales.T.contiguous()
+    group_scale_dtype = dtypes.DataType.from_any(group_scale_dtype)
+    group_scales = group_scales.view(dtypes.torch_dtype_map[group_scale_dtype])
+    return group_scales[:num_rows, :num_groups]
 
 
 def assert_process_input_close(
@@ -379,6 +373,7 @@ def assert_process_input_close(
     quant_mode: InputQuantizationMode | str = "none",
     quant_dtype: dtypes.DataType | str | None = None,
     quant_group_size: int | None = None,
+    group_scale_dtype: dtypes.DataType | str = dtypes.float32,
     use_m_major_input_scale: bool = False,
     valid_rows: torch.Tensor | None = None,
     zero_invalid: bool = False,
@@ -425,9 +420,14 @@ def assert_process_input_close(
     if quant_mode.has_group_scale:
         assert quant_group_size is not None
         num_groups = hidden_size // quant_group_size
-        m_major = use_m_major_input_scale
-        actual_group_scales = _unpack_group_scales(actual_group_scales, num_rows, num_groups, m_major)
-        expected_group_scales = _unpack_group_scales(expected_group_scales, num_rows, num_groups, m_major)
+        assert actual_group_scales.shape == expected_group_scales.shape
+        assert actual_group_scales.dtype == expected_group_scales.dtype
+        actual_group_scales = unpack_group_scales(
+            actual_group_scales, num_rows, num_groups, group_scale_dtype, use_m_major_input_scale
+        )
+        expected_group_scales = unpack_group_scales(
+            expected_group_scales, num_rows, num_groups, group_scale_dtype, use_m_major_input_scale
+        )
 
         actual_values = actual_group_scales.float()[valid_rows]
         expected_values = expected_group_scales.float()[valid_rows]

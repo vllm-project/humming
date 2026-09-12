@@ -64,6 +64,11 @@ def humming_gemm(
     top_k: int = 1,
     valid_shape_m: int = 0,
 ) -> torch.Tensor:
+    """Run GEMM with FP8 input group scales packed four per int32.
+
+    The layer configuration determines the numerical scale format. Packed scales
+    have shape (rows, packed_groups), or (packed_groups, padded_rows) for m-major.
+    """
     use_ops = _should_use_torch_op(inputs)
     if use_ops:
         if outputs is None:

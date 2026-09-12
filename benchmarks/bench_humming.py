@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from humming import dtypes
 from humming.config import GemmType
-from humming.forward import _prepare_input_scale, may_process_input
+from humming.forward import may_process_input
 from humming.layer import HummingLayer
 from humming.testing import (
     generate_random_moe_tensors,
@@ -85,7 +85,6 @@ def bench_humming(
                 token_scales = token_scales.unsqueeze(-1)
             input_scale = group_scales if group_scales is not None else token_scales
             assert input_scale is not None
-            input_scale = _prepare_input_scale(layer_config, input_scale)
 
         tuning_config = get_heuristics_config(
             layer_config=layer_config,

@@ -22,17 +22,6 @@ def _resolve_use_pdl(
     return heuristics.should_use_pdl_for_input(config, shape_m)
 
 
-def _prepare_input_scale(config: LayerConfig, input_scale: torch.Tensor) -> torch.Tensor:
-    mx_scale_dtype = str(config.as_dtype) in ("float8e4m3", "float8e8m0")
-    grouped_mxmma = config.mma_type == MmaType.MXMMA and config.input_scale_group_size > 0
-    if mx_scale_dtype and grouped_mxmma and input_scale.dtype != torch.int32:
-        packed_scale = input_scale.view(torch.int32)
-        if input_scale.ndim == 3:
-            packed_scale = packed_scale.reshape(input_scale.size(0), input_scale.size(1))
-        return packed_scale
-    return input_scale
-
-
 def may_process_input(
     config: LayerConfig,
     inputs: torch.Tensor,
@@ -117,7 +106,7 @@ def may_quant_input(
     )
     scale = group_scales if group_scales is not None else token_scales
     assert scale is not None
-    return outputs, _prepare_input_scale(config, scale)
+    return outputs, scale
 
 
 def humming_forward(
@@ -170,8 +159,6 @@ def humming_forward(
         )
         input_scale = group_scales if config.input_quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if config.input_quant_mode.has_secondary_scale else None
-        if input_scale is not None:
-            input_scale = _prepare_input_scale(config, input_scale)
 
     if isinstance(compute_config, dict):
         compute_config = json.dumps(compute_config)

@@ -503,8 +503,7 @@ def _working_set_bytes(config: ProcessInputProblemConfig, num_rows: int) -> int:
 
     if config.quant_mode.has_group_scale:
         scale_shape = config.get_group_scale_shape(num_output_rows)
-        scale_bits = math.prod(scale_shape) * config.group_scale_dtype.num_bits
-        working_set_bytes += scale_bits // 8
+        working_set_bytes += math.prod(scale_shape) * 4
     if config.quant_mode.has_token_scale:
         working_set_bytes += num_output_rows * 4
 
