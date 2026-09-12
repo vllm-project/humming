@@ -4,8 +4,8 @@ from torch._subclasses.fake_tensor import FakeTensor
 from humming import dtypes
 from humming.config import ActivationType, ProcessInputLayoutType, ProcessInputProblemConfig
 from humming.kernel.process_input import ProcessInputKernel
-from humming.ops.input.tune import get_process_input_tuning_intervals
 from humming.ops.utils import init_humming_launcher, register_op
+from humming.tune.process_input import get_process_input_tuning_intervals
 from humming.utils.math import round_up
 
 
@@ -30,29 +30,34 @@ def _prepare_process_input_op(
     use_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert inputs.ndim == 2, "process_input requires 2D inputs"
-    activation = ActivationType(activation_type)
+    activation_type = ActivationType(activation_type)
     input_width = int(inputs.size(1))
-    assert not activation.is_binary or input_width % 2 == 0
+    assert not activation_type.is_binary or input_width % 2 == 0
 
-    resolved_layout = ProcessInputLayoutType(layout)
+    hidden_size = input_width
+    if activation_type.is_binary:
+        hidden_size //= 2
+
+    layout = ProcessInputLayoutType(layout)
     scatter_width = 1
-    if resolved_layout == ProcessInputLayoutType.Scatter:
+    if layout == ProcessInputLayoutType.Scatter:
         assert scatter_idx is not None and scatter_idx.ndim == 2, "scatter requires 2D scatter_idx"
         scatter_width = int(scatter_idx.size(1))
+
     if group_scale_dtype is None and group_scales is not None:
         group_scale_dtype = dtypes.DataType.from_torch_dtype(group_scales.dtype)
 
     config = ProcessInputProblemConfig(
         input_dtype=dtypes.DataType.from_torch_dtype(inputs.dtype),
-        hidden_size=input_width // (2 if activation.is_binary else 1),
+        hidden_size=hidden_size,
         quant_mode=quant_mode,
         quant_dtype=quant_dtype,
         quant_group_size=quant_group_size,
         group_scale_dtype=group_scale_dtype,
-        activation_type=activation,
+        activation_type=activation_type,
         activation_impl=activation_impl,
         hadamard_block_size=hadamard_block_size,
-        layout=resolved_layout,
+        layout=layout,
         scatter_width=scatter_width,
         expert_layout_int64=expert_layout is not None and expert_layout.dtype == torch.int64,
         zero_invalid=zero_invalid,
@@ -60,8 +65,10 @@ def _prepare_process_input_op(
     )
     num_input_rows = inputs.size(0)
     num_output_rows = num_input_rows
-    if resolved_layout == ProcessInputLayoutType.Scatter:
-        num_output_rows = outputs.size(0) if outputs is not None else num_input_rows * scatter_width
+    if layout == ProcessInputLayoutType.Scatter:
+        num_output_rows = num_input_rows * scatter_width
+        if outputs is not None:
+            num_output_rows = outputs.size(0)
 
     allocated_outputs = None
     if outputs is None:
@@ -71,37 +78,43 @@ def _prepare_process_input_op(
             device=inputs.device,
         )
 
-    allocated_groups = None
+    allocated_group_scales = None
     if config.quant_mode.has_group_scale and group_scales is None:
-        allocated_groups = torch.empty(
+        allocated_group_scales = torch.empty(
             config.get_group_scale_shape(num_output_rows),
             dtype=dtypes.torch_dtype_map[config.group_scale_dtype],
             device=inputs.device,
         )
 
-    allocated_tokens = None
+    allocated_token_scales = None
     if config.quant_mode.has_token_scale and token_scales is None:
-        storage = torch.empty(
+        token_scale_storage = torch.empty(
             round_up(num_output_rows, 4),
             dtype=torch.float32,
             device=inputs.device,
         )
-        token_shape = (1, num_output_rows) if config.use_m_major_input_scale else (num_output_rows, 1)
-        allocated_tokens = storage[:num_output_rows].view(token_shape)
+        token_scale_shape = (num_output_rows, 1)
+        if config.use_m_major_input_scale:
+            token_scale_shape = (1, num_output_rows)
+
+        allocated_token_scales = token_scale_storage[:num_output_rows].view(token_scale_shape)
 
     assert inputs.is_cuda
     with torch.cuda.device(inputs.device):
         if isinstance(inputs, FakeTensor):
             init_humming_launcher()
-            intervals = get_process_input_tuning_intervals(config, use_pdl)
-            configs = torch.empty((len(intervals) * 4,), dtype=torch.int64, device="cpu")
+            tuning_intervals = get_process_input_tuning_intervals(config, use_pdl)
+            configs = torch.empty((len(tuning_intervals) * 4,), dtype=torch.int64, device="cpu")
         else:
             family_key = (inputs.device.index, config, use_pdl)
             configs = ProcessInputKernel._str2kernel_cache.get(family_key)
             if configs is None:
-                intervals = get_process_input_tuning_intervals(config, use_pdl)
-                configs = ProcessInputKernel.prepare_kernels(config, intervals, inputs.device, family_key)
-    return configs, allocated_outputs, allocated_groups, allocated_tokens
+                tuning_intervals = get_process_input_tuning_intervals(config, use_pdl)
+                configs = ProcessInputKernel.prepare_kernels(
+                    config, tuning_intervals, inputs.device, family_key
+                )
+
+    return configs, allocated_outputs, allocated_group_scales, allocated_token_scales
 
 
 def process_input(
@@ -139,25 +152,32 @@ def process_input(
         use_m_major_input_scale=use_m_major_input_scale,
         use_pdl=use_pdl,
     )
-    use_ops = torch.compiler.is_compiling() or isinstance(inputs, FakeTensor)
-    prepare_process_input = torch.ops.humming.prepare_process_input if use_ops else _prepare_process_input_op
+    prepare_process_input = _prepare_process_input_op
+    if torch.compiler.is_compiling() or isinstance(inputs, FakeTensor):
+        prepare_process_input = torch.ops.humming.prepare_process_input
+
     prepared_tensors = prepare_process_input(inputs, outputs, group_scales, token_scales, **options)
     configs, allocated_outputs, allocated_group_scales, allocated_token_scales = prepared_tensors
+
     if outputs is inputs:
         torch.ops.humming.launch_process_input.inplace(configs, inputs, expert_layout, scatter_idx)
         return inputs, None, None
 
-    result_outputs = outputs if outputs is not None else allocated_outputs
-    result_group_scales = group_scales if group_scales is not None else allocated_group_scales
-    result_token_scales = token_scales if token_scales is not None else allocated_token_scales
-    assert result_outputs is not None
+    if outputs is None:
+        outputs = allocated_outputs
+    if group_scales is None:
+        group_scales = allocated_group_scales
+    if token_scales is None:
+        token_scales = allocated_token_scales
+
+    assert outputs is not None
     torch.ops.humming.launch_process_input.default(
         configs,
         inputs,
-        result_outputs,
-        result_group_scales,
-        result_token_scales,
+        outputs,
+        group_scales,
+        token_scales,
         expert_layout,
         scatter_idx,
     )
-    return result_outputs, result_group_scales, result_token_scales
+    return outputs, group_scales, token_scales
