@@ -59,7 +59,6 @@ def _prepare_process_input_op(
         hadamard_block_size=hadamard_block_size,
         layout=layout,
         scatter_width=scatter_width,
-        expert_layout_int64=expert_layout is not None and expert_layout.dtype == torch.int64,
         zero_invalid=zero_invalid,
         use_m_major_input_scale=use_m_major_input_scale,
     )

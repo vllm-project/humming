@@ -57,7 +57,6 @@ struct ProcessInputKernelData {
   uint32_t output_packing;
   uint32_t finalize_tokens;
   bool separate_outputs;
-  bool expert_layout_int64;
   bool use_pdl;
   bool is_finalizer;
 };
@@ -174,7 +173,6 @@ inline std::tuple<int64_t, std::string> register_process_input_kernel(const std:
       reader.getUint32("OUTPUT_PACKING"),
       reader.getUint32("FINALIZE_TOKENS_PER_BLOCK"),
       reader.getBool("SEPARATE_OUTPUTS"),
-      reader.getBool("EXPERT_LAYOUT_INT64"),
       reader.getBool("USE_PDL"),
       is_finalizer};
 
@@ -209,8 +207,9 @@ inline void check_process_input_tensor(
   ASSERT_CHECK(valid_dtype, name, " has an invalid dtype");
 }
 
-inline void check_process_input_index(const Tensor &tensor, const char *name, int64_t device, bool int64) {
-  ScalarType dtype = int64 ? ScalarType::Long : ScalarType::Int;
+inline void check_process_input_index(const Tensor &tensor, const char *name, int64_t device) {
+  ScalarType dtype = tensor.scalar_type();
+  ASSERT_CHECK(dtype == ScalarType::Int || dtype == ScalarType::Long, name, " must be int32 or int64");
   check_process_input_tensor(tensor, name, device, dtype, false, false);
 }
 
@@ -361,7 +360,9 @@ inline void launch_process_input_main(
   const float *static_tensor_scales = has_static_tensor_scale(data.quant_mode) ? static_cast<const float *>(token_scales->data_ptr()) : nullptr;
   float *token_scales_ptr = has_dynamic_token_scale(data.quant_mode) ? static_cast<float *>(token_scales->data_ptr()) : nullptr;
   const void *expert_layout_ptr = expert_layout.has_value() ? expert_layout->data_ptr() : nullptr;
-  const int64_t *scatter_idx_ptr = scatter_idx.has_value() ? static_cast<const int64_t *>(scatter_idx->data_ptr()) : nullptr;
+  const void *scatter_idx_ptr = scatter_idx.has_value() ? scatter_idx->data_ptr() : nullptr;
+  bool use_int64_expert_layout = expert_layout.has_value() && expert_layout->scalar_type() == ScalarType::Long;
+  bool use_int64_scatter_idx = scatter_idx.has_value() && scatter_idx->scalar_type() == ScalarType::Long;
   uint64_t num_input_rows = static_cast<uint64_t>(shape.num_input_rows);
   uint64_t num_output_rows = static_cast<uint64_t>(shape.num_output_rows);
   uint32_t max_tokens_per_expert = static_cast<uint32_t>(shape.max_tokens_per_expert);
@@ -377,7 +378,9 @@ inline void launch_process_input_main(
       &num_input_rows,
       &num_output_rows,
       &max_tokens_per_expert,
-      &group_scale_stride};
+      &group_scale_stride,
+      &use_int64_expert_layout,
+      &use_int64_scatter_idx};
 
   int64_t work_rows = shape.num_work_rows * (data.separate_outputs ? data.scatter_width : 1);
   uint64_t grid_x;
@@ -420,7 +423,9 @@ inline void launch_process_input_finalizer(
   void *output_scales = group_scales.data_ptr();
   float *token_scales_ptr = static_cast<float *>(token_scales.data_ptr());
   const void *expert_layout_ptr = expert_layout.has_value() ? expert_layout->data_ptr() : nullptr;
-  const int64_t *scatter_idx_ptr = scatter_idx.has_value() ? static_cast<const int64_t *>(scatter_idx->data_ptr()) : nullptr;
+  const void *scatter_idx_ptr = scatter_idx.has_value() ? scatter_idx->data_ptr() : nullptr;
+  bool use_int64_expert_layout = expert_layout.has_value() && expert_layout->scalar_type() == ScalarType::Long;
+  bool use_int64_scatter_idx = scatter_idx.has_value() && scatter_idx->scalar_type() == ScalarType::Long;
   uint64_t num_input_rows = static_cast<uint64_t>(shape.num_input_rows);
   uint64_t num_output_rows = static_cast<uint64_t>(shape.num_output_rows);
   uint32_t max_tokens_per_expert = static_cast<uint32_t>(shape.max_tokens_per_expert);
@@ -434,7 +439,9 @@ inline void launch_process_input_finalizer(
       &num_input_rows,
       &num_output_rows,
       &max_tokens_per_expert,
-      &group_scale_stride};
+      &group_scale_stride,
+      &use_int64_expert_layout,
+      &use_int64_scatter_idx};
 
   int64_t work_rows = shape.num_work_rows * (data.separate_outputs ? data.scatter_width : 1);
   uint64_t grid_x = CEIL_DIV(work_rows, data.finalize_tokens);
@@ -494,9 +501,9 @@ inline void launch_process_input_impl(
   int64_t secondary_id = configs[config_index + 3];
 
   if (expert_layout.has_value())
-    check_process_input_index(*expert_layout, "expert_layout", inputs.get_device(), primary.expert_layout_int64);
+    check_process_input_index(*expert_layout, "expert_layout", inputs.get_device());
   if (scatter_idx.has_value())
-    check_process_input_index(*scatter_idx, "scatter_idx", inputs.get_device(), true);
+    check_process_input_index(*scatter_idx, "scatter_idx", inputs.get_device());
   check_process_input_output(primary, inputs, shape, outputs);
   group_scales = prepare_process_input_group_scales(primary, inputs, shape, group_scales);
   token_scales = prepare_process_input_token_scales(primary, inputs, shape, token_scales);

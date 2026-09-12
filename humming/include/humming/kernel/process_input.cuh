@@ -34,11 +34,13 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
     void *output_scales,
     float *token_scales,
     const void *expert_layout,
-    const int64_t *scatter_idx,
+    const void *scatter_idx,
     uint64_t num_input_rows,
     uint64_t num_output_rows,
     uint32_t max_tokens_per_expert,
-    uint64_t group_scale_stride) {
+    uint64_t group_scale_stride,
+    bool use_int64_expert_layout,
+    bool use_int64_scatter_idx) {
   using Config = ProcessInputContext<BaseConfig, TuningConfig, Phase>;
   using SourceType = typename Config::SourceType;
   using TargetType = typename Config::TargetType;
@@ -78,7 +80,9 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
   if constexpr (Config::kUsePdl) griddepcontrol_wait();
 
   __shared__ typename Config::SharedStorage shared;
-  Config ctx(shared, expert_layout, scatter_idx, num_input_rows, num_output_rows, max_tokens_per_expert);
+  Config ctx(
+      shared, expert_layout, scatter_idx, num_input_rows, num_output_rows,
+      max_tokens_per_expert, use_int64_expert_layout, use_int64_scatter_idx);
   float *scratch = shared.scratch;
   auto thread = ProcessInputThreadTask<Config>(ctx);
 
@@ -208,11 +212,13 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
     void *output_scales,
     float *token_scales,
     const void *expert_layout,
-    const int64_t *scatter_idx,
+    const void *scatter_idx,
     uint64_t num_input_rows,
     uint64_t num_output_rows,
     uint32_t max_tokens_per_expert,
-    uint64_t group_scale_stride) {
+    uint64_t group_scale_stride,
+    bool use_int64_expert_layout,
+    bool use_int64_scatter_idx) {
   using Config = ProcessInputContext<BaseConfig, TuningConfig, ProcessInputQuantizationPhase::Fused, true>;
   using OutputScaleType = typename Config::ConfiguredDynamicGroupScaleType;
   constexpr uint32_t kGroupsPerToken = Config::kHiddenSize / Config::kQuantGroupSize;
@@ -220,7 +226,9 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
   static_assert(kTokensPerBlock == Config::kTokensPerBlock && kTokensPerBlock <= 32);
   if constexpr (Config::kUsePdl) griddepcontrol_wait();
   __shared__ typename Config::SharedStorage shared;
-  Config ctx(shared, expert_layout, scatter_idx, num_input_rows, num_output_rows, max_tokens_per_expert);
+  Config ctx(
+      shared, expert_layout, scatter_idx, num_input_rows, num_output_rows,
+      max_tokens_per_expert, use_int64_expert_layout, use_int64_scatter_idx);
   uint32_t lane = threadIdx.x & 31;
   uint64_t source_row = ~uint64_t{0};
   PRAGMA_UNROLL

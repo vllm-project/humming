@@ -525,7 +525,6 @@ class ProcessInputProblemConfig(BaseHummingConfig):
     hadamard_block_size: int | None = None
     layout: ProcessInputLayoutType = ProcessInputLayoutType.Normal
     scatter_width: int = 1
-    expert_layout_int64: bool = False
     zero_invalid: bool = False
 
     def __post_init__(self):

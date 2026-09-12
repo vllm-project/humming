@@ -97,10 +97,12 @@ struct ProcessInputContext : Config, TuningConfig {
   CUDA_INLINE ProcessInputContext(
       SharedStorage &shared,
       const void *expert_layout,
-      const int64_t *scatter_idx,
+      const void *scatter_idx,
       uint64_t num_input_rows,
       uint64_t num_output_rows,
-      uint32_t max_tokens_per_expert)
+      uint32_t max_tokens_per_expert,
+      bool use_int64_expert_layout,
+      bool use_int64_scatter_idx)
       : smem(shared), load(false), zero(false) {
     uint64_t logical_row = (static_cast<uint64_t>(blockIdx.x) / kBlocksPerRow) * kTokensPerBlock + threadIdx.x / kThreadsPerTask;
     column = kFinalizer ? 0 : (blockIdx.x % kBlocksPerRow) * kColumnsPerTask + (threadIdx.x % kThreadsPerTask) * kValuesPerThread;
@@ -112,7 +114,11 @@ struct ProcessInputContext : Config, TuningConfig {
       uint32_t first_route = kScatterSingleOutput ? logical_row % Config::kScatterWidth : 0;
       PRAGMA_UNROLL
       for (uint32_t route = 0; route < kOutputsPerToken; ++route) {
-        uint64_t row = static_cast<uint64_t>(scatter_idx[input_row * Config::kScatterWidth + first_route + route]);
+        uint64_t index = input_row * Config::kScatterWidth + first_route + route;
+        int64_t output_row;
+        if (use_int64_scatter_idx) output_row = reinterpret_cast<const int64_t *>(scatter_idx)[index];
+        else output_row = reinterpret_cast<const int32_t *>(scatter_idx)[index];
+        uint64_t row = static_cast<uint64_t>(output_row);
         if (row < num_output_rows) {
           output_rows[route] = row;
           load = true;
@@ -124,7 +130,7 @@ struct ProcessInputContext : Config, TuningConfig {
         uint32_t expert = input_row / max_tokens_per_expert;
         uint32_t local_row = input_row % max_tokens_per_expert;
         int64_t valid_rows;
-        if constexpr (Config::kExpertLayoutInt64) valid_rows = reinterpret_cast<const int64_t *>(expert_layout)[expert];
+        if (use_int64_expert_layout) valid_rows = reinterpret_cast<const int64_t *>(expert_layout)[expert];
         else valid_rows = reinterpret_cast<const int32_t *>(expert_layout)[expert];
         load = static_cast<int64_t>(local_row) < valid_rows;
         zero = !load && Config::kZeroInvalid;
