@@ -512,7 +512,7 @@ class TuningConfig(BaseHummingConfig):
 
 
 @dataclasses.dataclass(kw_only=True, unsafe_hash=True)
-class ProcessInputConfig(BaseHummingConfig):
+class ProcessInputProblemConfig(BaseHummingConfig):
     input_dtype: dtypes.DataType
     hidden_size: int
     quant_mode: InputQuantizationMode = InputQuantizationMode.Disabled
@@ -542,9 +542,10 @@ class ProcessInputConfig(BaseHummingConfig):
             assert self.activation_impl, "activation_impl is required"
 
         self.hadamard_block_size = self.hadamard_block_size or 1
-        self.quant_group_size = self.hidden_size
         if self.quant_mode.has_group_scale:
             self.quant_group_size = self.quant_group_size or min(self.hidden_size & -self.hidden_size, 512)
+        else:
+            self.quant_group_size = self.hidden_size
 
         if self.group_scale_dtype is None:
             self.group_scale_dtype = dtypes.float32
@@ -554,6 +555,10 @@ class ProcessInputConfig(BaseHummingConfig):
     @property
     def input_row_size(self) -> int:
         return self.hidden_size * (2 if self.activation_type.is_binary else 1)
+
+    @property
+    def input_torch_dtype(self) -> torch.dtype:
+        return dtypes.torch_dtype_map[self.input_dtype]
 
     @property
     def output_packing(self) -> int:
@@ -571,7 +576,7 @@ class ProcessInputConfig(BaseHummingConfig):
     def get_group_scale_shape(self, rows: int) -> tuple[int, ...]:
         groups = self.hidden_size // self.quant_group_size
         if not self.use_m_major_input_scale:
-            return rows, groups
+            return rows, round_up(groups, 4) if self.group_scale_dtype.num_bits == 8 else groups
         stride = round_up(rows, 4)
         if self.group_scale_dtype.num_bits == 8:
             return (groups + 3) // 4, stride, 4

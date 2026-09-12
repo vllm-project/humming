@@ -6,7 +6,12 @@ import math
 from types import SimpleNamespace
 
 from humming import dtypes
-from humming.config import ActivationType, InputQuantizationMode, ProcessInputConfig, ProcessInputTuningConfig
+from humming.config import (
+    ActivationType,
+    InputQuantizationMode,
+    ProcessInputProblemConfig,
+    ProcessInputTuningConfig,
+)
 from humming.device import DeviceInfo, get_device_index
 from humming.utils.math import ceil_div, positive_divisors, powers_of_two_up_to
 
@@ -409,7 +414,9 @@ def _select_tuning_config(problem, device) -> ProcessInputTuningConfig:
     return tuning_config
 
 
-def select_process_input_tuning_config(config: ProcessInputConfig, shape_m: int) -> ProcessInputTuningConfig:
+def select_process_input_tuning_config(
+    config: ProcessInputProblemConfig, shape_m: int
+) -> ProcessInputTuningConfig:
     """Choose a tuning configuration for shape_m on the current CUDA device."""
     return _tuning_config_for_device(config, shape_m, get_device_index())
 
@@ -521,7 +528,7 @@ def _tuning_intervals_for_device(config, device_index, use_pdl):
     return merged
 
 
-def get_process_input_tuning_intervals(config: ProcessInputConfig, use_pdl: bool = False):
+def get_process_input_tuning_intervals(config: ProcessInputProblemConfig, use_pdl: bool = False):
     """Return (min_shape_m, max_shape_m, tuning_config) with min < shape_m <= max."""
     return _tuning_intervals_for_device(config, get_device_index(), use_pdl)
 

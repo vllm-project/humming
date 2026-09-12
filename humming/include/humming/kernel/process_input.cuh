@@ -12,8 +12,11 @@
 template <class Config, class ScaleType>
 CUDA_INLINE uint64_t group_scale_index(uint64_t output_row, uint32_t group, uint64_t scale_stride) {
   constexpr uint64_t kGroupsPerToken = Config::kHiddenSize / Config::kQuantGroupSize;
-  if constexpr (std::is_same<ScaleType, M3BFloat16>::value || !Config::kUseMMajorInputScale) {
+  if constexpr (std::is_same<ScaleType, M3BFloat16>::value) {
     return output_row * kGroupsPerToken + group;
+  } else if constexpr (!Config::kUseMMajorInputScale) {
+    constexpr uint32_t kStride = std::is_same<ScaleType, Float32>::value ? kGroupsPerToken : (kGroupsPerToken + 3) / 4 * 4;
+    return output_row * kStride + group;
   } else if constexpr (std::is_same<ScaleType, Float32>::value) {
     return group * scale_stride + output_row;
   } else {

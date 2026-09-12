@@ -10,7 +10,7 @@ from filelock import FileLock
 
 import humming.utils.jit as jit_utils
 from humming import dtypes, ops
-from humming.config import ComputeConfig, GemmType, InputQuantizationMode, LayerConfig, MmaType, TuningConfig
+from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
 from humming.device import current_device
 from humming.kernel.humming import HummingKernel
 from humming.schema import HummingWeightSchema
@@ -215,18 +215,18 @@ class KernelTestRunner:
                 quant_dtype=str(config.a_dtype),
                 quant_group_size=config.input_scale_group_size or None,
                 group_scale_dtype=str(config.as_dtype),
-                use_m_major_input_scale=m_major_scale and config.input_scale_group_size > 0,
+                use_m_major_input_scale=m_major_scale,
                 token_scales=static_scale,
             )
             return result
 
         inputs, group_scale_ref, token_scale_ref = process()
-        use_m_major_input_layout = self.test_case.uses_m_major_input_scale and (
-            config.input_scale_group_size > 0 or config.mma_type == MmaType.MXMMA
-        )
+        use_m_major_input_layout = self.test_case.uses_m_major_input_scale
         if use_m_major_input_layout:
-            _, input_scale, input_scale_2 = process(m_major_scale=True)
-            if config.mma_type == MmaType.MXMMA and input_scale is not None:
+            _, major_groups, major_tokens = process(m_major_scale=True)
+            input_scale = major_groups if config.input_quant_mode.has_group_scale else major_tokens
+            input_scale_2 = major_tokens if config.input_quant_mode.has_secondary_scale else None
+            if config.mma_type == MmaType.MXMMA and config.input_quant_mode.has_group_scale:
                 input_scale = input_scale.view(torch.int32)
                 if input_scale.ndim == 3:
                     input_scale = input_scale.reshape(input_scale.size(0), input_scale.size(1))
@@ -238,10 +238,6 @@ class KernelTestRunner:
             input_scale = group_scale_ref if group_scale_ref is not None else token_scale_ref
             input_scale_2 = token_scale_ref if config.input_quant_mode.has_secondary_scale else None
 
-        if config.input_quant_mode.has_token_scale and input_scale_2 is not None:
-            input_scale_2 = input_scale_2.unsqueeze(-1)
-        if config.input_quant_mode == InputQuantizationMode.DynamicToken and input_scale is not None:
-            input_scale = input_scale.unsqueeze(-1)
         if config.input_quant_mode.has_tensor_scale:
             tensor_scale = static_scale
             if config.input_quant_mode.has_secondary_scale:
@@ -270,7 +266,7 @@ class KernelTestRunner:
             dequant_inputs = inputs.float()
 
         if group_scale_ref is not None:
-            scale_ref = group_scale_ref.float()
+            scale_ref = group_scale_ref[:, : shape_k // config.input_scale_group_size].float()
             if token_scale_ref is not None:
                 scale_ref = scale_ref * token_scale_ref.float().reshape(-1, 1)
             group_size = config.input_scale_group_size

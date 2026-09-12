@@ -1,102 +1,70 @@
 import pytest
 import torch
 
+from humming.config import ActivationType
 from humming.ops.input import process_input
-
-from ._reference import (
-    _assert_quantized,
-    _hadamard_reference,
-    _make_activated_input,
-    _require_quant_capability,
-)
-
-SOURCE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-ROW_COUNTS = (1, 129)
-HADAMARD_BLOCK_SIZES = (1, 32, 128, 512)
-GROUP_SIZES = (64, 512)
-ACTIVATIONS = ("none", "unary", "binary_split", "binary_interleaved")
-MATRIX_QUANT_DTYPES = (None, "int8", "int4", "float8e4m3", "float4e2m1")
-ALL_QUANT_DTYPES = (
-    "int8",
-    "int4",
-    "float8e4m3",
-    "float8e3m4",
-    "float8e5m2",
-    "float4e2m1",
-    "float4e0m3",
+from humming.testing.process_input import (
+    ACTIVATION_TYPE_IMPL_TEST_MAP,
+    assert_process_input_close,
+    process_input_ref,
+    skip_if_process_input_unsupported,
 )
 
 
-@pytest.mark.parametrize("dtype", SOURCE_DTYPES)
-@pytest.mark.parametrize("rows", ROW_COUNTS)
-@pytest.mark.parametrize("block_size", HADAMARD_BLOCK_SIZES)
-@pytest.mark.parametrize("group_size", GROUP_SIZES)
-@pytest.mark.parametrize("activation", ACTIVATIONS)
-@pytest.mark.parametrize("quant_dtype", MATRIX_QUANT_DTYPES)
-def test_process_input_cartesian(dtype, rows, block_size, group_size, activation, quant_dtype):
-    """Cross every core transform/quantization parameter and schedule regime."""
-    _require_quant_capability(quant_dtype)
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape_m,hidden_size,quant_group_size,hadamard_block_size,activation_type,quant_dtype",
+    [
+        (1, 384, 64, 1, "none", None),
+        (3, 768, 128, 32, "unary", None),
+        (4, 2048, 512, 128, "binary_split", None),
+        (5, 7168, 128, 512, "binary_interleaved", None),
+        (2, 11008, 128, 1, "unary", "int8"),
+        (129, 2048, 64, 128, "binary_interleaved", "float8e4m3"),
+        (3, 512, 128, 16, "binary_split", "int8"),
+        (3, 512, 128, 256, "binary_interleaved", "float8e4m3"),
+        (4, 768, 128, 128, "none", "int8"),
+        (4, 768, 128, 128, "none", "int4"),
+        (4, 768, 128, 128, "none", "float8e4m3"),
+        (4, 768, 128, 128, "none", "float8e5m2"),
+        (4, 768, 128, 128, "none", "float8e3m4"),
+        (4, 768, 128, 128, "none", "float4e2m1"),
+        (4, 768, 128, 128, "none", "float4e0m3"),
+    ],
+)
+def test_transform_quantization(
+    input_dtype,
+    shape_m,
+    hidden_size,
+    quant_group_size,
+    hadamard_block_size,
+    activation_type,
+    quant_dtype,
+):
+    skip_if_process_input_unsupported(quant_dtype)
     torch.manual_seed(1)
-    hidden_size = 2048
-    inputs, activated, activation_impl = _make_activated_input(dtype, rows, hidden_size, activation)
-    transformed = _hadamard_reference(activated, block_size)
-    hadamard_block_size = block_size if block_size > 1 else None
-    activation_type = activation
-    activation_args = {"activation_type": activation_type, "activation_impl": activation_impl}
 
-    if quant_dtype is None:
-        result = process_input(
-            inputs,
-            quant_group_size=group_size,
-            hadamard_block_size=hadamard_block_size,
-            **activation_args,
-        )
-        tolerance = {
-            torch.float16: dict(rtol=5e-3, atol=5e-3),
-            torch.bfloat16: dict(rtol=2e-2, atol=2e-2),
-            torch.float32: dict(rtol=1e-5, atol=1e-5),
-        }[dtype]
-        torch.testing.assert_close(result[0], transformed.to(dtype), **tolerance)
-        assert result[1] is None and result[2] is None
-        return
+    activation_type = ActivationType(activation_type)
+    input_width = hidden_size * (2 if activation_type.is_binary else 1)
+    activation_impl = ACTIVATION_TYPE_IMPL_TEST_MAP[activation_type]["impl"]
+    inputs = 0.5 * torch.randn(shape_m, input_width, device="cuda", dtype=input_dtype)
+    quant_mode = "none" if quant_dtype is None else "dynamic_group"
 
-    result = process_input(
-        inputs,
-        quant_mode="dynamic_group",
+    options = dict(
+        quant_mode=quant_mode,
         quant_dtype=quant_dtype,
-        quant_group_size=group_size,
+        quant_group_size=quant_group_size,
+        activation_type=activation_type.value,
         hadamard_block_size=hadamard_block_size,
-        **activation_args,
     )
-    reference = process_input(
-        transformed,
-        quant_mode="dynamic_group",
-        quant_dtype=quant_dtype,
-        quant_group_size=group_size,
-    )
-    _assert_quantized(result, reference, quant_dtype, group_size)
 
+    expected = process_input_ref(inputs, **options)
+    actual = process_input(inputs, activation_impl=activation_impl, **options)
 
-@pytest.mark.parametrize("dtype", SOURCE_DTYPES)
-@pytest.mark.parametrize("quant_dtype", ALL_QUANT_DTYPES)
-def test_quant_dtype_codecs(dtype, quant_dtype):
-    """Cover every output codec without multiplying codecs into the large matrix."""
-    _require_quant_capability(quant_dtype)
-    torch.manual_seed(2)
-    group_size = 128
-    inputs = torch.randn((3, 512), device="cuda", dtype=dtype) * 0.5
-    transformed = _hadamard_reference(inputs, group_size)
-    result = process_input(
-        inputs,
-        quant_mode="dynamic_group",
+    assert_process_input_close(
+        actual,
+        expected,
+        quant_mode=quant_mode,
         quant_dtype=quant_dtype,
-        quant_group_size=group_size,
-        hadamard_block_size=group_size,
+        quant_group_size=quant_group_size,
     )
-    reference = process_input(
-        transformed,
-        quant_mode="dynamic_group",
-        quant_dtype=quant_dtype,
-        quant_group_size=group_size,
-    )
-    _assert_quantized(result, reference, quant_dtype, group_size)

@@ -124,6 +124,8 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
     std::vector<int64_t> expected_shape;
     if (kernel_data.use_m_major_input_scale && group_size > 0) {
       expected_shape = {(int64_t)num_groups, m_pad};
+    } else if (kernel_data.use_m_major_input_scale) {
+      expected_shape = {1, shape_m};
     } else {
       expected_shape = {shape_m, (int64_t)num_groups};
     }
@@ -140,6 +142,8 @@ inline void check_tensor_as2(std::optional<Tensor> &tensor, KernelData &kernel_d
   std::vector<int64_t> expected_shape;
   if (kernel_data.is_tensor_input_scale_2) {
     expected_shape = {1};
+  } else if (kernel_data.use_m_major_input_scale) {
+    expected_shape = {1, shape_m};
   } else {
     expected_shape = {shape_m, 1};
   }

@@ -26,3 +26,7 @@ def positive_divisors(value: int) -> list[int]:
         if divisor * divisor != value:
             divisors.append(value // divisor)
     return sorted(divisors)
+
+
+def is_pow_of_two(n: int) -> bool:
+    return n & (n - 1) == 0

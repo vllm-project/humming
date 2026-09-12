@@ -1,7 +1,7 @@
 from humming.config.config import (
     ComputeConfig,
     LayerConfig,
-    ProcessInputConfig,
+    ProcessInputProblemConfig,
     ProcessInputTuningConfig,
     TuningConfig,
 )
@@ -18,7 +18,7 @@ from humming.config.enum import (
 from humming.config.mma import MmaOpClass
 
 __all__ = [
-    "ProcessInputConfig",
+    "ProcessInputProblemConfig",
     "ProcessInputTuningConfig",
     "ProcessInputLayoutType",
     "ProcessInputQuantizationPhase",

@@ -7,7 +7,7 @@ import torch
 from humming import dtypes
 from humming.config import (
     InputQuantizationMode,
-    ProcessInputConfig,
+    ProcessInputProblemConfig,
     ProcessInputTuningConfig,
 )
 from humming.config import (
@@ -78,14 +78,14 @@ extern "C" __constant__ uint32_t QUANTIZATION_PHASE = static_cast<uint32_t>(Cont
 
 
 @dataclasses.dataclass(kw_only=True)
-class ProcessInputKernel(KernelRuntime, ProcessInputConfig, ProcessInputTuningConfig):
+class ProcessInputKernel(KernelRuntime, ProcessInputProblemConfig, ProcessInputTuningConfig):
     name: ClassVar[str] = "process_input_kernel"
     _str2kernel_cache: ClassVar[dict[tuple[object, ...], torch.Tensor]] = {}
     quantization_phase: QuantizationPhase = QuantizationPhase.Fused
 
     def __post_init__(self):
         self.quantization_phase = QuantizationPhase(self.quantization_phase)
-        ProcessInputConfig.__post_init__(self)
+        ProcessInputProblemConfig.__post_init__(self)
         ProcessInputTuningConfig.__post_init__(self)
         KernelRuntime.__post_init__(self)
 
@@ -112,8 +112,8 @@ class ProcessInputKernel(KernelRuntime, ProcessInputConfig, ProcessInputTuningCo
         group_scale_data_type = self.group_scale_dtype
         template_args = self.to_template_args()
         template_args.update(
-            process_input_config=self.to_cpp_str(ProcessInputConfig),
-            process_input_extern=self.to_extern_cpp_str(ProcessInputConfig),
+            process_input_config=self.to_cpp_str(ProcessInputProblemConfig),
+            process_input_extern=self.to_extern_cpp_str(ProcessInputProblemConfig),
             process_input_tuning=self.to_cpp_str(ProcessInputTuningConfig),
             tuning_extern=self.to_extern_cpp_str(ProcessInputTuningConfig),
             source_dtype=_SOURCE_TYPE_CPP[self.input_dtype],

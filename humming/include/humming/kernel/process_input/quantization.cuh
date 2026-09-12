@@ -68,11 +68,12 @@ CUDA_INLINE ScaleStorage<ScaleType> encode_scale(float value) {
   if constexpr (std::is_same<ScaleType, Float32>::value) {
     return value;
   } else if constexpr (std::is_same<ScaleType, Float8E4M3>::value) {
-    return static_cast<__nv_fp8_e4m3>(value).__x;
+    auto encoded = static_cast<__nv_fp8_e4m3>(value);
+    if (static_cast<float>(encoded) < value && encoded.__x < 0x7Eu) ++encoded.__x;
+    return encoded.__x;
   } else if constexpr (std::is_same<ScaleType, M3BFloat16>::value) {
     uint32_t bits = __float_as_uint(value);
-    uint32_t retained_lsb = (bits >> 20) & 1u;
-    bits = (bits + 0x0007FFFFu + retained_lsb) & 0xFFF00000u;
+    bits = (bits + 0x000FFFFFu) & 0xFFF00000u;
     return static_cast<uint16_t>(bits >> 16);
   } else {
     uint32_t bits = __float_as_uint(value);

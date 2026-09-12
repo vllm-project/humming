@@ -1,215 +1,105 @@
 import pytest
 import torch
 
+from humming.config import ActivationType, InputQuantizationMode
 from humming.ops.input import process_input
-
-from ._reference import (
-    _empty_group_scales,
-    _hadamard_reference,
-    _quantize_int8_reference,
-    _round_positive_m3_rne,
+from humming.testing.process_input import (
+    ACTIVATION_TYPE_IMPL_TEST_MAP,
+    assert_process_input_close,
+    process_input_ref,
+    skip_if_process_input_unsupported,
 )
-
-
-def test_raw_scatter():
-    x = torch.randn(4, 384, device="cuda", dtype=torch.bfloat16)
-    destinations = torch.tensor([[3, -1], [0, 2], [1, -1], [4, 5]], device="cuda")
-    outputs = torch.zeros(8, 384, device="cuda", dtype=x.dtype)
-    scattered = process_input(x, outputs=outputs, layout="scatter", scatter_idx=destinations)[0]
-    for input_row, output_rows in enumerate(destinations.tolist()):
-        for output_row in output_rows:
-            if output_row >= 0:
-                assert torch.equal(scattered[output_row].view(torch.uint8), x[input_row].view(torch.uint8))
-    assert torch.count_nonzero(scattered[6:]) == 0
 
 
 @pytest.mark.parametrize(
-    ("quant_mode", "group_scale_dtype", "hadamard_block_size"),
+    "quant_mode,group_scale_dtype,use_m_major_input_scale",
     [
-        ("group", "float32", None),
-        ("group", "float8e4m3", 128),
-        ("group", "float8e8m0", 128),
-        ("token", None, None),
-        ("token", None, 128),
-        ("group_token", "float8e4m3", None),
-        ("group_token", "float8e4m3", 128),
+        ("none", "float32", False),
+        ("static_tensor", "float32", False),
+        ("dynamic_token", "float32", False),
+        ("dynamic_group", "float32", False),
+        ("dynamic_group", "float32", True),
+        ("dynamic_group", "float8e8m0", True),
+        ("static_tensor_dynamic_group", "float8e4m3", True),
+        ("dynamic_group_token", "float8e4m3", False),
+        ("dynamic_group_token", "float8e4m3", True),
     ],
 )
-def test_scatter_layout(
-    quant_mode,
-    group_scale_dtype,
-    hadamard_block_size,
-):
-    torch.manual_seed(31)
-    x = torch.randn(3, 512, device="cuda", dtype=torch.bfloat16)
-    scatter_idx = torch.tensor(
-        [[5, -1, 1], [3, 0, -1], [4, -1, 2]],
-        device="cuda",
-        dtype=torch.int64,
-    )
-    rows = scatter_idx.numel()
-    common = dict(
-        quant_mode={
-            "group": "dynamic_group",
-            "token": "dynamic_token",
-            "group_token": "dynamic_group_token",
-        }[quant_mode],
+def test_scatter_layout(quant_mode, group_scale_dtype, use_m_major_input_scale):
+    quant_mode = InputQuantizationMode(quant_mode)
+    quant_dtype = "int8" if quant_mode.should_quantize else None
+    skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
+    torch.manual_seed(0)
+
+    inputs = torch.randn(4, 768, device="cuda")
+    scatter_idx = torch.tensor([[5, -1, 1], [3, 0, -1], [4, -1, 2], [-1, -1, -1]], device="cuda")
+    valid_rows = scatter_idx[scatter_idx >= 0]
+    static_tensor_scale = None
+
+    if quant_mode.has_tensor_scale:
+        static_tensor_scale = torch.tensor([0.5], device="cuda")
+
+    options = dict(
+        quant_mode=quant_mode.value,
+        quant_dtype=quant_dtype,
         quant_group_size=128,
-        hadamard_block_size=hadamard_block_size,
-    )
-    reference_scales = None
-    if group_scale_dtype is not None and quant_mode == "group":
-        reference_scales = _empty_group_scales(3, 4, group_scale_dtype)
-    reference = process_input(
-        x,
-        quant_dtype="float8e4m3",
-        group_scales=reference_scales,
-        **common,
-    )
-
-    outputs = torch.zeros((rows, x.size(1)), device=x.device, dtype=torch.float8_e4m3fn)
-    group_scales = None
-    if reference[1] is not None:
-        group_scales = torch.zeros(
-            (rows, x.size(1) // 128),
-            device=x.device,
-            dtype=reference[1].dtype,
-        )
-    token_scales = None
-    if reference[2] is not None:
-        token_scales = torch.zeros(rows, device=x.device, dtype=torch.float32)
-
-    result = process_input(
-        x,
-        quant_dtype="float8e4m3",
-        outputs=outputs,
-        group_scales=group_scales,
-        token_scales=token_scales,
+        group_scale_dtype=group_scale_dtype,
         layout="scatter",
         scatter_idx=scatter_idx,
-        **common,
+        use_m_major_input_scale=use_m_major_input_scale,
     )
 
-    for input_row, target_row in enumerate(scatter_idx.tolist()):
-        for target in target_row:
-            if target < 0:
-                continue
-            for index, (actual, expected) in enumerate(zip(result, reference, strict=True)):
-                if actual is None:
-                    continue
-                actual, expected = actual[target], expected[input_row]
-                if index < 2:
-                    actual, expected = actual.float(), expected.float()
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    expected = process_input_ref(inputs, static_tensor_scale=static_tensor_scale, **options)
+    actual = process_input(inputs, token_scales=static_tensor_scale, **options)
 
-    for untouched in (6, 7, 8):
-        assert torch.count_nonzero(result[0][untouched]) == 0
-        if result[1] is not None:
-            assert torch.count_nonzero(result[1][untouched]) == 0
-        if result[2] is not None:
-            assert result[2][untouched] == 0
-
-
-def test_scatter_layout_static_scale_and_m_major_scale():
-    torch.manual_seed(32)
-    x = torch.randn(2, 512, device="cuda", dtype=torch.bfloat16)
-    scatter_idx = torch.tensor([[6, 0], [-1, 4]], device="cuda", dtype=torch.int64)
-    static_scale = torch.tensor([0.5], device=x.device, dtype=torch.float32)
-
-    static_reference = process_input(
-        x,
-        quant_mode="static_tensor",
-        quant_dtype="int8",
+    assert_process_input_close(
+        actual,
+        expected,
+        quant_mode=quant_mode,
+        quant_dtype=quant_dtype,
         quant_group_size=128,
-        token_scales=static_scale,
+        use_m_major_input_scale=use_m_major_input_scale,
+        valid_rows=valid_rows,
     )
-    static_outputs = torch.zeros((7, 512), device=x.device, dtype=torch.int8)
-    static_result = process_input(
-        x,
-        quant_mode="static_tensor",
-        quant_dtype="int8",
-        outputs=static_outputs,
-        quant_group_size=128,
-        token_scales=static_scale,
-        layout="scatter",
-        scatter_idx=scatter_idx,
-    )
-    torch.testing.assert_close(static_result[0][6], static_reference[0][0], rtol=0, atol=0)
-    torch.testing.assert_close(static_result[0][0], static_reference[0][0], rtol=0, atol=0)
-    torch.testing.assert_close(static_result[0][4], static_reference[0][1], rtol=0, atol=0)
-    assert torch.count_nonzero(static_result[0][1]) == 0
-
-    reference = process_input(
-        x,
-        quant_mode="dynamic_group",
-        quant_dtype="float8e4m3",
-        quant_group_size=128,
-        use_m_major_input_scale=True,
-    )
-    outputs = torch.zeros((7, 512), device=x.device, dtype=torch.float8_e4m3fn)
-    group_scales = torch.zeros((4, 8), device=x.device, dtype=torch.float32)
-    result = process_input(
-        x,
-        quant_mode="dynamic_group",
-        quant_dtype="float8e4m3",
-        outputs=outputs,
-        group_scales=group_scales,
-        quant_group_size=128,
-        use_m_major_input_scale=True,
-        layout="scatter",
-        scatter_idx=scatter_idx,
-    )
-    torch.testing.assert_close(result[1][:, 6], reference[1][:, 0], rtol=0, atol=0)
-    torch.testing.assert_close(result[1][:, 0], reference[1][:, 0], rtol=0, atol=0)
-    torch.testing.assert_close(result[1][:, 4], reference[1][:, 1], rtol=0, atol=0)
-    assert torch.count_nonzero(result[1][:, 1]) == 0
 
 
 @pytest.mark.parametrize("zero_invalid", [False, True])
-@pytest.mark.parametrize("preallocate", [False, True])
-def test_moe_grouped_mask_invalid_write_policy(zero_invalid, preallocate):
-    torch.manual_seed(14)
-    x = torch.randn(14, 256, device="cuda")
-    valid_tokens = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
-    outputs = torch.full_like(x, 13, dtype=torch.int8)
-    group_scales = torch.full((14, 2), 7, device="cuda", dtype=torch.float8_e4m3fn)
-    token_scales = torch.full((14,), 11, device="cuda", dtype=torch.float32)
+@pytest.mark.parametrize("quant_mode", ["none", "dynamic_group", "dynamic_token", "dynamic_group_token"])
+@pytest.mark.parametrize("activation_type", ["none", "unary", "binary_split", "binary_interleaved"])
+def test_grouped_mask_layout(quant_mode, zero_invalid, activation_type):
+    quant_mode = InputQuantizationMode(quant_mode)
+    quant_dtype = "int8" if quant_mode.should_quantize else None
+    group_scale_dtype = "float8e4m3" if quant_mode == InputQuantizationMode.DynamicGroupToken else "float32"
+    skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
+    torch.manual_seed(0)
 
-    result = process_input(
-        x,
-        quant_mode="dynamic_group_token",
-        quant_dtype="int8",
-        outputs=outputs if preallocate else None,
-        group_scales=group_scales if preallocate else None,
-        token_scales=token_scales if preallocate else None,
+    inputs = torch.randn(14, 256, device="cuda")
+    expert_layout = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
+    rows_per_expert = inputs.size(0) // expert_layout.numel()
+    local_rows = torch.arange(rows_per_expert, device="cuda")
+    valid_rows = (local_rows[None, :] < expert_layout[:, None]).flatten()
+
+    activation_impl = ACTIVATION_TYPE_IMPL_TEST_MAP[ActivationType(activation_type)]["impl"]
+    options = dict(
+        quant_mode=quant_mode.value,
+        quant_dtype=quant_dtype,
         quant_group_size=128,
-        hadamard_block_size=128,
+        group_scale_dtype=group_scale_dtype,
+        activation_type=activation_type,
         layout="grouped_mask",
-        expert_layout=valid_tokens,
+        expert_layout=expert_layout,
         zero_invalid=zero_invalid,
     )
-    assert result[0].shape == (14, 256)
-    assert result[1].shape == (14, 2)
-    assert result[2].shape == (14,)
 
-    valid_mask = (torch.arange(7, device="cuda")[None, :] < valid_tokens[:, None]).flatten()
-    invalid, invalid_groups, invalid_tokens = (tensor[~valid_mask] for tensor in result)
-    transformed = _hadamard_reference(x, 128).to(x.dtype)[valid_mask]
-    grouped = transformed.reshape(-1, 2, 128)
-    raw = grouped.abs().amax(-1) / 127.0
-    m3 = _round_positive_m3_rne(raw)
-    expected_token = torch.exp2(torch.ceil(torch.log2(m3.amax(-1) / 448.0)))
-    expected_group = (m3 / expected_token[:, None]).to(torch.float8_e4m3fn)
-    expected_output = _quantize_int8_reference(transformed, m3, 128)
-    torch.testing.assert_close(result[1][valid_mask], expected_group, rtol=0, atol=0)
-    torch.testing.assert_close(result[2][valid_mask], expected_token, rtol=0, atol=0)
-    torch.testing.assert_close(result[0][valid_mask], expected_output, rtol=0, atol=1)
+    expected = process_input_ref(inputs, **options)
+    actual = process_input(inputs, activation_impl=activation_impl, **options)
 
-    if zero_invalid:
-        assert torch.count_nonzero(invalid) == 0
-        assert torch.count_nonzero(invalid_groups.view(torch.uint8)) == 0
-        assert torch.count_nonzero(invalid_tokens) == 0
-    elif preallocate:
-        assert torch.all(invalid == 13)
-        assert torch.all(invalid_groups == 7)
-        assert torch.all(invalid_tokens == 11)
+    assert_process_input_close(
+        actual,
+        expected,
+        quant_mode=quant_mode,
+        quant_dtype=quant_dtype,
+        quant_group_size=128,
+        valid_rows=valid_rows,
+        zero_invalid=zero_invalid,
+    )

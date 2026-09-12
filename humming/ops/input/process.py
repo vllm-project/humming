@@ -2,7 +2,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from humming import dtypes
-from humming.config import ActivationType, ProcessInputConfig, ProcessInputLayoutType
+from humming.config import ActivationType, ProcessInputLayoutType, ProcessInputProblemConfig
 from humming.kernel.process_input import ProcessInputKernel
 from humming.ops.input.tune import get_process_input_tuning_intervals
 from humming.ops.utils import init_humming_launcher, register_op
@@ -42,7 +42,7 @@ def _prepare_process_input_op(
     if group_scale_dtype is None and group_scales is not None:
         group_scale_dtype = dtypes.DataType.from_torch_dtype(group_scales.dtype)
 
-    config = ProcessInputConfig(
+    config = ProcessInputProblemConfig(
         input_dtype=dtypes.DataType.from_torch_dtype(inputs.dtype),
         hidden_size=input_width // (2 if activation.is_binary else 1),
         quant_mode=quant_mode,
@@ -86,7 +86,8 @@ def _prepare_process_input_op(
             dtype=torch.float32,
             device=inputs.device,
         )
-        allocated_tokens = storage[:num_output_rows]
+        token_shape = (1, num_output_rows) if config.use_m_major_input_scale else (num_output_rows, 1)
+        allocated_tokens = storage[:num_output_rows].view(token_shape)
 
     assert inputs.is_cuda
     with torch.cuda.device(inputs.device):

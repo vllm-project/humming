@@ -2,7 +2,7 @@ import json
 
 import torch
 
-from humming import dtypes, ops
+from humming import ops
 from humming.config import LayerConfig, MmaType
 from humming.tune import get_heuristics_class
 
@@ -90,7 +90,7 @@ def may_process_input(
         expert_layout=expert_layout,
         scatter_idx=scatter_idx,
         zero_invalid=zero_invalid,
-        use_m_major_input_scale=m_major_scale and config.input_scale_group_size > 0,
+        use_m_major_input_scale=m_major_scale,
         use_pdl=resolved_use_pdl,
     )
 
@@ -115,8 +115,6 @@ def may_quant_input(
         m_major_scale=(config.mma_type == MmaType.MXMMA and config.input_scale_group_size > 0),
         use_pdl=use_pdl,
     )
-    if token_scales is not None:
-        token_scales = token_scales.unsqueeze(-1)
     scale = group_scales if group_scales is not None else token_scales
     assert scale is not None
     return outputs, _prepare_input_scale(config, scale)
@@ -150,9 +148,8 @@ def humming_forward(
         parsed_compute_config = json.loads(parsed_compute_config)
 
     m_major_scale = False
-    if config.input_scale_group_size > 0:
-        if isinstance(parsed_compute_config, dict):
-            m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
+    if isinstance(parsed_compute_config, dict):
+        m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
 
     unquantized_dtype = [torch.bfloat16, torch.float16, torch.float32]
     should_quantize = config.input_quant_mode.should_quantize
@@ -171,8 +168,6 @@ def humming_forward(
             m_major_scale=m_major_scale,
             use_pdl=use_pdl,
         )
-        if token_scales is not None and config.input_quant_mode.has_token_scale:
-            token_scales = token_scales.unsqueeze(-1)
         input_scale = group_scales if config.input_quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if config.input_quant_mode.has_secondary_scale else None
         if input_scale is not None:

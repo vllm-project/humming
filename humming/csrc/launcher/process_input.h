@@ -307,7 +307,8 @@ inline std::optional<Tensor> prepare_process_input_group_scales(
     return std::nullopt;
   }
   int64_t groups = data.hidden_size / data.quant_group_size;
-  int64_t elements = shape.num_output_rows * groups;
+  int64_t padded_groups = get_dtype_num_bits(data.group_scale_dtype_id) == 8 ? CEIL_DIV(groups, 4) * 4 : groups;
+  int64_t elements = shape.num_output_rows * padded_groups;
   if (data.use_m_major_input_scale) {
     bool packed_scales = get_dtype_num_bits(data.group_scale_dtype_id) == 8;
     elements = shape.group_scale_stride * (packed_scales ? CEIL_DIV(groups, 4) * 4 : groups);
@@ -318,7 +319,7 @@ inline std::optional<Tensor> prepare_process_input_group_scales(
   check_process_input_tensor(*scales, "group_scales", inputs.get_device(), dtype, allow_byte);
   ASSERT_CHECK(scales->numel() == elements, "invalid group_scales size");
   if (!data.use_m_major_input_scale) {
-    ASSERT_CHECK(scales->dim() == 2 && scales->size(0) == shape.num_output_rows && scales->size(1) == groups, "invalid group_scales shape");
+    ASSERT_CHECK(scales->dim() == 2 && scales->size(0) == shape.num_output_rows && scales->size(1) == padded_groups, "invalid group_scales shape");
   } else if (get_dtype_num_bits(data.group_scale_dtype_id) == 8) {
     ASSERT_CHECK(scales->dim() == 3 && scales->size(0) == CEIL_DIV(groups, 4) && scales->size(1) == shape.group_scale_stride && scales->size(2) == 4, "invalid packed group_scales shape");
   } else {
@@ -342,7 +343,11 @@ inline std::optional<Tensor> prepare_process_input_token_scales(
   ASSERT_CHECK(scales.has_value(), "token_scales must be allocated by prepare_process_input");
   check_process_input_tensor(*scales, "token_scales", inputs.get_device(), ScalarType::Float);
   ASSERT_CHECK(scales->numel() == elements, "invalid token_scales size");
-  ASSERT_CHECK(static_scale || scales->dim() == 1, "dynamic token_scales must be 1D");
+  if (dynamic_scale) {
+    int64_t rows = data.use_m_major_input_scale ? 1 : shape.num_output_rows;
+    int64_t columns = data.use_m_major_input_scale ? shape.num_output_rows : 1;
+    ASSERT_CHECK(scales->dim() == 2 && scales->size(0) == rows && scales->size(1) == columns, "invalid dynamic token_scales shape");
+  }
   return scales;
 }
 
