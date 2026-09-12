@@ -31,13 +31,13 @@ def prepare_layer_config(
     pad_shape_k = round_up(shape_k, pad_k_to_multiple) - shape_k
 
     if input_schema is None:
-        input_schema = HummingInputSchema(a_dtype=f16_dtype)
+        input_schema = HummingInputSchema(input_dtype=f16_dtype)
 
     assert isinstance(input_schema, HummingInputSchema)
     assert isinstance(weight_schema, HummingWeightSchema)
 
     use_channel_scale_2 = (
-        input_schema.a_dtype == dtypes.int8
+        input_schema.input_dtype == dtypes.int8
         and weight_schema.b_dtype == dtypes.float4e2m1
         and weight_schema.bs_dtype == dtypes.float8e8m0
         and weight_schema.weight_scale_type == WeightScaleType.GROUP
@@ -48,7 +48,7 @@ def prepare_layer_config(
 
     return LayerConfig(
         sm_version=sm_version,
-        a_dtype=input_schema.a_dtype or f16_dtype,
+        a_dtype=input_schema.input_dtype or f16_dtype,
         b_dtype=weight_schema.b_dtype,
         bs_dtype=weight_schema.bs_dtype or f16_dtype,
         as_dtype=input_schema.input_scale_dtype,

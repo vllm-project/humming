@@ -258,7 +258,7 @@ class ModeloptNvfp4InputSchema(ModeloptInputSchema):
             else InputQuantizationMode.StaticTensorDynamicGroup
         )
         return HummingInputSchema(
-            a_dtype=dtypes.float4e2m1,
+            input_dtype=dtypes.float4e2m1,
             input_scale_group_size=16,
             input_quant_mode=quant_mode,
         )

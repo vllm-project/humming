@@ -331,30 +331,38 @@ class HummingWeightSchema(BaseWeightSchema):
 @dataclasses.dataclass(kw_only=True)
 class HummingInputSchema(BaseInputSchema):
     quant_method: str = "humming"
-    a_dtype: dtypes.DataType | None = None
+    input_dtype: dtypes.DataType | None = None
     input_scale_group_size: int = 0
     input_scale_dtype: dtypes.DataType | None = None
     input_quant_mode: InputQuantizationMode | str | None = None
 
     KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {
-        "a_dtype": ["input_dtype", "dtype"],
+        "input_dtype": ["a_dtype", "dtype"],
         "input_scale_group_size": ["group_size"],
         "input_scale_dtype": ["scale_dtype"],
         "input_quant_mode": ["quant_mode", "quantization_mode"],
     }
 
     def __post_init__(self):
-        if isinstance(self.a_dtype, str):
-            self.a_dtype = dtypes.DataType.from_str(str(self.a_dtype))
+        if isinstance(self.input_dtype, str):
+            self.input_dtype = dtypes.DataType.from_str(str(self.input_dtype))
         if isinstance(self.input_scale_dtype, str):
             self.input_scale_dtype = dtypes.DataType.from_str(str(self.input_scale_dtype))
         if isinstance(self.input_quant_mode, str):
             self.input_quant_mode = InputQuantizationMode(self.input_quant_mode)
 
+    @property
+    def a_dtype(self) -> dtypes.DataType | None:
+        return self.input_dtype
+
+    @a_dtype.setter
+    def a_dtype(self, value: dtypes.DataType | None):
+        self.input_dtype = value
+
     def get_activation_bits(self):
-        if self.a_dtype is None:
+        if self.input_dtype is None:
             return 16
-        return self.a_dtype.num_bits
+        return self.input_dtype.num_bits
 
     @property
     def static_tensor_scale_name(self) -> str | None:
