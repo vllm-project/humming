@@ -35,6 +35,17 @@ class DataType:
         else:
             raise NotImplementedError
 
+    @classmethod
+    def from_any(cls, dtype):
+        if isinstance(dtype, DataType):
+            return dtype
+        elif isinstance(dtype, str):
+            return cls.from_str(dtype)
+        elif isinstance(dtype, torch.dtype):
+            return cls.from_torch_dtype(dtype)
+        else:
+            raise ValueError(f"unsupported dtype: {dtype}")
+
     def to_str(self):
         raise NotImplementedError
 

@@ -220,39 +220,8 @@ def test_group_token_int8_register_schedules(hadamard_block_size, group_size):
     torch.testing.assert_close(result[0], expected_output, rtol=0, atol=1)
 
 
-def test_group_token_permute_layout():
-    torch.manual_seed(21)
-    x = torch.randn(5, 256, device="cuda")
-    permute_idx = torch.tensor([3, 1, 4, 0, 2], device="cuda", dtype=torch.int64)
-
-    result = process_input(
-        x,
-        quant_mode="dynamic_group_token",
-        quant_dtype="float8e4m3",
-        quant_group_size=128,
-        layout="permute",
-        indices=permute_idx,
-    )
-
-    grouped = x[permute_idx].reshape(5, 2, 128)
-    raw = grouped.abs().amax(-1) / 448.0
-    m3 = _round_positive_m3_rne(raw)
-    expected_token = torch.exp2(torch.ceil(torch.log2(m3.amax(-1) / 448.0)))
-    expected_group = (m3 / expected_token[:, None]).to(torch.float8_e4m3fn)
-    expected_output = (grouped / m3[:, :, None]).to(torch.float8_e4m3fn)
-
-    torch.testing.assert_close(result[1], expected_group, rtol=0, atol=0)
-    torch.testing.assert_close(result[2], expected_token, rtol=0, atol=0)
-    torch.testing.assert_close(
-        result[0].float().reshape_as(expected_output),
-        expected_output.float(),
-        rtol=0,
-        atol=0,
-    )
-
-
-@pytest.mark.parametrize("packed", [False, True])
-def test_group_token_m_major_scale_layout(packed):
+@pytest.mark.parametrize("group_scale_dtype", ["float32", "float8e4m3"])
+def test_group_token_m_major_scale_layout(group_scale_dtype):
     torch.manual_seed(22)
     x = torch.randn(5, 512, device="cuda")
     row_major = process_input(
@@ -261,6 +230,7 @@ def test_group_token_m_major_scale_layout(packed):
         quant_dtype="float8e4m3",
         quant_group_size=128,
         hadamard_block_size=128,
+        group_scale_dtype=group_scale_dtype,
     )
     m_major = process_input(
         x,
@@ -268,17 +238,18 @@ def test_group_token_m_major_scale_layout(packed):
         quant_dtype="float8e4m3",
         quant_group_size=128,
         hadamard_block_size=128,
-        group_scale_layout="mx_packed" if packed else "m_major",
+        group_scale_dtype=group_scale_dtype,
+        use_m_major_input_scale=True,
     )
 
-    if packed:
+    if group_scale_dtype == "float8e4m3":
         assert m_major[1].shape == (1, 8, 4)
         assert m_major[1].dtype == torch.float8_e4m3fn
         unpacked = m_major[1][0, :5]
         expected_group_scales = row_major[1]
     else:
-        assert m_major[1].shape == (4, 16)
-        assert m_major[1].dtype == torch.float8_e4m3fn
+        assert m_major[1].shape == (4, 8)
+        assert m_major[1].dtype == torch.float32
         unpacked = m_major[1][:, :5].T
         expected_group_scales = row_major[1]
     torch.testing.assert_close(unpacked, expected_group_scales, rtol=0, atol=0)

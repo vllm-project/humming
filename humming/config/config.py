@@ -7,7 +7,15 @@ import torch
 
 from humming import dtypes
 from humming.config.base import BaseHummingConfig
-from humming.config.enum import GemmType, InputQuantizationMode, MmaType, WeightScale2Type, WeightScaleType
+from humming.config.enum import (
+    ActivationType,
+    GemmType,
+    InputQuantizationMode,
+    MmaType,
+    ProcessInputLayoutType,
+    WeightScale2Type,
+    WeightScaleType,
+)
 from humming.device import DeviceInfo, current_device
 from humming.utils.math import round_up
 
@@ -197,7 +205,7 @@ class LayerConfig(BaseHummingConfig):
 
         self.has_input_scale = self.input_quant_mode.should_quantize
         self.has_input_scale_2 = self.input_quant_mode.has_secondary_scale
-        self.is_group_input_scale = self.input_quant_mode.uses_group_scale
+        self.is_group_input_scale = self.input_quant_mode.has_group_scale
         self.is_token_input_scale = self.input_quant_mode == InputQuantizationMode.DynamicToken
         self.is_tensor_input_scale = self.input_quant_mode == InputQuantizationMode.StaticTensor
         self.is_token_input_scale_2 = self.input_quant_mode == InputQuantizationMode.DynamicGroupToken
@@ -501,3 +509,90 @@ class TuningConfig(BaseHummingConfig):
                 assert getattr(self, name) is not True
             if getattr(self, name) is None:
                 setattr(self, name, self.use_tma)
+
+
+@dataclasses.dataclass(kw_only=True, unsafe_hash=True)
+class ProcessInputConfig(BaseHummingConfig):
+    input_dtype: dtypes.DataType
+    hidden_size: int
+    quant_mode: InputQuantizationMode = InputQuantizationMode.Disabled
+    quant_dtype: dtypes.DataType | None = None
+    quant_group_size: int | None = None
+    group_scale_dtype: dtypes.DataType | None = None
+    use_m_major_input_scale: bool = False
+    activation_type: ActivationType = ActivationType.None_
+    activation_impl: str | None = None
+    hadamard_block_size: int | None = None
+    layout: ProcessInputLayoutType = ProcessInputLayoutType.Normal
+    scatter_width: int = 1
+    expert_layout_int64: bool = False
+    zero_invalid: bool = False
+
+    def __post_init__(self):
+        self.quant_mode = InputQuantizationMode(self.quant_mode)
+        self.activation_type = ActivationType(self.activation_type)
+        self.layout = ProcessInputLayoutType(self.layout)
+        self.input_dtype = self.input_dtype and dtypes.DataType.from_any(self.input_dtype)
+        self.quant_dtype = self.quant_dtype and dtypes.DataType.from_any(self.quant_dtype)
+        self.group_scale_dtype = self.group_scale_dtype and dtypes.DataType.from_any(self.group_scale_dtype)
+        assert self.hidden_size > 0
+        assert self.quant_mode.should_quantize == (self.quant_dtype is not None)
+
+        if self.activation_type != ActivationType.None_:
+            assert self.activation_impl, "activation_impl is required"
+
+        self.hadamard_block_size = self.hadamard_block_size or 1
+        self.quant_group_size = self.hidden_size
+        if self.quant_mode.has_group_scale:
+            self.quant_group_size = self.quant_group_size or min(self.hidden_size & -self.hidden_size, 512)
+
+        if self.group_scale_dtype is None:
+            self.group_scale_dtype = dtypes.float32
+            if self.quant_mode == InputQuantizationMode.DynamicGroupToken:
+                self.group_scale_dtype = dtypes.float8e4m3
+
+    @property
+    def input_row_size(self) -> int:
+        return self.hidden_size * (2 if self.activation_type.is_binary else 1)
+
+    @property
+    def output_packing(self) -> int:
+        return 8 // self.quant_dtype.num_bits if self.quant_dtype is not None else 1
+
+    @property
+    def output_row_size(self) -> int:
+        return self.hidden_size // self.output_packing
+
+    @property
+    def output_torch_dtype(self) -> torch.dtype:
+        dtype = self.quant_dtype or self.input_dtype
+        return dtypes.torch_dtype_map.get(dtype, torch.uint8)
+
+    def get_group_scale_shape(self, rows: int) -> tuple[int, ...]:
+        groups = self.hidden_size // self.quant_group_size
+        if not self.use_m_major_input_scale:
+            return rows, groups
+        stride = round_up(rows, 4)
+        if self.group_scale_dtype.num_bits == 8:
+            return (groups + 3) // 4, stride, 4
+        return groups, stride
+
+
+@dataclasses.dataclass(kw_only=True, unsafe_hash=True)
+class ProcessInputTuningConfig(BaseHummingConfig):
+    threads_per_task: int
+    values_per_thread: int
+    tokens_per_block: int = 1
+    use_tile_partition: bool = False
+    separate_outputs: bool = False
+    two_stage: bool = False
+    finalize_tokens_per_block: int = 4
+    use_pdl: bool = False
+
+    @property
+    def threads(self) -> int:
+        return self.threads_per_task * self.tokens_per_block
+
+    @property
+    def columns_per_task(self) -> int:
+        return self.threads_per_task * self.values_per_thread

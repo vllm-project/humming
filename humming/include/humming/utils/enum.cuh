@@ -1,6 +1,20 @@
 #pragma once
 
 
+enum class ProcessInputLayoutType : uint32_t {
+  Normal = 0,
+  GroupedMask = 3,
+  Scatter = 4,
+};
+
+
+enum class ProcessInputQuantizationPhase : uint32_t {
+  Fused = 0,
+  CollectAbsmax = 1,
+  Quantize = 2,
+};
+
+
 enum class InputQuantizationMode : uint32_t {
   Disabled = 0,
   StaticTensor = 1,

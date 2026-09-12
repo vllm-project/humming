@@ -57,17 +57,26 @@ class BaseHummingConfig:
     def __post_init__(self):
         pass
 
+    @classmethod
+    def get_field_names(cls) -> list[str]:
+        """Return dataclass field names, including inherited fields."""
+        return [field.name for field in dataclasses.fields(cls)]
+
+    def to_dict(self, cls: type["BaseHummingConfig"] | None = None) -> dict[str, Any]:
+        """Return field values without converting or copying nested objects."""
+        cls = cls or self.__class__
+        return {name: getattr(self, name) for name in cls.get_field_names()}
+
     def to_template_args(self) -> dict[str, Any]:
         template_args = {}
-        for field in dataclasses.fields(self):
-            value = getattr(self, field.name)
+        for name, value in self.to_dict().items():
             if isinstance(value, bool):
                 value = int(value)
             elif isinstance(value, Enum):
                 value = value.name
             elif isinstance(value, dtypes.DataType):
                 value = value.to_cpp_str()
-            template_args[field.name] = value
+            template_args[name] = value
         return template_args
 
     def to_cpp_str(
@@ -77,7 +86,7 @@ class BaseHummingConfig:
     ) -> str:
         cls = cls or self.__class__
         str_list = []
-        names = [x.name for x in dataclasses.fields(cls)]
+        names = cls.get_field_names()
         names += list(cls._cpp_extra_names)
         for name in names:
             value = getattr(self, name)
@@ -100,7 +109,7 @@ class BaseHummingConfig:
     def to_macro_cpp_str(self, cls: type["BaseHummingConfig"] | None = None) -> str:
         cls = cls or self.__class__
         str_list = []
-        names = [x.name for x in dataclasses.fields(cls)]
+        names = cls.get_field_names()
         names += list(cls._cpp_extra_names)
         for name in names:
             value = getattr(self, name)
@@ -117,7 +126,7 @@ class BaseHummingConfig:
     def to_extern_cpp_str(self, cls: type["BaseHummingConfig"] | None = None) -> str:
         cls = cls or self.__class__
         str_list = []
-        names = [x.name for x in dataclasses.fields(cls)]
+        names = cls.get_field_names()
         names += list(cls._cpp_extra_names)
         for name in names:
             value = getattr(self, name)
@@ -133,12 +142,11 @@ class BaseHummingConfig:
 
     def to_str(self) -> str:
         res = {}
-        for field in dataclasses.fields(self):
-            value = getattr(self, field.name)
+        for name, value in self.to_dict().items():
             if isinstance(value, Enum):
                 value = value.value
             elif isinstance(value, dtypes.DataType):
                 value = str(value)
-            res[field.name] = value
+            res[name] = value
 
         return json.dumps(res)

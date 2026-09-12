@@ -1,362 +1,12 @@
-import copy
-import dataclasses
-import math
-
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from humming import dtypes
-from humming.config import InputQuantizationMode
-from humming.device import DeviceInfo
+from humming.config import ActivationType, ProcessInputConfig, ProcessInputLayoutType
 from humming.kernel.process_input import ProcessInputKernel
+from humming.ops.input.tune import get_process_input_tuning_intervals
 from humming.ops.utils import init_humming_launcher, register_op
 from humming.utils.math import round_up
-
-from .enums import ActivationType, GroupScaleLayout, LayoutType
-from .plan import select_process_input_plan
-
-QUANT_DTYPE_MIN_SM_VERSION = {
-    dtypes.int4: 75,
-    dtypes.int8: 75,
-    dtypes.float8e4m3: 89,
-    dtypes.float8e5m2: 89,
-    dtypes.float4e0m3: 100,
-    dtypes.float4e2m1: 100,
-    dtypes.float8e3m4: 100,
-}
-
-
-@dataclasses.dataclass(kw_only=True)
-class _ProcessInput:
-    inputs: torch.Tensor
-    outputs: torch.Tensor | None = None
-    quant_mode: InputQuantizationMode | str = "none"
-    quant_dtype: dtypes.DataType | None = None
-    quant_group_size: int | None = None
-    group_scales: torch.Tensor | None = None
-    group_scale_dtype: str | None = None
-    token_scales: torch.Tensor | None = None
-    activation_type: ActivationType | str = "none"
-    activation_impl: str | None = None
-    hadamard_block_size: int | None = None
-    layout: LayoutType | str = "normal"
-    expert_layout: torch.Tensor | None = None
-    indices: torch.Tensor | None = None
-    zero_invalid: bool = False
-    group_scale_layout: GroupScaleLayout | str = "row_major"
-    use_pdl: bool = False
-
-    def validate_tensor(self, tensor: torch.Tensor) -> None:
-        assert tensor.device == self.inputs.device and tensor.is_contiguous()
-
-    @staticmethod
-    def scale_dtype_name(tensor: torch.Tensor) -> str:
-        scale_dtype = dtypes.DataType.from_torch_dtype(tensor.dtype)
-        supported = (dtypes.float32, dtypes.float8e4m3, dtypes.float8e8m0)
-        assert scale_dtype in supported, f"unsupported scale dtype: {tensor.dtype}"
-        return scale_dtype.to_str()
-
-    def normalize(self) -> None:
-        assert self.inputs.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        assert self.inputs.is_contiguous() and self.inputs.size(-1) > 0
-        self.layout = LayoutType(self.layout)
-        self.group_scale_layout = GroupScaleLayout(self.group_scale_layout)
-        self.quant_mode = InputQuantizationMode(self.quant_mode)
-        self.should_quantize = self.quant_mode.should_quantize
-        assert self.should_quantize == (self.quant_dtype is not None), "quant_dtype must match quant_mode"
-        valid_quant_dtype = not self.should_quantize or self.quant_dtype in QUANT_DTYPE_MIN_SM_VERSION
-        assert valid_quant_dtype, f"unsupported quant_dtype: {self.quant_dtype}"
-
-        self.input_row_size = self.inputs.size(-1)
-        self.activation_type = ActivationType(self.activation_type)
-        if self.activation_type == ActivationType.None_:
-            assert self.activation_impl in (None, ""), "activation_impl requires activation_type"
-            self.activation_impl = ""
-        else:
-            assert self.activation_impl, "activation_impl is required"
-
-        binary_types = (ActivationType.BinarySplit, ActivationType.BinaryInterleaved)
-        binary = self.activation_type in binary_types
-        if binary:
-            assert self.input_row_size % 2 == 0
-        self.hidden_size = self.input_row_size // (2 if binary else 1)
-
-        if self.outputs is self.inputs:
-            assert not self.should_quantize, "inplace does not support quantization"
-            unary_activation = self.activation_type in (ActivationType.None_, ActivationType.Unary)
-            assert unary_activation, "inplace does not support binary activation"
-            allowed_layouts = (LayoutType.Normal, LayoutType.GroupedMask)
-            assert self.layout in allowed_layouts, f"inplace does not support {self.layout.value} layout"
-            self.outputs = self.inputs
-
-        uses_group_scale = self.quant_mode.uses_group_scale
-        self.hadamard_block_size = self.hadamard_block_size or 1
-        has_hadamard = self.hadamard_block_size > 1
-        if has_hadamard:
-            err_msg = f"hadamard_block_size must be <= 512, got {self.hadamard_block_size}"
-            assert self.hadamard_block_size <= 512, err_msg
-            is_power_of_two = not self.hadamard_block_size & (self.hadamard_block_size - 1)
-            assert is_power_of_two, "hadamard_block_size must be a power of two"
-            err_msg = "hadamard_block_size must divide hidden_size"
-            assert self.hidden_size % self.hadamard_block_size == 0, err_msg
-
-        if uses_group_scale:
-            if self.quant_group_size is None or self.quant_group_size == 0:
-                self.quant_group_size = min(self.hidden_size & -self.hidden_size, 512)
-            is_power_of_two = not self.quant_group_size & (self.quant_group_size - 1)
-            err_msg = f"quant_group_size {self.quant_group_size} must be a power of 2 >= 2"
-            assert self.quant_group_size >= 2 and is_power_of_two, err_msg
-            assert self.quant_group_size <= 512, "per-group quant_group_size must be <= 512"
-            assert self.hidden_size % self.quant_group_size == 0, "quant_group_size must divide hidden_size"
-            self.tile_size = self.quant_group_size
-        else:
-            self.quant_group_size = self.hidden_size
-            default_tile_size = min(self.hidden_size & -self.hidden_size, 256)
-            if not self.should_quantize and has_hadamard:
-                self.tile_size = self.hadamard_block_size
-            else:
-                self.tile_size = default_tile_size
-
-        self.num_quant_groups = self.hidden_size // self.quant_group_size
-        self.num_tiles = self.hidden_size // self.tile_size
-
-    def prepare_layout(self) -> None:
-        self.num_experts = 1
-        self.max_tokens_per_expert = 1
-        self.output_width = 1
-        if self.layout == LayoutType.Normal:
-            assert self.expert_layout is None and self.indices is None
-            self.output_leading_shape = tuple(self.inputs.shape[:-1])
-            self.num_work_rows = math.prod(self.output_leading_shape)
-        elif self.layout == LayoutType.Permute:
-            assert self.inputs.ndim == 2 and self.expert_layout is None
-            assert self.indices is not None and self.indices.ndim == 1
-            assert self.indices.dtype in (torch.int32, torch.int64)
-            self.validate_tensor(self.indices)
-            rows = self.indices.numel()
-            self.output_leading_shape = (rows,)
-            self.num_work_rows = rows
-        elif self.layout == LayoutType.GroupedMask:
-            assert self.inputs.ndim == 3 and self.expert_layout is not None
-            assert self.indices is None
-            self.num_experts, self.max_tokens_per_expert, _ = self.inputs.shape
-            assert self.expert_layout.shape == (self.num_experts,)
-            assert self.expert_layout.dtype in (torch.int32, torch.int64)
-            self.validate_tensor(self.expert_layout)
-            self.output_leading_shape = (self.num_experts, self.max_tokens_per_expert)
-            self.num_work_rows = math.prod(self.output_leading_shape)
-        else:
-            assert self.layout == LayoutType.Scatter
-            assert self.inputs.ndim == 2 and self.expert_layout is None and self.indices is not None
-            assert self.indices.ndim == 2 and self.indices.size(0) == self.inputs.size(0)
-            assert self.indices.size(1) > 0 and self.indices.dtype == torch.int64
-            self.validate_tensor(self.indices)
-            output_rows = self.outputs.size(0) if self.outputs is not None else self.indices.numel()
-            assert (self.outputs is None or self.outputs.ndim == 2) and output_rows > 0
-            self.output_leading_shape = (output_rows,)
-            self.num_work_rows = self.inputs.size(0)
-            self.output_width = self.indices.size(1)
-        self.num_output_rows = math.prod(self.output_leading_shape)
-
-    def allocate_outputs(self) -> None:
-        output_dtype = self.inputs.dtype
-        if self.quant_dtype is not None:
-            output_dtype = dtypes.torch_dtype_map.get(self.quant_dtype, torch.uint8)
-        packing = 8 // self.quant_dtype.num_bits if self.quant_dtype is not None else 1
-        assert self.hidden_size % packing == 0
-        output_shape = self.output_leading_shape + (self.hidden_size // packing,)
-        if self.outputs is None:
-            self.outputs = torch.empty(output_shape, dtype=output_dtype, device=self.inputs.device)
-            return
-        assert self.outputs.shape == output_shape and self.outputs.dtype == output_dtype
-        self.validate_tensor(self.outputs)
-
-    def allocate_scales(self) -> None:
-        static_tensor = self.quant_mode.has_static_tensor_scale
-        if self.group_scales is not None:
-            tensor_scale_dtype = self.scale_dtype_name(self.group_scales)
-            if self.group_scale_dtype is not None:
-                assert self.group_scale_dtype == tensor_scale_dtype
-            self.group_scale_dtype = tensor_scale_dtype
-        elif self.group_scale_dtype is None and self.quant_mode.dynamic_scale_mode == "group_token":
-            self.group_scale_dtype = "float8e4m3"
-        elif self.group_scale_dtype is None:
-            self.group_scale_dtype = "float32"
-        group_scale_dtype = dtypes.DataType.from_str(self.group_scale_dtype)
-        supported = (dtypes.float32, dtypes.float8e4m3, dtypes.float8e8m0)
-        assert group_scale_dtype in supported
-        if static_tensor:
-            assert self.token_scales is not None and self.token_scales.dtype == torch.float32
-            self.validate_tensor(self.token_scales)
-            assert self.token_scales.numel() == 1
-        uses_group = self.quant_mode.uses_group_scale
-        uses_token = self.quant_mode.has_dynamic_token_scale
-        row_major_scales = self.group_scale_layout == GroupScaleLayout.RowMajor
-        assert uses_group or row_major_scales, "non-row-major scale layout requires dynamic group scales"
-        if self.group_scale_layout == GroupScaleLayout.RowMajor:
-            self.group_scale_stride = self.num_output_rows
-        else:
-            scale_entry_bits = group_scale_dtype.num_bits
-            if self.group_scale_layout == GroupScaleLayout.MxPacked:
-                scale_entry_bits *= 4
-            scale_m_alignment = 128 // scale_entry_bits
-            self.group_scale_stride = round_up(self.num_output_rows, scale_m_alignment)
-
-        if uses_group:
-            if self.quant_mode.dynamic_scale_mode == "group_token":
-                assert group_scale_dtype in (dtypes.float32, dtypes.float8e4m3)
-            if self.group_scale_layout == GroupScaleLayout.MxPacked:
-                assert group_scale_dtype in (dtypes.float8e4m3, dtypes.float8e8m0)
-                scale_shape = ((self.num_quant_groups + 3) // 4, self.group_scale_stride, 4)
-            elif self.group_scale_layout == GroupScaleLayout.MMajor:
-                scale_shape = (self.num_quant_groups, self.group_scale_stride)
-            else:
-                scale_shape = self.output_leading_shape + (self.num_quant_groups,)
-            if self.group_scales is None:
-                dtype = dtypes.torch_dtype_map[group_scale_dtype]
-                self.group_scales = torch.empty(scale_shape, dtype=dtype, device=self.inputs.device)
-            else:
-                assert self.group_scales.shape == scale_shape
-                self.validate_tensor(self.group_scales)
-        else:
-            assert self.group_scales is None, "group_scales is not used by quant_mode"
-
-        if uses_token:
-            if self.token_scales is None:
-                padded_rows = round_up(self.num_output_rows, 4)
-                storage = torch.empty(padded_rows, dtype=torch.float32, device=self.inputs.device)
-                self.token_scales = storage[: self.num_output_rows].view(self.output_leading_shape)
-            else:
-                assert self.token_scales.shape == self.output_leading_shape
-                assert self.token_scales.dtype == torch.float32
-                self.validate_tensor(self.token_scales)
-        elif not self.quant_mode.uses_tensor_scale:
-            assert self.token_scales is None, "token_scales is not used by quant_mode"
-
-    def select_schedule(self) -> None:
-        self.device_info = DeviceInfo(self.inputs.device)
-        minimum_sm_version = QUANT_DTYPE_MIN_SM_VERSION.get(self.quant_dtype)
-        if minimum_sm_version is not None and self.device_info.sm_version < minimum_sm_version:
-            actual = f"SM{self.device_info.sm_version}"
-            minimum = f"SM{minimum_sm_version}"
-            raise RuntimeError(f"{self.quant_dtype} output requires {minimum} or newer, got {actual}")
-        tensors = (self.inputs, self.outputs, self.group_scales, self.token_scales)
-        tensors += (self.expert_layout, self.indices)
-        self.working_set_bytes = sum(t.numel() * t.element_size() for t in tensors if t is not None)
-        self.source_bits = self.inputs.element_size() * 8
-        if self.should_quantize:
-            self.target_bits = self.quant_dtype.num_bits
-        else:
-            self.target_bits = self.source_bits
-        separate_outputs = self.separate_scatter_outputs(self.num_work_rows)
-        expanded_rows = self.num_work_rows * self.output_width
-        self.schedule_rows = expanded_rows if separate_outputs else self.num_work_rows
-        self.schedule_width = 1 if separate_outputs else self.output_width
-        self.plan = select_process_input_plan(self, self.device_info)
-        self.plan = dataclasses.replace(self.plan, separate_outputs=separate_outputs)
-
-    def separate_scatter_outputs(self, rows: int) -> bool:
-        can_repeat_input = self.activation_type == ActivationType.None_
-        can_repeat_input &= self.hadamard_block_size <= 1
-        row_limit = self.device_info.sm_count
-        if not self.quant_mode.has_dynamic_token_scale:
-            row_limit = (row_limit + 1) // 2
-        separate_outputs = self.output_width > 1 and can_repeat_input
-        return separate_outputs and rows * self.output_width <= row_limit
-
-    def plan_for_rows(self, rows: int):
-        operation = copy.copy(self)
-        operation.num_work_rows = rows
-        separate_outputs = self.separate_scatter_outputs(rows)
-        operation.schedule_rows = rows * self.output_width if separate_outputs else rows
-        operation.schedule_width = 1 if separate_outputs else self.output_width
-        bytes_per_row = (self.working_set_bytes + self.num_work_rows - 1) // self.num_work_rows
-        operation.working_set_bytes = bytes_per_row * rows
-        plan = select_process_input_plan(operation, self.device_info)
-        return dataclasses.replace(plan, separate_outputs=separate_outputs)
-
-    def plan_intervals(self):
-        plans = {self.num_work_rows: self.plan}
-
-        def get_plan(rows: int):
-            if rows not in plans:
-                plans[rows] = self.plan_for_rows(rows)
-            return plans[rows]
-
-        def partition(first: int, last: int):
-            if first > last:
-                return []
-            distance = last - first
-            probes = {first, last, first + distance // 4, first + distance // 2, first + 3 * distance // 4}
-            probe_plans = {get_plan(row) for row in probes}
-            if len(probe_plans) == 1:
-                return [(first, last, probe_plans.pop())]
-            if distance <= 16:
-                return [(row, row, get_plan(row)) for row in range(first, last + 1)]
-            middle = (first + last) // 2
-            return partition(first, middle) + partition(middle + 1, last)
-
-        small_limit = max(1, 4 * self.device_info.sm_count)
-        intervals = [(row, row, get_plan(row)) for row in range(1, small_limit + 1)]
-        bytes_per_row = max(1, (self.working_set_bytes + self.num_work_rows - 1) // self.num_work_rows)
-        l2_rows = max(1, self.device_info.l2_cache_size // bytes_per_row)
-        maximum = 1 << 30
-        cuts = {small_limit, maximum}
-        cuts.update(row for row in range(l2_rows - 2, l2_rows + 3) if small_limit < row < maximum)
-        first = small_limit + 1
-        for last in sorted(cuts):
-            if last < first:
-                continue
-            intervals.extend(partition(first, last))
-            first = last + 1
-
-        merged = []
-        for first, last, plan in intervals:
-            if merged and merged[-1][1] + 1 == first and merged[-1][2] == plan:
-                merged[-1] = (merged[-1][0], last, plan)
-            else:
-                merged.append((first, last, plan))
-        return merged
-
-    def kernel_config(self):
-        target_dtype = self.quant_dtype or dtypes.float32
-        kernel_args = dict(
-            source_dtype=dtypes.DataType.from_torch_dtype(self.inputs.dtype),
-            target_dtype=target_dtype,
-            hidden_size=self.hidden_size,
-            quant_group_size=self.quant_group_size,
-            hadamard_block_size=self.hadamard_block_size,
-            tile_size=self.tile_size,
-            layout=self.layout,
-            layout_width=self.output_width,
-            expert_layout_int64=self.expert_layout is not None and self.expert_layout.dtype == torch.int64,
-            index_int64=self.indices is not None and self.indices.dtype == torch.int64,
-            zero_invalid=self.zero_invalid and self.layout == LayoutType.GroupedMask,
-            activation_type=self.activation_type,
-            activation_impl=self.activation_impl,
-            quant_mode=self.quant_mode,
-            group_scale_dtype=self.group_scale_dtype,
-            scale_layout=self.group_scale_layout,
-            use_pdl=self.use_pdl and self.device_info.sm_version >= 90,
-        )
-        return kernel_args
-
-    def prepare_launch_configs(self, cache_key=None) -> torch.Tensor:
-        self.select_schedule()
-        intervals = self.plan_intervals()
-        return ProcessInputKernel.prepare_kernels(
-            self.kernel_config(),
-            intervals,
-            self.quant_mode,
-            self.inputs.device,
-            cache_key,
-        )
-
-    def prepare(self) -> None:
-        self.normalize()
-        self.prepare_layout()
-        self.allocate_outputs()
-        self.allocate_scales()
 
 
 @register_op("humming::prepare_process_input")
@@ -374,77 +24,83 @@ def _prepare_process_input_op(
     hadamard_block_size: int | None = None,
     layout: str = "normal",
     expert_layout: torch.Tensor | None = None,
-    indices: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
     zero_invalid: bool = False,
-    group_scale_layout: str = "row_major",
+    use_m_major_input_scale: bool = False,
     use_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    allocate_outputs = outputs is None
-    allocate_group_scales = group_scales is None
-    allocate_token_scales = token_scales is None
-    operation = _ProcessInput(
-        inputs=inputs,
-        outputs=outputs,
+    assert inputs.ndim == 2, "process_input requires 2D inputs"
+    activation = ActivationType(activation_type)
+    input_width = int(inputs.size(1))
+    assert not activation.is_binary or input_width % 2 == 0
+
+    resolved_layout = ProcessInputLayoutType(layout)
+    scatter_width = 1
+    if resolved_layout == ProcessInputLayoutType.Scatter:
+        assert scatter_idx is not None and scatter_idx.ndim == 2, "scatter requires 2D scatter_idx"
+        scatter_width = int(scatter_idx.size(1))
+    if group_scale_dtype is None and group_scales is not None:
+        group_scale_dtype = dtypes.DataType.from_torch_dtype(group_scales.dtype)
+
+    config = ProcessInputConfig(
+        input_dtype=dtypes.DataType.from_torch_dtype(inputs.dtype),
+        hidden_size=input_width // (2 if activation.is_binary else 1),
         quant_mode=quant_mode,
-        quant_dtype=None if quant_dtype is None else dtypes.DataType.from_str(quant_dtype),
+        quant_dtype=quant_dtype,
         quant_group_size=quant_group_size,
-        group_scales=group_scales,
         group_scale_dtype=group_scale_dtype,
-        token_scales=token_scales,
-        activation_type=activation_type,
+        activation_type=activation,
         activation_impl=activation_impl,
         hadamard_block_size=hadamard_block_size,
-        layout=layout,
-        expert_layout=expert_layout,
-        indices=indices,
+        layout=resolved_layout,
+        scatter_width=scatter_width,
+        expert_layout_int64=expert_layout is not None and expert_layout.dtype == torch.int64,
         zero_invalid=zero_invalid,
-        group_scale_layout=group_scale_layout,
-        use_pdl=use_pdl,
+        use_m_major_input_scale=use_m_major_input_scale,
     )
-    operation.prepare()
+    num_input_rows = inputs.size(0)
+    num_output_rows = num_input_rows
+    if resolved_layout == ProcessInputLayoutType.Scatter:
+        num_output_rows = outputs.size(0) if outputs is not None else num_input_rows * scatter_width
 
-    if isinstance(inputs, FakeTensor):
-        init_humming_launcher()
-        config_size = torch.library.get_ctx().new_dynamic_size(min=4)
-        configs = torch.empty((config_size,), dtype=torch.int64, device="cpu")
-    else:
-        assert inputs.is_cuda
-        output_width = indices.size(1) if layout == "scatter" and indices is not None else 1
-        output_alias = 0 if outputs is None else (1 if outputs is inputs else 2)
-        family_key = (
-            inputs.device.index,
-            inputs.dtype,
-            inputs.size(-1),
-            outputs.dtype if outputs is not None else None,
-            output_alias,
-            group_scales.dtype if group_scales is not None else None,
-            group_scale_dtype,
-            token_scales.dtype if token_scales is not None else None,
-            expert_layout.dtype if expert_layout is not None else None,
-            indices.dtype if indices is not None else None,
-            quant_mode,
-            quant_dtype,
-            quant_group_size,
-            activation_type,
-            activation_impl,
-            hadamard_block_size,
-            layout,
-            output_width,
-            zero_invalid,
-            group_scale_layout,
-            use_pdl,
+    allocated_outputs = None
+    if outputs is None:
+        allocated_outputs = torch.empty(
+            (num_output_rows, config.output_row_size),
+            dtype=config.output_torch_dtype,
+            device=inputs.device,
         )
-        configs = ProcessInputKernel._str2kernel_cache.get(family_key)
-        if configs is None:
-            with torch.cuda.device(inputs.device):
-                configs = operation.prepare_launch_configs(family_key)
 
-    return (
-        configs,
-        operation.outputs if allocate_outputs else None,
-        operation.group_scales if allocate_group_scales else None,
-        operation.token_scales if allocate_token_scales else None,
-    )
+    allocated_groups = None
+    if config.quant_mode.has_group_scale and group_scales is None:
+        allocated_groups = torch.empty(
+            config.get_group_scale_shape(num_output_rows),
+            dtype=dtypes.torch_dtype_map[config.group_scale_dtype],
+            device=inputs.device,
+        )
+
+    allocated_tokens = None
+    if config.quant_mode.has_token_scale and token_scales is None:
+        storage = torch.empty(
+            round_up(num_output_rows, 4),
+            dtype=torch.float32,
+            device=inputs.device,
+        )
+        allocated_tokens = storage[:num_output_rows]
+
+    assert inputs.is_cuda
+    with torch.cuda.device(inputs.device):
+        if isinstance(inputs, FakeTensor):
+            init_humming_launcher()
+            intervals = get_process_input_tuning_intervals(config, use_pdl)
+            configs = torch.empty((len(intervals) * 4,), dtype=torch.int64, device="cpu")
+        else:
+            family_key = (inputs.device.index, config, use_pdl)
+            configs = ProcessInputKernel._str2kernel_cache.get(family_key)
+            if configs is None:
+                intervals = get_process_input_tuning_intervals(config, use_pdl)
+                configs = ProcessInputKernel.prepare_kernels(config, intervals, inputs.device, family_key)
+    return configs, allocated_outputs, allocated_groups, allocated_tokens
 
 
 def process_input(
@@ -462,9 +118,9 @@ def process_input(
     hadamard_block_size: int | None = None,
     layout: str = "normal",
     expert_layout: torch.Tensor | None = None,
-    indices: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
     zero_invalid: bool = False,
-    group_scale_layout: str = "row_major",
+    use_m_major_input_scale: bool = False,
     use_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     options = dict(
@@ -477,17 +133,17 @@ def process_input(
         hadamard_block_size=hadamard_block_size,
         layout=layout,
         expert_layout=expert_layout,
-        indices=indices,
+        scatter_idx=scatter_idx,
         zero_invalid=zero_invalid,
-        group_scale_layout=group_scale_layout,
+        use_m_major_input_scale=use_m_major_input_scale,
         use_pdl=use_pdl,
     )
     use_ops = torch.compiler.is_compiling() or isinstance(inputs, FakeTensor)
-    prepare = torch.ops.humming.prepare_process_input if use_ops else _prepare_process_input_op
-    prepared = prepare(inputs, outputs, group_scales, token_scales, **options)
-    configs, allocated_outputs, allocated_group_scales, allocated_token_scales = prepared
+    prepare_process_input = torch.ops.humming.prepare_process_input if use_ops else _prepare_process_input_op
+    prepared_tensors = prepare_process_input(inputs, outputs, group_scales, token_scales, **options)
+    configs, allocated_outputs, allocated_group_scales, allocated_token_scales = prepared_tensors
     if outputs is inputs:
-        torch.ops.humming.launch_process_input.inplace(configs, inputs, expert_layout, indices)
+        torch.ops.humming.launch_process_input.inplace(configs, inputs, expert_layout, scatter_idx)
         return inputs, None, None
 
     result_outputs = outputs if outputs is not None else allocated_outputs
@@ -501,6 +157,6 @@ def process_input(
         result_group_scales,
         result_token_scales,
         expert_layout,
-        indices,
+        scatter_idx,
     )
     return result_outputs, result_group_scales, result_token_scales

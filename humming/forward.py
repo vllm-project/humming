@@ -33,14 +33,6 @@ def _prepare_input_scale(config: LayerConfig, input_scale: torch.Tensor) -> torc
     return input_scale
 
 
-def _group_scale_layout(config: LayerConfig, m_major_scale: bool) -> str:
-    if not m_major_scale or config.input_scale_group_size == 0:
-        return "row_major"
-    if str(config.as_dtype) in ("float8e4m3", "float8e8m0"):
-        return "mx_packed"
-    return "m_major"
-
-
 def may_process_input(
     config: LayerConfig,
     inputs: torch.Tensor,
@@ -53,7 +45,7 @@ def may_process_input(
     hadamard_block_size: int | None = None,
     layout: str = "normal",
     expert_layout: torch.Tensor | None = None,
-    indices: torch.Tensor | None = None,
+    scatter_idx: torch.Tensor | None = None,
     zero_invalid: bool = False,
     m_major_scale: bool = False,
     use_pdl: bool | None = None,
@@ -71,14 +63,14 @@ def may_process_input(
         quant_group_size = config.input_scale_group_size or None
         group_scale_dtype = str(config.as_dtype)
 
-    no_transform = (
-        activation_type == "none"
-        and activation_impl in (None, "")
-        and (hadamard_block_size is None or hadamard_block_size <= 1)
-    )
-    no_layout = layout == "normal" and expert_layout is None and indices is None and not zero_invalid
-    no_buffers = outputs is None and group_scales is None and token_scales is None
-    if not should_quantize and no_transform and no_layout and no_buffers:
+    should_transform = hadamard_block_size is not None and hadamard_block_size > 1
+    has_activation = activation_type != "none"
+    should_scatter = layout == "scatter"
+    should_process = should_quantize or should_transform or has_activation or should_scatter
+    if not should_process:
+        if outputs is not None and outputs is not inputs:
+            outputs.copy_(inputs)
+            return outputs, None, None
         return inputs, None, None
 
     resolved_use_pdl = _resolve_use_pdl(config, inputs, use_pdl)
@@ -96,9 +88,9 @@ def may_process_input(
         hadamard_block_size=hadamard_block_size,
         layout=layout,
         expert_layout=expert_layout,
-        indices=indices,
+        scatter_idx=scatter_idx,
         zero_invalid=zero_invalid,
-        group_scale_layout=_group_scale_layout(config, m_major_scale),
+        use_m_major_input_scale=m_major_scale and config.input_scale_group_size > 0,
         use_pdl=resolved_use_pdl,
     )
 
@@ -162,21 +154,13 @@ def humming_forward(
         if isinstance(parsed_compute_config, dict):
             m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
 
-    inputs_are_quantized = False
-    if config.input_quant_mode.should_quantize:
-        quantized_torch_dtype = dtypes.torch_dtype_map.get(config.a_dtype, torch.uint8)
-        inputs_are_quantized = inputs.dtype == quantized_torch_dtype
-        if config.a_dtype.num_bits == 4:
-            inputs_are_quantized = inputs.dtype == torch.uint8
-
-    needs_transform = hadamard_block_size is not None and hadamard_block_size > 1
-    should_process = False
-    if not inputs_are_quantized:
-        should_process = config.input_quant_mode.should_quantize
-        if needs_transform:
-            should_process = True
+    unquantized_dtype = [torch.bfloat16, torch.float16, torch.float32]
+    should_quantize = config.input_quant_mode.should_quantize
+    is_quantized_input = inputs.dtype not in unquantized_dtype
+    should_transform = hadamard_block_size is not None and hadamard_block_size > 1
+    should_process = not is_quantized_input and (should_quantize or should_transform)
     if should_process:
-        group_scales = input_scale if config.input_quant_mode.uses_group_scale else None
+        group_scales = input_scale if config.input_quant_mode.has_group_scale else None
         token_scales = input_scale_2 if config.input_quant_mode.has_secondary_scale else input_scale
         inputs, group_scales, token_scales = may_process_input(
             config,
@@ -187,9 +171,9 @@ def humming_forward(
             m_major_scale=m_major_scale,
             use_pdl=use_pdl,
         )
-        if token_scales is not None and config.input_quant_mode.has_dynamic_token_scale:
+        if token_scales is not None and config.input_quant_mode.has_token_scale:
             token_scales = token_scales.unsqueeze(-1)
-        input_scale = group_scales if config.input_quant_mode.uses_group_scale else token_scales
+        input_scale = group_scales if config.input_quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if config.input_quant_mode.has_secondary_scale else None
         if input_scale is not None:
             input_scale = _prepare_input_scale(config, input_scale)

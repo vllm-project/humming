@@ -163,8 +163,7 @@ def test_dynamic_group_e4_token_centric_schedules(quant_dtype, hadamard_block_si
         assert mismatches.count_nonzero() / mismatches.numel() < 1e-5
 
 
-@pytest.mark.parametrize("packed", [False, True])
-def test_dynamic_group_e4_token_centric_m_major(packed):
+def test_dynamic_group_e4_token_centric_m_major():
     torch.manual_seed(24)
     x = torch.randn(512, 512, device="cuda")
     row_major = process_input(
@@ -179,19 +178,10 @@ def test_dynamic_group_e4_token_centric_m_major(packed):
         quant_mode="dynamic_group",
         quant_dtype="float8e4m3",
         quant_group_size=128,
-        group_scales=_empty_group_scales(
-            512,
-            4,
-            "float8e4m3",
-            "mx_packed" if packed else "m_major",
-        ),
-        group_scale_layout="mx_packed" if packed else "m_major",
+        group_scales=_empty_group_scales(512, 4, "float8e4m3", use_m_major_input_scale=True),
+        use_m_major_input_scale=True,
     )
-    if packed:
-        unpacked = m_major[1].view(torch.uint8).reshape(1, 512, 4)[0]
-        expected = row_major[1].view(torch.uint8)
-    else:
-        unpacked = m_major[1][:, :512].T
-        expected = row_major[1]
+    unpacked = m_major[1].view(torch.uint8).reshape(1, 512, 4)[0]
+    expected = row_major[1].view(torch.uint8)
     torch.testing.assert_close(unpacked, expected, rtol=0, atol=0)
     torch.testing.assert_close(m_major[0].float(), row_major[0].float(), rtol=0, atol=0)

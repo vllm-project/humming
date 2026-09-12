@@ -199,7 +199,10 @@ class HummingWeightSchema(BaseWeightSchema):
         if schema.hadamard_block_size > 1:
             from humming import ops
 
+            origin_shape = tensor.shape
+            tensor = tensor.reshape(-1, tensor.size(-1))
             tensor = ops.process_input(tensor, hadamard_block_size=schema.hadamard_block_size)[0]
+            tensor = tensor.view(*origin_shape)
         is_tensor_only = schema.weight_scale_type == WeightScaleType.TENSOR
         if schema.weight_scale_2_type == WeightScale2Type.TENSOR:
             scale_2_type = "tensor"
@@ -246,7 +249,7 @@ class HummingWeightSchema(BaseWeightSchema):
         else:
             weight_scale = tensors["weight_scale"]
             weight_scale_2 = tensors.get("weight_scale_2")
-        return dequantize_weight(
+        tensor = dequantize_weight(
             tensors["weight"],
             weight_scale=weight_scale,
             zero_point=zero_point,
@@ -254,6 +257,15 @@ class HummingWeightSchema(BaseWeightSchema):
             dtype=self.b_dtype,
             packed=True,
         )
+        if self.hadamard_block_size > 1:
+            from humming import ops
+
+            origin_shape = tensor.shape
+            tensor = tensor.reshape(-1, tensor.size(-1))
+            tensor = ops.process_input(tensor, hadamard_block_size=self.hadamard_block_size)[0]
+            tensor = tensor.view(*origin_shape)
+
+        return tensor
 
     def requant_tensors(
         self,

@@ -1,9 +1,3 @@
-from .enums import ActivationType, GroupScaleLayout, LayoutType
-from .process import process_input
+from humming.ops.input.process import process_input
 
-__all__ = [
-    "ActivationType",
-    "GroupScaleLayout",
-    "LayoutType",
-    "process_input",
-]
+__all__ = ["process_input"]

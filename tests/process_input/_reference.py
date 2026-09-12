@@ -17,12 +17,12 @@ def _empty_group_scales(
     rows: int,
     groups: int,
     scale_dtype: str,
-    scale_layout: str = "row_major",
+    use_m_major_input_scale: bool = False,
 ) -> torch.Tensor:
     dtype = SCALE_DTYPES[scale_dtype]
-    if scale_layout == "row_major":
+    if not use_m_major_input_scale:
         shape = (rows, groups)
-    elif scale_layout == "m_major":
+    elif dtype == torch.float32:
         alignment = 16 // torch.empty((), dtype=dtype).element_size()
         stride = round_up(rows, alignment)
         shape = (groups, stride)

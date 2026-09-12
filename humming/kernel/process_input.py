@@ -5,15 +5,15 @@ import jinja2
 import torch
 
 from humming import dtypes
-from humming.config import InputQuantizationMode
-from humming.config.base import BaseHummingConfig
-from humming.jit.runtime import KernelRuntime
-from humming.ops.input.enums import (
-    ActivationType,
-    GroupScaleLayout,
-    LayoutType,
-    QuantizationPhase,
+from humming.config import (
+    InputQuantizationMode,
+    ProcessInputConfig,
+    ProcessInputTuningConfig,
 )
+from humming.config import (
+    ProcessInputQuantizationPhase as QuantizationPhase,
+)
+from humming.jit.runtime import KernelRuntime
 
 _SOURCE_TYPE_CPP = {
     dtypes.float16: "__half",
@@ -45,7 +45,7 @@ struct ProcessInputActivation {
 {% endif %}
 };
 
-class KernelConfig {
+class Config {
 public:
   using SourceType = {{ source_dtype }};
   using TargetType = {{ target_dtype }};
@@ -54,77 +54,45 @@ public:
 {{ process_input_config }}
 };
 
-using RuntimeConfig = ProcessInputConfig<KernelConfig>;
+class TuningConfig {
+public:
+{{ process_input_tuning }}
+};
+
+using Context = ProcessInputContext<
+    Config, TuningConfig, ProcessInputQuantizationPhase::{{ quantization_phase }}>;
 
 {{ process_input_extern }}
-extern "C" __constant__ uint32_t NUM_THREADS = RuntimeConfig::kThreads;
-extern "C" __constant__ uint32_t INPUT_ROW_SIZE = RuntimeConfig::kInputRowSize;
-extern "C" __constant__ uint32_t OUTPUT_PACKING = RuntimeConfig::kOutputPacking;
+{{ tuning_extern }}
+extern "C" __constant__ uint32_t NUM_THREADS = Context::kThreads;
+extern "C" __constant__ uint32_t INPUT_ROW_SIZE = Context::kInputRowSize;
+extern "C" __constant__ uint32_t COLUMNS_PER_TASK = Context::kColumnsPerTask;
+extern "C" __constant__ uint32_t OUTPUT_PACKING = Context::kOutputPacking;
 extern "C" __constant__ uint32_t SOURCE_DTYPE_ID = {{ source_dtype_config }}::kId;
-extern "C" __constant__ uint32_t TARGET_DTYPE_ID = KernelConfig::TargetType::kId;
+extern "C" __constant__ uint32_t TARGET_DTYPE_ID = Config::TargetType::kId;
 extern "C" __constant__ uint32_t GROUP_SCALE_DTYPE_ID = {{ group_scale_data_type }}::kId;
-extern "C" __constant__ uint32_t LAYOUT = static_cast<uint32_t>(KernelConfig::kLayout);
-extern "C" __constant__ uint32_t QUANT_MODE = static_cast<uint32_t>(RuntimeConfig::kQuantization);
-extern "C" __constant__ uint32_t QUANTIZATION_PHASE = static_cast<uint32_t>(RuntimeConfig::kPhase);
-extern "C" __constant__ uint32_t SCALE_LAYOUT = static_cast<uint32_t>(RuntimeConfig::kGroupScaleLayout);
+extern "C" __constant__ uint32_t LAYOUT = static_cast<uint32_t>(Config::kLayout);
+extern "C" __constant__ uint32_t QUANT_MODE = static_cast<uint32_t>(Context::kQuantization);
+extern "C" __constant__ uint32_t QUANTIZATION_PHASE = static_cast<uint32_t>(Context::kPhase);
 """)
 
 
 @dataclasses.dataclass(kw_only=True)
-class ProcessInputKernel(KernelRuntime, BaseHummingConfig):
-    # Kernel metadata
+class ProcessInputKernel(KernelRuntime, ProcessInputConfig, ProcessInputTuningConfig):
     name: ClassVar[str] = "process_input_kernel"
     _str2kernel_cache: ClassVar[dict[tuple[object, ...], torch.Tensor]] = {}
-
-    # Input/output types
-    source_dtype: dtypes.DataType
-    target_dtype: dtypes.DataType
-
-    # Shape
-    hidden_size: int
-    quant_group_size: int
-    hadamard_block_size: int
-
-    # Layout
-    layout: LayoutType | str = LayoutType.Normal
-    layout_width: int = 1
-    scatter_single_output: bool = False
-    expert_layout_int64: bool = False
-    index_int64: bool = False
-    zero_invalid: bool = False
-
-    # Activation
-    activation_type: ActivationType | str = ActivationType.None_
-    activation_impl: str = ""
-
-    # Quantization
-    quant_mode: InputQuantizationMode | str = InputQuantizationMode.DynamicGroup
-    group_scale_dtype: str = "float32"
-    scale_layout: GroupScaleLayout | str = GroupScaleLayout.RowMajor
-    quantization_phase: QuantizationPhase | str = QuantizationPhase.Fused
-
-    # Schedule
-    threads_per_task: int
-    values_per_thread: int
-    tokens_per_block: int = 1
-    use_tile_partition: bool = False
-    tile_size: int
-    tiles_per_block: int = 1
-    use_pdl: bool = False
-    finalize_tokens_per_block: int = 0
+    quantization_phase: QuantizationPhase = QuantizationPhase.Fused
 
     def __post_init__(self):
-        self.activation_type = ActivationType(self.activation_type)
-        self.layout = LayoutType(self.layout)
-        self.quant_mode = InputQuantizationMode(self.quant_mode)
         self.quantization_phase = QuantizationPhase(self.quantization_phase)
-        self.scale_layout = GroupScaleLayout(self.scale_layout)
-        super().__post_init__()
+        ProcessInputConfig.__post_init__(self)
+        ProcessInputTuningConfig.__post_init__(self)
+        KernelRuntime.__post_init__(self)
 
     def register_kernel(self):
-        from humming.ops import register_process_input_kernel
+        from humming import ops
 
-        kernel_id, kernel_name = register_process_input_kernel(self.kernel_filename)
+        kernel_id, kernel_name = ops.register_process_input_kernel(self.kernel_filename)
         assert self.name in kernel_name
         self.kernel_id = kernel_id
         self.kernel_name = kernel_name
@@ -137,25 +105,21 @@ class ProcessInputKernel(KernelRuntime, BaseHummingConfig):
             assert self.quantization_phase == QuantizationPhase.Fused
             assert 1 <= self.finalize_tokens_per_block <= 32
             finalize_tokens = self.finalize_tokens_per_block
-            kernel_expr = f"finalize_group_token_scales_kernel<RuntimeConfig, {finalize_tokens}>"
+            kernel_expr = f"finalize_group_token_scales_kernel<Config, TuningConfig, {finalize_tokens}>"
         else:
-            assert self.hidden_size % self.quant_group_size == 0
-            assert self.hidden_size % self.tile_size == 0
-            assert self.values_per_thread > 0
-            assert self.threads_per_task > 0
-            assert not self.scatter_single_output or self.layout == LayoutType.Scatter
-            threads = self.threads_per_task * self.tokens_per_block
-            assert threads % 32 == 0 and 32 <= threads <= 1024
-            kernel_expr = "process_input_kernel<RuntimeConfig>"
+            kernel_expr = "process_input_kernel<Config, TuningConfig, Context::kPhase>"
 
-        group_scale_data_type = dtypes.DataType.from_str(self.group_scale_dtype)
+        group_scale_data_type = self.group_scale_dtype
         template_args = self.to_template_args()
         template_args.update(
-            process_input_config=self.to_cpp_str(ProcessInputKernel),
-            process_input_extern=self.to_extern_cpp_str(ProcessInputKernel),
-            source_dtype=_SOURCE_TYPE_CPP[self.source_dtype],
-            source_dtype_config=self.source_dtype.to_cpp_str(),
-            group_scale_dtype=_SCALE_TYPE_CPP[self.group_scale_dtype],
+            process_input_config=self.to_cpp_str(ProcessInputConfig),
+            process_input_extern=self.to_extern_cpp_str(ProcessInputConfig),
+            process_input_tuning=self.to_cpp_str(ProcessInputTuningConfig),
+            tuning_extern=self.to_extern_cpp_str(ProcessInputTuningConfig),
+            source_dtype=_SOURCE_TYPE_CPP[self.input_dtype],
+            target_dtype=(self.quant_dtype or dtypes.float32).to_cpp_str(),
+            source_dtype_config=self.input_dtype.to_cpp_str(),
+            group_scale_dtype=_SCALE_TYPE_CPP[str(self.group_scale_dtype)],
             group_scale_data_type=group_scale_data_type.to_cpp_str(),
             activation_type=self.activation_type.cpp_name,
         )
@@ -168,67 +132,61 @@ class ProcessInputKernel(KernelRuntime, BaseHummingConfig):
         from humming.utils.cubin import patch_cubin
 
         mode = None
-        if self.target_dtype == dtypes.float8e3m4:
+        if self.quant_dtype == dtypes.float8e3m4:
             mode = "cvt_e3m4"
-        elif self.target_dtype == dtypes.float4e0m3:
+        elif self.quant_dtype == dtypes.float4e0m3:
             mode = "cvt_e0m3"
         if mode:
             patch_cubin(cubin_path=cubin_path, mode=mode)
 
     @classmethod
-    def prepare_kernels(cls, kernel_args, intervals, quant_mode, device, cache_key=None):
+    def prepare_kernels(cls, config, tuning_intervals, device, cache_key=None):
         if cache_key is not None and cache_key in cls._str2kernel_cache:
             return cls._str2kernel_cache[cache_key]
 
-        plan_specs = {}
-        for _, _, plan in intervals:
-            if plan in plan_specs:
+        config_dict = config.to_dict()
+        quant_mode = config.quant_mode
+        kernel_specs_by_tuning = {}
+        for _, _, tuning_config in tuning_intervals:
+            if tuning_config in kernel_specs_by_tuning:
                 continue
-            schedule_args = {
-                "threads_per_task": plan.threads_per_task,
-                "values_per_thread": plan.values_per_thread,
-                "tokens_per_block": plan.tokens_per_block,
-                "use_tile_partition": plan.use_tile_partition,
-                "tiles_per_block": plan.tiles_per_block,
-                "scatter_single_output": plan.separate_outputs,
-            }
-            plan_args = kernel_args | schedule_args
-            primary = (cls, plan_args | {"quantization_phase": QuantizationPhase.Fused})
-            secondary = None
-            if quant_mode.dynamic_scale_mode == "token" and plan.two_stage:
-                primary = (cls, plan_args | {"quantization_phase": QuantizationPhase.CollectAbsmax})
-                secondary = (cls, plan_args | {"quantization_phase": QuantizationPhase.Quantize})
-            elif quant_mode.dynamic_scale_mode == "group_token" and plan.use_tile_partition:
-                finalizer_args = plan_args | {"quantization_phase": QuantizationPhase.Fused}
-                finalizer_args["finalize_tokens_per_block"] = plan.finalize_tokens_per_block
-                secondary = (ProcessInputScaleKernel, finalizer_args)
-            plan_specs[plan] = primary, secondary
+            kernel_config = config_dict | tuning_config.to_dict()
+            primary_spec = (cls, kernel_config | {"quantization_phase": QuantizationPhase.Fused})
+            secondary_spec = None
+            if quant_mode.dynamic_scale_mode == "token" and tuning_config.two_stage:
+                primary_spec = (cls, kernel_config | {"quantization_phase": QuantizationPhase.CollectAbsmax})
+                secondary_spec = (cls, kernel_config | {"quantization_phase": QuantizationPhase.Quantize})
+            elif quant_mode.dynamic_scale_mode == "group_token" and tuning_config.use_tile_partition:
+                finalizer_config = kernel_config | {"quantization_phase": QuantizationPhase.Fused}
+                finalizer_config["finalize_tokens_per_block"] = tuning_config.finalize_tokens_per_block
+                secondary_spec = (ProcessInputScaleKernel, finalizer_config)
+            kernel_specs_by_tuning[tuning_config] = primary_spec, secondary_spec
 
-        def spec_key(spec):
-            kernel_type, config = spec
-            return kernel_type, tuple(sorted(config.items()))
+        def get_kernel_spec_key(kernel_spec):
+            kernel_type, kernel_config = kernel_spec
+            return kernel_type, tuple(sorted(kernel_config.items()))
 
-        unique_specs = {}
-        for primary, secondary in plan_specs.values():
-            unique_specs.setdefault(spec_key(primary), primary)
-            if secondary is not None:
-                unique_specs.setdefault(spec_key(secondary), secondary)
+        unique_kernel_specs = {}
+        for primary_spec, secondary_spec in kernel_specs_by_tuning.values():
+            unique_kernel_specs.setdefault(get_kernel_spec_key(primary_spec), primary_spec)
+            if secondary_spec is not None:
+                unique_kernel_specs.setdefault(get_kernel_spec_key(secondary_spec), secondary_spec)
 
-        specs = list(unique_specs.values())
-        compiled = cls.compile_many(specs, device)
-        kernels = dict(zip(unique_specs, compiled, strict=True))
-        plan_kernel_ids = {}
-        for plan, (primary, secondary) in plan_specs.items():
-            primary_id = kernels[spec_key(primary)].kernel_id
+        kernel_specs = list(unique_kernel_specs.values())
+        compiled_kernels = cls.compile_many(kernel_specs, device)
+        kernels_by_spec = dict(zip(unique_kernel_specs, compiled_kernels, strict=True))
+        kernel_ids_by_tuning = {}
+        for tuning_config, (primary_spec, secondary_spec) in kernel_specs_by_tuning.items():
+            primary_id = kernels_by_spec[get_kernel_spec_key(primary_spec)].kernel_id
             secondary_id = -1
-            if secondary is not None:
-                secondary_id = kernels[spec_key(secondary)].kernel_id
-            plan_kernel_ids[plan] = primary_id, secondary_id
+            if secondary_spec is not None:
+                secondary_id = kernels_by_spec[get_kernel_spec_key(secondary_spec)].kernel_id
+            kernel_ids_by_tuning[tuning_config] = primary_id, secondary_id
 
         launch_configs = []
-        for first, last, plan in intervals:
-            primary_id, secondary_id = plan_kernel_ids[plan]
-            launch_configs.extend((first - 1, last, primary_id, secondary_id))
+        for min_shape_m, max_shape_m, tuning_config in tuning_intervals:
+            primary_id, secondary_id = kernel_ids_by_tuning[tuning_config]
+            launch_configs.extend((min_shape_m, max_shape_m, primary_id, secondary_id))
         result = torch.tensor(launch_configs, dtype=torch.int64, device="cpu")
         if cache_key is not None:
             cls._str2kernel_cache[cache_key] = result

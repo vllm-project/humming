@@ -14,15 +14,15 @@ class InputQuantizationMode(str, enum.Enum):
         return self != InputQuantizationMode.Disabled
 
     @property
-    def has_static_tensor_scale(self) -> bool:
+    def has_tensor_scale(self) -> bool:
         return self in (InputQuantizationMode.StaticTensor, InputQuantizationMode.StaticTensorDynamicGroup)
 
     @property
-    def has_dynamic_token_scale(self) -> bool:
+    def has_token_scale(self) -> bool:
         return self in (InputQuantizationMode.DynamicToken, InputQuantizationMode.DynamicGroupToken)
 
     @property
-    def has_dynamic_group_scale(self) -> bool:
+    def has_group_scale(self) -> bool:
         return self in (
             InputQuantizationMode.DynamicGroup,
             InputQuantizationMode.StaticTensorDynamicGroup,
@@ -31,31 +31,19 @@ class InputQuantizationMode(str, enum.Enum):
 
     @property
     def has_dynamic_scale(self) -> bool:
-        return self.has_dynamic_token_scale or self.has_dynamic_group_scale
+        return self.has_token_scale or self.has_group_scale
 
     @property
     def dynamic_scale_mode(self) -> str | None:
-        if self.has_dynamic_token_scale:
-            return "group_token" if self.has_dynamic_group_scale else "token"
-        if self.has_dynamic_group_scale:
+        if self.has_token_scale:
+            return "group_token" if self.has_group_scale else "token"
+        if self.has_group_scale:
             return "group"
         return None
 
     @property
-    def uses_token_scale(self) -> bool:
-        return self.has_dynamic_token_scale
-
-    @property
-    def uses_tensor_scale(self) -> bool:
-        return self.has_static_tensor_scale
-
-    @property
-    def uses_group_scale(self) -> bool:
-        return self.has_dynamic_group_scale
-
-    @property
     def has_secondary_scale(self) -> bool:
-        return self.uses_group_scale and (self.uses_tensor_scale or self.uses_token_scale)
+        return self.has_group_scale and (self.has_tensor_scale or self.has_token_scale)
 
 
 class MmaType(enum.Enum):
@@ -83,3 +71,34 @@ class GemmType(enum.Enum):
     INDEXED = "indexed"
     GROUPED_CONTIGUOUS = "grouped_contiguous"
     GROUPED_MASKED = "grouped_masked"
+
+
+class ProcessInputQuantizationPhase(str, enum.Enum):
+    Fused = "fused"
+    CollectAbsmax = "collect_absmax"
+    Quantize = "quantize"
+
+
+class ActivationType(str, enum.Enum):
+    None_ = "none"
+    Unary = "unary"
+    BinarySplit = "binary_split"
+    BinaryInterleaved = "binary_interleaved"
+
+    @property
+    def cpp_name(self) -> str:
+        return self.name.removesuffix("_")
+
+    @property
+    def is_unary(self) -> bool:
+        return self == ActivationType.Unary
+
+    @property
+    def is_binary(self) -> bool:
+        return self in (ActivationType.BinarySplit, ActivationType.BinaryInterleaved)
+
+
+class ProcessInputLayoutType(str, enum.Enum):
+    Normal = "normal"
+    GroupedMask = "grouped_mask"
+    Scatter = "scatter"

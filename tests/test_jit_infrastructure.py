@@ -148,8 +148,7 @@ def test_kernel_runtime_instances_are_context_local():
 
     def make_kernel():
         return ProcessInputKernel(
-            source_dtype=dtypes.float32,
-            target_dtype=dtypes.float32,
+            input_dtype=dtypes.float32,
             hidden_size=32,
             quant_group_size=32,
             hadamard_block_size=32,
@@ -157,7 +156,6 @@ def test_kernel_runtime_instances_are_context_local():
             values_per_thread=1,
             quant_mode="none",
             use_tile_partition=True,
-            tile_size=32,
         )
 
     values = torch.randn((2, 32), dtype=torch.float32)

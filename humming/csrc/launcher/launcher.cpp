@@ -413,10 +413,10 @@ COMMON_TORCH_LIBRARY(humming, m) {
   m.def(
       "launch_process_input(Tensor configs, Tensor inputs, Tensor(a!) outputs, "
       "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_layout, "
-      "Tensor? indices) -> ()");
+      "Tensor? scatter_idx) -> ()");
   m.def(
       "launch_process_input.inplace(Tensor configs, Tensor(a!) inputs, "
-      "Tensor? expert_layout, Tensor? indices) -> ()");
+      "Tensor? expert_layout, Tensor? scatter_idx) -> ()");
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {

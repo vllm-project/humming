@@ -66,7 +66,7 @@ def test_unquantized_hadamard_and_activation():
 
 @pytest.mark.parametrize("layout", ["normal", "grouped_mask"])
 def test_unquantized_unary_inplace(layout):
-    x = torch.randn((2, 8, 384) if layout == "grouped_mask" else (5, 384), device="cuda")
+    x = torch.randn((16, 384) if layout == "grouped_mask" else (5, 384), device="cuda")
     original = x.clone()
     kwargs = {}
     if layout == "grouped_mask":
@@ -85,8 +85,8 @@ def test_unquantized_unary_inplace(layout):
     assert result[0] is x
     expected = original.relu()
     if layout == "grouped_mask":
-        expected[0, 3:] = 0
-        expected[1, 1:] = 0
+        expected[3:8] = 0
+        expected[9:] = 0
     torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
 

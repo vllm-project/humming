@@ -11,19 +11,11 @@ from ._reference import (
 )
 
 
-def test_raw_permute_and_scatter():
+def test_raw_scatter():
     x = torch.randn(4, 384, device="cuda", dtype=torch.bfloat16)
-    permutation = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int64)
-    permuted = process_input(
-        x,
-        layout="permute",
-        indices=permutation,
-    )[0]
-    assert torch.equal(permuted.view(torch.uint8), x[permutation].view(torch.uint8))
-
     destinations = torch.tensor([[3, -1], [0, 2], [1, -1], [4, 5]], device="cuda")
     outputs = torch.zeros(8, 384, device="cuda", dtype=x.dtype)
-    scattered = process_input(x, outputs=outputs, layout="scatter", indices=destinations)[0]
+    scattered = process_input(x, outputs=outputs, layout="scatter", scatter_idx=destinations)[0]
     for input_row, output_rows in enumerate(destinations.tolist()):
         for output_row in output_rows:
             if output_row >= 0:
@@ -94,7 +86,7 @@ def test_scatter_layout(
         group_scales=group_scales,
         token_scales=token_scales,
         layout="scatter",
-        indices=scatter_idx,
+        scatter_idx=scatter_idx,
         **common,
     )
 
@@ -140,7 +132,7 @@ def test_scatter_layout_static_scale_and_m_major_scale():
         quant_group_size=128,
         token_scales=static_scale,
         layout="scatter",
-        indices=scatter_idx,
+        scatter_idx=scatter_idx,
     )
     torch.testing.assert_close(static_result[0][6], static_reference[0][0], rtol=0, atol=0)
     torch.testing.assert_close(static_result[0][0], static_reference[0][0], rtol=0, atol=0)
@@ -152,7 +144,7 @@ def test_scatter_layout_static_scale_and_m_major_scale():
         quant_mode="dynamic_group",
         quant_dtype="float8e4m3",
         quant_group_size=128,
-        group_scale_layout="m_major",
+        use_m_major_input_scale=True,
     )
     outputs = torch.zeros((7, 512), device=x.device, dtype=torch.float8_e4m3fn)
     group_scales = torch.zeros((4, 8), device=x.device, dtype=torch.float32)
@@ -163,9 +155,9 @@ def test_scatter_layout_static_scale_and_m_major_scale():
         outputs=outputs,
         group_scales=group_scales,
         quant_group_size=128,
-        group_scale_layout="m_major",
+        use_m_major_input_scale=True,
         layout="scatter",
-        indices=scatter_idx,
+        scatter_idx=scatter_idx,
     )
     torch.testing.assert_close(result[1][:, 6], reference[1][:, 0], rtol=0, atol=0)
     torch.testing.assert_close(result[1][:, 0], reference[1][:, 0], rtol=0, atol=0)
@@ -173,53 +165,35 @@ def test_scatter_layout_static_scale_and_m_major_scale():
     assert torch.count_nonzero(result[1][:, 1]) == 0
 
 
-def test_permute_layout_static_scale():
-    torch.manual_seed(13)
-    x = torch.randn(5, 256, device="cuda")
-    static_scale = torch.tensor([0.04], device="cuda")
-    permute_idx = torch.tensor([3, 1, 4, 0, 2], device="cuda", dtype=torch.int64)
-
-    result = process_input(
-        x,
-        quant_mode="static_tensor",
-        quant_dtype="int8",
-        quant_group_size=128,
-        token_scales=static_scale,
-        layout="permute",
-        indices=permute_idx,
-    )
-
-    expected = _quantize_int8_reference(x[permute_idx], static_scale.expand(5, 2), 128)
-    torch.testing.assert_close(result[0], expected, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("zero_invalid", [False, True])
-def test_moe_grouped_mask_invalid_write_policy(zero_invalid):
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_moe_grouped_mask_invalid_write_policy(zero_invalid, preallocate):
     torch.manual_seed(14)
-    x = torch.randn(2, 7, 256, device="cuda")
+    x = torch.randn(14, 256, device="cuda")
     valid_tokens = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
     outputs = torch.full_like(x, 13, dtype=torch.int8)
-    group_scales = torch.full((2, 7, 2), 7, device="cuda", dtype=torch.float8_e4m3fn)
-    token_scales = torch.full((2, 7), 11, device="cuda", dtype=torch.float32)
+    group_scales = torch.full((14, 2), 7, device="cuda", dtype=torch.float8_e4m3fn)
+    token_scales = torch.full((14,), 11, device="cuda", dtype=torch.float32)
 
     result = process_input(
         x,
         quant_mode="dynamic_group_token",
         quant_dtype="int8",
-        outputs=outputs,
-        group_scales=group_scales,
-        token_scales=token_scales,
+        outputs=outputs if preallocate else None,
+        group_scales=group_scales if preallocate else None,
+        token_scales=token_scales if preallocate else None,
         quant_group_size=128,
         hadamard_block_size=128,
         layout="grouped_mask",
         expert_layout=valid_tokens,
         zero_invalid=zero_invalid,
     )
-    invalid = torch.cat((result[0][0, 3:].flatten(), result[0][1, 1:].flatten()))
-    invalid_groups = torch.cat((result[1][0, 3:].flatten(), result[1][1, 1:].flatten()))
-    invalid_tokens = torch.cat((result[2][0, 3:].flatten(), result[2][1, 1:].flatten()))
+    assert result[0].shape == (14, 256)
+    assert result[1].shape == (14, 2)
+    assert result[2].shape == (14,)
 
-    valid_mask = torch.arange(7, device="cuda")[None, :] < valid_tokens[:, None]
+    valid_mask = (torch.arange(7, device="cuda")[None, :] < valid_tokens[:, None]).flatten()
+    invalid, invalid_groups, invalid_tokens = (tensor[~valid_mask] for tensor in result)
     transformed = _hadamard_reference(x, 128).to(x.dtype)[valid_mask]
     grouped = transformed.reshape(-1, 2, 128)
     raw = grouped.abs().amax(-1) / 127.0
@@ -235,7 +209,7 @@ def test_moe_grouped_mask_invalid_write_policy(zero_invalid):
         assert torch.count_nonzero(invalid) == 0
         assert torch.count_nonzero(invalid_groups.view(torch.uint8)) == 0
         assert torch.count_nonzero(invalid_tokens) == 0
-    else:
+    elif preallocate:
         assert torch.all(invalid == 13)
         assert torch.all(invalid_groups == 7)
         assert torch.all(invalid_tokens == 11)

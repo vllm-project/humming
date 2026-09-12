@@ -204,23 +204,18 @@ class KernelTestRunner:
             return inputs.float(), inputs, None, None
 
         static_scale = None
-        if config.input_quant_mode.has_static_tensor_scale:
+        if config.input_quant_mode.has_tensor_scale:
             target_maximum = 448.0 if config.a_dtype == dtypes.float8e4m3 else 127.0
             static_scale = (inputs_orig.abs().amax() / target_maximum).reshape(1).float()
 
         def process(m_major_scale: bool = False):
-            scale_layout = "row_major"
-            if m_major_scale and config.input_scale_group_size > 0:
-                scale_layout = "m_major"
-                if str(config.as_dtype) in ("float8e4m3", "float8e8m0"):
-                    scale_layout = "mx_packed"
             result = ops.process_input(
                 inputs_orig,
                 quant_mode=config.input_quant_mode.value,
                 quant_dtype=str(config.a_dtype),
                 quant_group_size=config.input_scale_group_size or None,
                 group_scale_dtype=str(config.as_dtype),
-                group_scale_layout=scale_layout,
+                use_m_major_input_scale=m_major_scale and config.input_scale_group_size > 0,
                 token_scales=static_scale,
             )
             return result
@@ -243,11 +238,11 @@ class KernelTestRunner:
             input_scale = group_scale_ref if group_scale_ref is not None else token_scale_ref
             input_scale_2 = token_scale_ref if config.input_quant_mode.has_secondary_scale else None
 
-        if config.input_quant_mode.has_dynamic_token_scale and input_scale_2 is not None:
+        if config.input_quant_mode.has_token_scale and input_scale_2 is not None:
             input_scale_2 = input_scale_2.unsqueeze(-1)
         if config.input_quant_mode == InputQuantizationMode.DynamicToken and input_scale is not None:
             input_scale = input_scale.unsqueeze(-1)
-        if config.input_quant_mode.has_static_tensor_scale:
+        if config.input_quant_mode.has_tensor_scale:
             tensor_scale = static_scale
             if config.input_quant_mode.has_secondary_scale:
                 input_scale_2 = tensor_scale
