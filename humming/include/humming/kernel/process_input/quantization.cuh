@@ -151,8 +151,7 @@ CUDA_INLINE float lane_absmax(const float *values) {
     partial[chain] = fabsf(values[chain]);
   PRAGMA_UNROLL
   for (uint32_t value = kChains; value < kValues; value++)
-    partial[value % kChains] = fmaxf(
-        partial[value % kChains], fabsf(values[value]));
+    partial[value % kChains] = fmaxf(partial[value % kChains], fabsf(values[value]));
   PRAGMA_UNROLL
   for (uint32_t step = kChains / 2; step > 0; step >>= 1)
     for (uint32_t chain = 0; chain < step; chain++)
@@ -278,7 +277,7 @@ CUDA_INLINE float token_group_scale_max(float group_scale, float *shared) {
 
 
 template <class TargetType>
-__host__ __device__ constexpr float target_maximum() {
+constexpr float target_maximum() {
   if constexpr (std::is_same<TargetType, Float8E3M4>::value)
     return 30.f;
   else if constexpr (std::is_same<TargetType, Float8E4M3>::value)

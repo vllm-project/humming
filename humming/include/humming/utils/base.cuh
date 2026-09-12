@@ -79,6 +79,15 @@ constexpr uint32_t get_max_load_bytes(uint32_t bytes) {
   return 1;
 }
 
+constexpr uint32_t constexpr_log2(uint32_t value) {
+  uint32_t result = 0;
+  while (value > 1) {
+    value >>= 1;
+    result++;
+  }
+  return result;
+}
+
 template <int bytes>
 struct LoadTypeChooser {
   using Type = typename LoadTypeChooser<get_max_load_bytes(bytes)>::Type;

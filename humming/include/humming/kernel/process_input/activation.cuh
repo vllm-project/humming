@@ -9,9 +9,7 @@
 enum class ActivationType : uint32_t {
   None = 0,
   Unary = 1,
-  // [gate_0 ... gate_K-1, up_0 ... up_K-1].
   BinarySplit = 2,
-  // [gate_0, up_0, ... gate_K-1, up_K-1].
   BinaryInterleaved = 3,
 };
 
@@ -86,13 +84,11 @@ CUDA_INLINE void store_values(ValueType *output, const float *values, bool zero)
     if constexpr (std::is_same<ValueType, __nv_bfloat16>::value && kValuesPerStore >= 2) {
       PRAGMA_UNROLL
       for (uint32_t item = 0; item < kValuesPerStore; item += 2)
-        reinterpret_cast<__nv_bfloat162 *>(converted)[item / 2] =
-            __floats2bfloat162_rn(values[value + item], values[value + item + 1]);
+        reinterpret_cast<__nv_bfloat162 *>(converted)[item / 2] = __floats2bfloat162_rn(values[value + item], values[value + item + 1]);
     } else if constexpr (std::is_same<ValueType, __half>::value && kValuesPerStore >= 2) {
       PRAGMA_UNROLL
       for (uint32_t item = 0; item < kValuesPerStore; item += 2)
-        reinterpret_cast<__half2 *>(converted)[item / 2] =
-            __floats2half2_rn(values[value + item], values[value + item + 1]);
+        reinterpret_cast<__half2 *>(converted)[item / 2] = __floats2half2_rn(values[value + item], values[value + item + 1]);
     } else {
       PRAGMA_UNROLL
       for (uint32_t item = 0; item < kValuesPerStore; item++)
@@ -109,8 +105,7 @@ template <class Activation, uint32_t kHiddenSize, uint32_t kValuesPerThread>
 class InputActivation {
 public:
   static constexpr ActivationType kType = Activation::kType;
-  static constexpr bool kBinary =
-      kType == ActivationType::BinarySplit || kType == ActivationType::BinaryInterleaved;
+  static constexpr bool kBinary = kType == ActivationType::BinarySplit || kType == ActivationType::BinaryInterleaved;
   static constexpr uint32_t kInputElementsPerRow = kBinary ? kHiddenSize * 2 : kHiddenSize;
 
   template <class SourceType>

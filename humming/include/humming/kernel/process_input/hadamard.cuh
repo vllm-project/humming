@@ -3,16 +3,6 @@
 #include <humming/utils/all.cuh>
 
 
-__host__ __device__ constexpr uint32_t constexpr_log2(uint32_t value) {
-  uint32_t result = 0;
-  while (value > 1) {
-    value >>= 1;
-    result++;
-  }
-  return result;
-}
-
-
 template <
     uint32_t kValuesPerLane,
     uint32_t kHadamardBlockSize,
