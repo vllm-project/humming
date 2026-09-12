@@ -231,30 +231,32 @@ inline ProcessInputShape process_input_shape(
     const ProcessInputKernelData &data,
     const Tensor &inputs,
     const Tensor &outputs,
-    const std::optional<Tensor> &expert_layout,
-    const std::optional<Tensor> &scatter_idx) {
+    const std::optional<Tensor> &expert_tokens,
+    const std::optional<Tensor> &scatter_idx,
+    const std::optional<Tensor> &num_valid_tokens) {
   ASSERT_CHECK(inputs.dim() == 2 && inputs.size(-1) == data.input_row_size, "process_input requires 2D inputs");
   ASSERT_CHECK(inputs.numel() % data.input_row_size == 0, "invalid input size");
   int64_t num_input_rows = inputs.numel() / data.input_row_size;
   ProcessInputShape shape{num_input_rows, num_input_rows, num_input_rows, 1, 1, num_input_rows};
 
   if (data.layout == 0) {
-    ASSERT_CHECK(!expert_layout.has_value() && !scatter_idx.has_value(), "normal layout has no metadata");
+    ASSERT_CHECK(!expert_tokens.has_value() && !scatter_idx.has_value() && !num_valid_tokens.has_value(), "normal layout has no metadata");
   } else if (data.layout == 3) {
-    ASSERT_CHECK(expert_layout.has_value() && expert_layout->dim() == 1, "grouped-mask requires 1D expert_layout");
-    ASSERT_CHECK(!scatter_idx.has_value(), "grouped-mask layout does not use scatter_idx");
-    shape.num_experts = expert_layout->numel();
+    ASSERT_CHECK(expert_tokens.has_value() && expert_tokens->dim() == 1, "grouped-mask requires 1D expert_tokens");
+    ASSERT_CHECK(!scatter_idx.has_value() && !num_valid_tokens.has_value(), "grouped-mask layout does not use scatter metadata");
+    shape.num_experts = expert_tokens->numel();
     ASSERT_CHECK(shape.num_experts > 0 && num_input_rows % shape.num_experts == 0, "invalid grouped-mask row count");
     shape.max_tokens_per_expert = num_input_rows / shape.num_experts;
     shape.num_output_rows = shape.num_experts * shape.max_tokens_per_expert;
     shape.num_work_rows = shape.num_output_rows;
-    ASSERT_CHECK(expert_layout->dim() == 1 && expert_layout->numel() == shape.num_experts, "invalid expert_layout");
+    ASSERT_CHECK(expert_tokens->dim() == 1 && expert_tokens->numel() == shape.num_experts, "invalid expert_tokens");
   } else {
     ASSERT_CHECK(data.layout == 4 && inputs.dim() == 2, "invalid scatter layout");
-    ASSERT_CHECK(!expert_layout.has_value() && scatter_idx.has_value(), "scatter requires scatter_idx only");
+    ASSERT_CHECK(!expert_tokens.has_value() && scatter_idx.has_value(), "scatter requires scatter_idx and does not use expert_tokens");
     ASSERT_CHECK(scatter_idx->dim() == 2 && scatter_idx->size(0) == inputs.size(0), "invalid scatter scatter_idx");
     ASSERT_CHECK(scatter_idx->size(1) == data.scatter_width, "scatter width changed after preparation");
     ASSERT_CHECK(outputs.dim() == 2, "scatter outputs must be 2D");
+    ASSERT_CHECK(outputs.size(0) >= scatter_idx->numel(), "scatter output must hold scatter_idx.numel() rows");
     shape.num_output_rows = outputs.size(0);
     shape.num_work_rows = inputs.size(0);
   }
@@ -351,36 +353,41 @@ inline void launch_process_input_main(
     const Tensor &outputs,
     const std::optional<Tensor> &group_scales,
     const std::optional<Tensor> &token_scales,
-    const std::optional<Tensor> &expert_layout,
+    const std::optional<Tensor> &expert_tokens,
     const std::optional<Tensor> &scatter_idx,
+    const std::optional<Tensor> &num_valid_tokens,
     const ProcessInputShape &shape,
     void *output_scales) {
   const void *input_ptr = inputs.data_ptr();
   void *output_ptr = outputs.data_ptr();
   const float *static_tensor_scales = has_static_tensor_scale(data.quant_mode) ? static_cast<const float *>(token_scales->data_ptr()) : nullptr;
   float *token_scales_ptr = has_dynamic_token_scale(data.quant_mode) ? static_cast<float *>(token_scales->data_ptr()) : nullptr;
-  const void *expert_layout_ptr = expert_layout.has_value() ? expert_layout->data_ptr() : nullptr;
+  const void *expert_tokens_ptr = expert_tokens.has_value() ? expert_tokens->data_ptr() : nullptr;
   const void *scatter_idx_ptr = scatter_idx.has_value() ? scatter_idx->data_ptr() : nullptr;
-  bool use_int64_expert_layout = expert_layout.has_value() && expert_layout->scalar_type() == ScalarType::Long;
-  bool use_int64_scatter_idx = scatter_idx.has_value() && scatter_idx->scalar_type() == ScalarType::Long;
+  const void *num_valid_tokens_ptr = num_valid_tokens.has_value() ? num_valid_tokens->data_ptr() : nullptr;
   uint64_t num_input_rows = static_cast<uint64_t>(shape.num_input_rows);
   uint64_t num_output_rows = static_cast<uint64_t>(shape.num_output_rows);
   uint32_t max_tokens_per_expert = static_cast<uint32_t>(shape.max_tokens_per_expert);
   uint64_t group_scale_stride = static_cast<uint64_t>(shape.group_scale_stride);
+  bool use_int64_expert_tokens = expert_tokens.has_value() && expert_tokens->scalar_type() == ScalarType::Long;
+  bool use_int64_scatter_idx = scatter_idx.has_value() && scatter_idx->scalar_type() == ScalarType::Long;
+  bool use_int64_num_valid_tokens = num_valid_tokens.has_value() && num_valid_tokens->scalar_type() == ScalarType::Long;
   void *kernel_args[] = {
       &input_ptr,
       &output_ptr,
       &static_tensor_scales,
       &output_scales,
       &token_scales_ptr,
-      &expert_layout_ptr,
+      &expert_tokens_ptr,
       &scatter_idx_ptr,
+      &num_valid_tokens_ptr,
       &num_input_rows,
       &num_output_rows,
       &max_tokens_per_expert,
       &group_scale_stride,
-      &use_int64_expert_layout,
-      &use_int64_scatter_idx};
+      &use_int64_expert_tokens,
+      &use_int64_scatter_idx,
+      &use_int64_num_valid_tokens};
 
   int64_t work_rows = shape.num_work_rows * (data.separate_outputs ? data.scatter_width : 1);
   uint64_t grid_x;
@@ -416,32 +423,37 @@ inline void launch_process_input_finalizer(
     const Tensor &intermediate,
     const Tensor &group_scales,
     const Tensor &token_scales,
-    const std::optional<Tensor> &expert_layout,
+    const std::optional<Tensor> &expert_tokens,
     const std::optional<Tensor> &scatter_idx,
+    const std::optional<Tensor> &num_valid_tokens,
     const ProcessInputShape &shape) {
   const uint16_t *input_ptr = static_cast<const uint16_t *>(intermediate.data_ptr());
   void *output_scales = group_scales.data_ptr();
   float *token_scales_ptr = static_cast<float *>(token_scales.data_ptr());
-  const void *expert_layout_ptr = expert_layout.has_value() ? expert_layout->data_ptr() : nullptr;
+  const void *expert_tokens_ptr = expert_tokens.has_value() ? expert_tokens->data_ptr() : nullptr;
   const void *scatter_idx_ptr = scatter_idx.has_value() ? scatter_idx->data_ptr() : nullptr;
-  bool use_int64_expert_layout = expert_layout.has_value() && expert_layout->scalar_type() == ScalarType::Long;
-  bool use_int64_scatter_idx = scatter_idx.has_value() && scatter_idx->scalar_type() == ScalarType::Long;
+  const void *num_valid_tokens_ptr = num_valid_tokens.has_value() ? num_valid_tokens->data_ptr() : nullptr;
   uint64_t num_input_rows = static_cast<uint64_t>(shape.num_input_rows);
   uint64_t num_output_rows = static_cast<uint64_t>(shape.num_output_rows);
   uint32_t max_tokens_per_expert = static_cast<uint32_t>(shape.max_tokens_per_expert);
   uint64_t group_scale_stride = static_cast<uint64_t>(shape.group_scale_stride);
+  bool use_int64_expert_tokens = expert_tokens.has_value() && expert_tokens->scalar_type() == ScalarType::Long;
+  bool use_int64_scatter_idx = scatter_idx.has_value() && scatter_idx->scalar_type() == ScalarType::Long;
+  bool use_int64_num_valid_tokens = num_valid_tokens.has_value() && num_valid_tokens->scalar_type() == ScalarType::Long;
   void *kernel_args[] = {
       &input_ptr,
       &output_scales,
       &token_scales_ptr,
-      &expert_layout_ptr,
+      &expert_tokens_ptr,
       &scatter_idx_ptr,
+      &num_valid_tokens_ptr,
       &num_input_rows,
       &num_output_rows,
       &max_tokens_per_expert,
       &group_scale_stride,
-      &use_int64_expert_layout,
-      &use_int64_scatter_idx};
+      &use_int64_expert_tokens,
+      &use_int64_scatter_idx,
+      &use_int64_num_valid_tokens};
 
   int64_t work_rows = shape.num_work_rows * (data.separate_outputs ? data.scatter_width : 1);
   uint64_t grid_x = CEIL_DIV(work_rows, data.finalize_tokens);
@@ -478,8 +490,9 @@ inline void launch_process_input_impl(
     Tensor outputs,
     std::optional<Tensor> group_scales,
     std::optional<Tensor> token_scales,
-    std::optional<Tensor> expert_layout,
-    std::optional<Tensor> scatter_idx) {
+    std::optional<Tensor> expert_tokens,
+    std::optional<Tensor> scatter_idx,
+    std::optional<Tensor> num_valid_tokens) {
   DeviceContextGuard context_guard(inputs.get_device());
   ASSERT_CHECK(configs_tensor.scalar_type() == ScalarType::Long, "configs must be int64");
   ASSERT_CHECK(configs_tensor.is_contiguous() && configs_tensor.get_device() < 0, "configs must be CPU");
@@ -493,17 +506,21 @@ inline void launch_process_input_impl(
     ASSERT_CHECK(base.input_row_size == base.hidden_size, "inplace does not support binary activation");
     ASSERT_CHECK(base.layout == 0 || base.layout == 3, "inplace supports normal and grouped-mask layouts only");
   }
-  ProcessInputShape shape = process_input_shape(base, inputs, outputs, expert_layout, scatter_idx);
+  ProcessInputShape shape = process_input_shape(base, inputs, outputs, expert_tokens, scatter_idx, num_valid_tokens);
   int64_t config_index = process_input_config_index(configs, std::max<int64_t>(shape.num_work_rows, 1));
   ProcessInputKernelLaunchData primary_kernel = get_or_load_process_input_kernel(configs[config_index + 2], context);
   ProcessInputKernelData &primary = primary_kernel.metadata;
   ASSERT_CHECK(!primary.is_finalizer, "primary process-input kernel cannot be a finalizer");
   int64_t secondary_id = configs[config_index + 3];
 
-  if (expert_layout.has_value())
-    check_process_input_index(*expert_layout, "expert_layout", inputs.get_device());
+  if (expert_tokens.has_value())
+    check_process_input_index(*expert_tokens, "expert_tokens", inputs.get_device());
   if (scatter_idx.has_value())
     check_process_input_index(*scatter_idx, "scatter_idx", inputs.get_device());
+  if (num_valid_tokens.has_value()) {
+    check_process_input_index(*num_valid_tokens, "num_valid_tokens", inputs.get_device());
+    ASSERT_CHECK(num_valid_tokens->numel() == 1, "num_valid_tokens must contain one element");
+  }
   check_process_input_output(primary, inputs, shape, outputs);
   group_scales = prepare_process_input_group_scales(primary, inputs, shape, group_scales);
   token_scales = prepare_process_input_token_scales(primary, inputs, shape, token_scales);
@@ -518,7 +535,7 @@ inline void launch_process_input_impl(
     void *output_scales = token_scale ? public_token_scales : public_group_scales;
     launch_process_input_main(
         primary, primary_kernel.func, inputs, outputs, group_scales, token_scales,
-        expert_layout, scatter_idx, shape, output_scales);
+        expert_tokens, scatter_idx, num_valid_tokens, shape, output_scales);
   } else {
     ProcessInputKernelLaunchData secondary_kernel = get_or_load_process_input_kernel(secondary_id, context);
     ProcessInputKernelData &secondary = secondary_kernel.metadata;
@@ -527,10 +544,10 @@ inline void launch_process_input_impl(
       ASSERT_CHECK(secondary.quantization_phase == QuantizationPhase::Quantize, "invalid dynamic-token phases");
       launch_process_input_main(
           primary, primary_kernel.func, inputs, outputs, group_scales, token_scales,
-          expert_layout, scatter_idx, shape, public_token_scales);
+          expert_tokens, scatter_idx, num_valid_tokens, shape, public_token_scales);
       launch_process_input_main(
           secondary, secondary_kernel.func, inputs, outputs, group_scales, token_scales,
-          expert_layout, scatter_idx, shape, public_token_scales);
+          expert_tokens, scatter_idx, num_valid_tokens, shape, public_token_scales);
     } else {
       bool valid_finalizer = primary.quant_mode == InputQuantizationMode::DynamicGroupToken;
       valid_finalizer = valid_finalizer && primary.quantization_phase == QuantizationPhase::Fused;
@@ -541,10 +558,10 @@ inline void launch_process_input_impl(
       Tensor intermediate = torch_empty({shape.num_output_rows * groups * 2}, ScalarType::Byte, inputs.device());
       launch_process_input_main(
           primary, primary_kernel.func, inputs, outputs, group_scales, token_scales,
-          expert_layout, scatter_idx, shape, intermediate.data_ptr());
+          expert_tokens, scatter_idx, num_valid_tokens, shape, intermediate.data_ptr());
       launch_process_input_finalizer(
           secondary, secondary_kernel.func, intermediate, *group_scales, *token_scales,
-          expert_layout, scatter_idx, shape);
+          expert_tokens, scatter_idx, num_valid_tokens, shape);
     }
   }
 }
@@ -555,19 +572,21 @@ inline void launch_process_input(
     Tensor outputs,
     std::optional<Tensor> group_scales,
     std::optional<Tensor> token_scales,
-    std::optional<Tensor> expert_layout,
-    std::optional<Tensor> scatter_idx) {
+    std::optional<Tensor> expert_tokens,
+    std::optional<Tensor> scatter_idx,
+    std::optional<Tensor> num_valid_tokens) {
   if (inputs.is_cuda()) {
-    launch_process_input_impl(configs_tensor, inputs, outputs, group_scales, token_scales, expert_layout, scatter_idx);
+    launch_process_input_impl(configs_tensor, inputs, outputs, group_scales, token_scales, expert_tokens, scatter_idx, num_valid_tokens);
   }
 }
 
 inline void launch_process_input_inplace(
     Tensor configs_tensor,
     Tensor inputs,
-    std::optional<Tensor> expert_layout,
-    std::optional<Tensor> scatter_idx) {
+    std::optional<Tensor> expert_tokens,
+    std::optional<Tensor> scatter_idx,
+    std::optional<Tensor> num_valid_tokens) {
   if (inputs.is_cuda()) {
-    launch_process_input_impl(configs_tensor, inputs, inputs, std::nullopt, std::nullopt, expert_layout, scatter_idx);
+    launch_process_input_impl(configs_tensor, inputs, inputs, std::nullopt, std::nullopt, expert_tokens, scatter_idx, num_valid_tokens);
   }
 }

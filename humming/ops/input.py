@@ -23,7 +23,6 @@ def _prepare_process_input_op(
     activation_impl: str | None = None,
     hadamard_block_size: int | None = None,
     layout: str = "normal",
-    expert_layout: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
     zero_invalid: bool = False,
     use_m_major_input_scale: bool = False,
@@ -130,8 +129,9 @@ def process_input(
     activation_impl: str | None = None,
     hadamard_block_size: int | None = None,
     layout: str = "normal",
-    expert_layout: torch.Tensor | None = None,
+    expert_tokens: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
     zero_invalid: bool = False,
     use_m_major_input_scale: bool = False,
     use_pdl: bool = False,
@@ -140,6 +140,9 @@ def process_input(
 
     FP8 group scales store four consecutive groups per int32, low byte first.
     Their numerical format is selected by group_scale_dtype, not the tensor dtype.
+    Scatter targets outside [0, scatter_idx.numel()) are ignored. Targets at or
+    above num_valid_tokens are zeroed when zero_invalid is set, otherwise ignored.
+    Omitting num_valid_tokens makes all in-range targets valid.
     """
     options = dict(
         quant_mode=quant_mode,
@@ -150,7 +153,6 @@ def process_input(
         activation_impl=activation_impl,
         hadamard_block_size=hadamard_block_size,
         layout=layout,
-        expert_layout=expert_layout,
         scatter_idx=scatter_idx,
         zero_invalid=zero_invalid,
         use_m_major_input_scale=use_m_major_input_scale,
@@ -164,7 +166,9 @@ def process_input(
     configs, allocated_outputs, allocated_group_scales, allocated_token_scales = prepared_tensors
 
     if outputs is inputs:
-        torch.ops.humming.launch_process_input.inplace(configs, inputs, expert_layout, scatter_idx)
+        torch.ops.humming.launch_process_input.inplace(
+            configs, inputs, expert_tokens, scatter_idx, num_valid_tokens
+        )
         return inputs, None, None
 
     if outputs is None:
@@ -181,7 +185,8 @@ def process_input(
         outputs,
         group_scales,
         token_scales,
-        expert_layout,
+        expert_tokens,
         scatter_idx,
+        num_valid_tokens,
     )
     return outputs, group_scales, token_scales

@@ -33,14 +33,16 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
     const float *static_tensor_scales,
     void *output_scales,
     float *token_scales,
-    const void *expert_layout,
+    const void *expert_tokens,
     const void *scatter_idx,
+    const void *num_valid_tokens,
     uint64_t num_input_rows,
     uint64_t num_output_rows,
     uint32_t max_tokens_per_expert,
     uint64_t group_scale_stride,
-    bool use_int64_expert_layout,
-    bool use_int64_scatter_idx) {
+    bool use_int64_expert_tokens,
+    bool use_int64_scatter_idx,
+    bool use_int64_num_valid_tokens) {
   using Config = ProcessInputContext<BaseConfig, TuningConfig, Phase>;
   using SourceType = typename Config::SourceType;
   using TargetType = typename Config::TargetType;
@@ -81,8 +83,8 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
 
   __shared__ typename Config::SharedStorage shared;
   Config ctx(
-      shared, expert_layout, scatter_idx, num_input_rows, num_output_rows,
-      max_tokens_per_expert, use_int64_expert_layout, use_int64_scatter_idx);
+      shared, expert_tokens, scatter_idx, num_valid_tokens, num_input_rows, num_output_rows,
+      max_tokens_per_expert, use_int64_expert_tokens, use_int64_scatter_idx, use_int64_num_valid_tokens);
   float *scratch = shared.scratch;
   auto thread = ProcessInputThreadTask<Config>(ctx);
 
@@ -128,7 +130,7 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
         PRAGMA_UNROLL
         for (uint32_t route = 0; route < Config::kOutputsPerToken; route++) {
           auto write = ProcessInputThreadTask<Config>(ctx, route);
-          if (!write.skip_output) {
+          if (!write.skip_output && !write.zero_output()) {
             collected_scale = load_scale<Float32>(output_scales, write.output_row);
             break;
           }
@@ -211,14 +213,16 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
     const uint16_t *input,
     void *output_scales,
     float *token_scales,
-    const void *expert_layout,
+    const void *expert_tokens,
     const void *scatter_idx,
+    const void *num_valid_tokens,
     uint64_t num_input_rows,
     uint64_t num_output_rows,
     uint32_t max_tokens_per_expert,
     uint64_t group_scale_stride,
-    bool use_int64_expert_layout,
-    bool use_int64_scatter_idx) {
+    bool use_int64_expert_tokens,
+    bool use_int64_scatter_idx,
+    bool use_int64_num_valid_tokens) {
   using Config = ProcessInputContext<BaseConfig, TuningConfig, ProcessInputQuantizationPhase::Fused, true>;
   using OutputScaleType = typename Config::ConfiguredDynamicGroupScaleType;
   constexpr uint32_t kGroupsPerToken = Config::kHiddenSize / Config::kQuantGroupSize;
@@ -227,14 +231,14 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
   if constexpr (Config::kUsePdl) griddepcontrol_wait();
   __shared__ typename Config::SharedStorage shared;
   Config ctx(
-      shared, expert_layout, scatter_idx, num_input_rows, num_output_rows,
-      max_tokens_per_expert, use_int64_expert_layout, use_int64_scatter_idx);
+      shared, expert_tokens, scatter_idx, num_valid_tokens, num_input_rows, num_output_rows,
+      max_tokens_per_expert, use_int64_expert_tokens, use_int64_scatter_idx, use_int64_num_valid_tokens);
   uint32_t lane = threadIdx.x & 31;
   uint64_t source_row = ~uint64_t{0};
   PRAGMA_UNROLL
   for (uint32_t route = 0; route < Config::kOutputsPerToken; ++route) {
     auto task = ProcessInputThreadTask<Config>(ctx, route);
-    if (!task.skip_output && source_row == ~uint64_t{0}) source_row = task.output_row;
+    if (!task.skip_output && !task.zero_output() && source_row == ~uint64_t{0}) source_row = task.output_row;
   }
   bool active = source_row != ~uint64_t{0};
   uint32_t maximum = 0;
@@ -254,9 +258,9 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
   for (uint32_t route = 0; route < Config::kOutputsPerToken; ++route) {
     auto task = ProcessInputThreadTask<Config>(ctx, route);
     if (!task.skip_output) {
-      if (lane == 0) token_scales[task.output_row] = token_scale;
+      if (lane == 0) token_scales[task.output_row] = task.zero_output() ? 0.f : token_scale;
       for (uint32_t group = lane; group < kGroupsPerToken; group += 32) {
-        float scale = token_scale > 0.f ? decode_scale<M3BFloat16>(input[source_row * kGroupsPerToken + group]) / token_scale : 0.f;
+        float scale = !task.zero_output() && token_scale > 0.f ? decode_scale<M3BFloat16>(input[source_row * kGroupsPerToken + group]) / token_scale : 0.f;
         uint64_t index = group_scale_index<Config, OutputScaleType>(task.output_row, group, group_scale_stride);
         store_scale<OutputScaleType>(output_scales, index, encode_scale<OutputScaleType>(scale));
       }

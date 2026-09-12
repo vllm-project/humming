@@ -85,32 +85,44 @@ struct ProcessInputContext : Config, TuningConfig {
       (kQuantGroupSize & (kQuantGroupSize - 1)) == 0));
   static_assert(Config::kScatterWidth > 0);
   static_assert(kLayout == ProcessInputLayoutType::Scatter || Config::kScatterWidth == 1);
-  static_assert(!Config::kZeroInvalid || kLayout == ProcessInputLayoutType::GroupedMask);
+  static_assert(!Config::kZeroInvalid || kLayout != ProcessInputLayoutType::Normal);
 
   SharedStorage &smem;
   uint64_t input_row;
   uint32_t column;
   uint64_t output_rows[kOutputsPerToken];
+  bool zero_outputs[kOutputsPerToken];
   bool load;
   bool zero;
 
   CUDA_INLINE ProcessInputContext(
       SharedStorage &shared,
-      const void *expert_layout,
+      const void *expert_tokens,
       const void *scatter_idx,
+      const void *num_valid_tokens,
       uint64_t num_input_rows,
       uint64_t num_output_rows,
       uint32_t max_tokens_per_expert,
-      bool use_int64_expert_layout,
-      bool use_int64_scatter_idx)
+      bool use_int64_expert_tokens,
+      bool use_int64_scatter_idx,
+      bool use_int64_num_valid_tokens)
       : smem(shared), load(false), zero(false) {
     uint64_t logical_row = (static_cast<uint64_t>(blockIdx.x) / kBlocksPerRow) * kTokensPerBlock + threadIdx.x / kThreadsPerTask;
     column = kFinalizer ? 0 : (blockIdx.x % kBlocksPerRow) * kColumnsPerTask + (threadIdx.x % kThreadsPerTask) * kValuesPerThread;
     input_row = kScatterSingleOutput ? logical_row / Config::kScatterWidth : logical_row;
     PRAGMA_UNROLL
-    for (uint32_t route = 0; route < kOutputsPerToken; ++route) output_rows[route] = ~uint64_t{0};
+    for (uint32_t route = 0; route < kOutputsPerToken; ++route) {
+      output_rows[route] = ~uint64_t{0};
+      zero_outputs[route] = false;
+    }
     if (input_row >= num_input_rows) return;
     if constexpr (kLayout == ProcessInputLayoutType::Scatter) {
+      uint64_t scatter_size = num_input_rows * Config::kScatterWidth;
+      int64_t valid_rows = static_cast<int64_t>(scatter_size);
+      if (num_valid_tokens != nullptr) {
+        if (use_int64_num_valid_tokens) valid_rows = *reinterpret_cast<const int64_t *>(num_valid_tokens);
+        else valid_rows = *reinterpret_cast<const int32_t *>(num_valid_tokens);
+      }
       uint32_t first_route = kScatterSingleOutput ? logical_row % Config::kScatterWidth : 0;
       PRAGMA_UNROLL
       for (uint32_t route = 0; route < kOutputsPerToken; ++route) {
@@ -119,9 +131,14 @@ struct ProcessInputContext : Config, TuningConfig {
         if (use_int64_scatter_idx) output_row = reinterpret_cast<const int64_t *>(scatter_idx)[index];
         else output_row = reinterpret_cast<const int32_t *>(scatter_idx)[index];
         uint64_t row = static_cast<uint64_t>(output_row);
-        if (row < num_output_rows) {
+        if (row >= scatter_size) continue;
+        if (output_row < valid_rows) {
           output_rows[route] = row;
           load = true;
+        } else if constexpr (Config::kZeroInvalid) {
+          output_rows[route] = row;
+          zero_outputs[route] = true;
+          zero = true;
         }
       }
     } else if (input_row < num_output_rows) {
@@ -130,11 +147,12 @@ struct ProcessInputContext : Config, TuningConfig {
         uint32_t expert = input_row / max_tokens_per_expert;
         uint32_t local_row = input_row % max_tokens_per_expert;
         int64_t valid_rows;
-        if (use_int64_expert_layout) valid_rows = reinterpret_cast<const int64_t *>(expert_layout)[expert];
-        else valid_rows = reinterpret_cast<const int32_t *>(expert_layout)[expert];
+        if (use_int64_expert_tokens) valid_rows = reinterpret_cast<const int64_t *>(expert_tokens)[expert];
+        else valid_rows = reinterpret_cast<const int32_t *>(expert_tokens)[expert];
         load = static_cast<int64_t>(local_row) < valid_rows;
         zero = !load && Config::kZeroInvalid;
       }
+      zero_outputs[0] = zero;
       if (load || zero) output_rows[0] = input_row;
     }
   }

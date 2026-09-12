@@ -412,11 +412,11 @@ COMMON_TORCH_LIBRARY(humming, m) {
   m.def("get_kernel_smem_size(int kernel_id) -> int");
   m.def(
       "launch_process_input(Tensor configs, Tensor inputs, Tensor(a!) outputs, "
-      "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_layout, "
-      "Tensor? scatter_idx) -> ()");
+      "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_tokens, "
+      "Tensor? scatter_idx, Tensor? num_valid_tokens) -> ()");
   m.def(
       "launch_process_input.inplace(Tensor configs, Tensor(a!) inputs, "
-      "Tensor? expert_layout, Tensor? scatter_idx) -> ()");
+      "Tensor? expert_tokens, Tensor? scatter_idx, Tensor? num_valid_tokens) -> ()");
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, CUDA, m) {

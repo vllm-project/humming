@@ -13,6 +13,7 @@ struct ProcessInputThreadTask {
   bool skip_read;
   bool skip_all;
   bool skip_output;
+  bool zero;
 
   // Reading is shared across routes: an invalid route must not suppress the
   // computation needed by another valid destination.
@@ -23,9 +24,10 @@ struct ProcessInputThreadTask {
     skip_read = !active_column || !ctx.load;
     skip_all = !active_column || (!ctx.load && !ctx.zero);
     skip_output = !active_column || output_row == ~uint64_t{0};
+    zero = ctx.zero_outputs[route];
   }
 
-  CUDA_INLINE bool zero_output() const { return skip_read && !skip_output; }
+  CUDA_INLINE bool zero_output() const { return zero && !skip_output; }
 
   template <class SourceType>
   CUDA_INLINE const SourceType *input(const SourceType *base) const {

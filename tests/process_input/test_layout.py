@@ -25,15 +25,28 @@ from humming.testing.process_input import (
         ("dynamic_group_token", "float8e4m3", True),
     ],
 )
-def test_scatter_layout(quant_mode, group_scale_dtype, use_m_major_input_scale):
+@pytest.mark.parametrize("zero_invalid", [False, True])
+def test_scatter_layout(quant_mode, group_scale_dtype, use_m_major_input_scale, zero_invalid):
     quant_mode = InputQuantizationMode(quant_mode)
     quant_dtype = "int8" if quant_mode.should_quantize else None
     skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
     torch.manual_seed(0)
 
     inputs = torch.randn(4, 768, device="cuda")
-    scatter_idx = torch.tensor([[5, -1, 1], [3, 0, -1], [4, -1, 2], [-1, -1, -1]], device="cuda")
-    valid_rows = scatter_idx[scatter_idx >= 0]
+    index_dtype = torch.int32
+    if zero_invalid:
+        index_dtype = torch.int64
+    scatter_idx = torch.tensor(
+        [[5, -1, 1], [3, 0, 12], [4, 20, 2], [-1, -1, -1]],
+        device="cuda",
+        dtype=index_dtype,
+    )
+    num_valid_tokens = torch.tensor([4], device="cuda", dtype=index_dtype)
+    in_range = (scatter_idx >= 0) & (scatter_idx < scatter_idx.numel())
+    valid_rows = scatter_idx[in_range].long()
+    if not zero_invalid:
+        valid_rows = valid_rows[valid_rows < num_valid_tokens]
+
     static_tensor_scale = None
 
     if quant_mode.has_tensor_scale:
@@ -46,6 +59,8 @@ def test_scatter_layout(quant_mode, group_scale_dtype, use_m_major_input_scale):
         group_scale_dtype=group_scale_dtype,
         layout="scatter",
         scatter_idx=scatter_idx,
+        num_valid_tokens=num_valid_tokens,
+        zero_invalid=zero_invalid,
         use_m_major_input_scale=use_m_major_input_scale,
     )
 
@@ -63,6 +78,11 @@ def test_scatter_layout(quant_mode, group_scale_dtype, use_m_major_input_scale):
         valid_rows=valid_rows,
     )
 
+    if zero_invalid:
+        zero_rows = scatter_idx[in_range & (scatter_idx >= num_valid_tokens)].long()
+        output_bytes = actual[0].view(torch.uint8)
+        assert torch.count_nonzero(output_bytes[zero_rows]) == 0
+
 
 @pytest.mark.parametrize("zero_invalid", [False, True])
 @pytest.mark.parametrize("quant_mode", ["none", "dynamic_group", "dynamic_token", "dynamic_group_token"])
@@ -75,10 +95,10 @@ def test_grouped_mask_layout(quant_mode, zero_invalid, activation_type):
     torch.manual_seed(0)
 
     inputs = torch.randn(14, 256, device="cuda")
-    expert_layout = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
-    rows_per_expert = inputs.size(0) // expert_layout.numel()
+    expert_tokens = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
+    rows_per_expert = inputs.size(0) // expert_tokens.numel()
     local_rows = torch.arange(rows_per_expert, device="cuda")
-    valid_rows = (local_rows[None, :] < expert_layout[:, None]).flatten()
+    valid_rows = (local_rows[None, :] < expert_tokens[:, None]).flatten()
 
     activation_impl = ACTIVATION_TYPE_IMPL_TEST_MAP[ActivationType(activation_type)]["impl"]
     options = dict(
@@ -88,7 +108,7 @@ def test_grouped_mask_layout(quant_mode, zero_invalid, activation_type):
         group_scale_dtype=group_scale_dtype,
         activation_type=activation_type,
         layout="grouped_mask",
-        expert_layout=expert_layout,
+        expert_tokens=expert_tokens,
         zero_invalid=zero_invalid,
     )
 

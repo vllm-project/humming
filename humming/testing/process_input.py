@@ -249,8 +249,9 @@ def quant_input_ref(
 def apply_layout_ref(
     inputs: torch.Tensor,
     layout: ProcessInputLayoutType = ProcessInputLayoutType.Normal,
-    expert_layout: torch.Tensor | None = None,
+    expert_tokens: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
     zero_invalid: bool = False,
 ):
     layout = ProcessInputLayoutType(layout)
@@ -265,14 +266,20 @@ def apply_layout_ref(
     destination = outputs.view(torch.uint8).reshape(output_rows, -1)
     input_rows = torch.arange(rows, device=inputs.device)
     if layout == ProcessInputLayoutType.Scatter:
-        valid = (scatter_idx >= 0) & (scatter_idx < outputs.size(0))
+        in_range = (scatter_idx >= 0) & (scatter_idx < scatter_idx.numel())
+        valid = in_range
+        if num_valid_tokens is not None:
+            valid = in_range & (scatter_idx < num_valid_tokens.reshape(()))
+            if zero_invalid:
+                zero_rows = scatter_idx[in_range & ~valid].long()
+                destination[zero_rows] = 0
         source_rows = input_rows[:, None].expand_as(scatter_idx)[valid]
         output_rows = scatter_idx[valid].long()
     else:
-        assert rows % expert_layout.numel() == 0
-        rows_per_expert = rows // expert_layout.numel()
+        assert rows % expert_tokens.numel() == 0
+        rows_per_expert = rows // expert_tokens.numel()
         local_rows = torch.arange(rows_per_expert, device=inputs.device)
-        valid = (local_rows[None, :] < expert_layout[:, None]).flatten()
+        valid = (local_rows[None, :] < expert_tokens[:, None]).flatten()
         source_rows = output_rows = input_rows[valid]
         if zero_invalid:
             destination[~valid] = 0
@@ -290,8 +297,9 @@ def process_input_ref(
     activation_type: str = "none",
     hadamard_block_size: int | None = None,
     layout: str = "normal",
-    expert_layout: torch.Tensor | None = None,
+    expert_tokens: torch.Tensor | None = None,
     scatter_idx: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
     zero_invalid: bool = False,
     use_m_major_input_scale: bool = False,
 ):
@@ -315,8 +323,9 @@ def process_input_ref(
 
     layout_args = dict(
         layout=layout,
-        expert_layout=expert_layout,
+        expert_tokens=expert_tokens,
         scatter_idx=scatter_idx,
+        num_valid_tokens=num_valid_tokens,
         zero_invalid=zero_invalid,
     )
     outputs = apply_layout_ref(inputs, **layout_args)
