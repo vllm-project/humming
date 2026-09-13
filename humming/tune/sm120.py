@@ -204,6 +204,16 @@ class Sm120Heuristics(Sm89Heuristics):
                 config["warp_shape"] = (warp_m, warp_n, max(warp_k, block_k // target_k_warps))
 
             cls._rebalance_dense_warps(layer_config, config, shape_m)
+            if is_mxmma:
+                config["num_stages"] = min(
+                    config["num_stages"],
+                    cls._fit_num_stages(
+                        layer_config,
+                        config,
+                        gemm_type,
+                        reduce_overlap=config.get("reduce_overlap_last_stage_only", False),
+                    ),
+                )
 
         return config
 
@@ -337,8 +347,8 @@ class Sm120Heuristics(Sm89Heuristics):
 
     @classmethod
     def _fit_num_stages(cls, layer_config, config, gemm_type, reduce_overlap: bool) -> int:
-        best = 2
-        for num_stages in range(3, 6 if cls.sm_version == 121 else 5):
+        best = None
+        for num_stages in range(2, 6 if cls.sm_version == 121 else 5):
             smem = estimate_smem_size_layer(
                 layer_config,
                 config["block_shape"],
@@ -352,4 +362,6 @@ class Sm120Heuristics(Sm89Heuristics):
             )
             if smem <= cls.max_smem_size:
                 best = num_stages
+        if best is None:
+            raise ValueError(f"No pipeline stage count fits shared memory on SM{cls.sm_version}: {config}")
         return best
