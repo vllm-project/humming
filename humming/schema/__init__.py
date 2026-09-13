@@ -9,7 +9,7 @@ from humming.schema.compressed_tensors import (
 from humming.schema.fp8 import Fp8InputSchema, Fp8WeightSchema
 from humming.schema.gpt_oss_mxfp4 import GptOssMxfp4WeightSchema
 from humming.schema.gptq import GPTQWeightSchema
-from humming.schema.humming import HummingInputSchema, HummingWeightSchema
+from humming.schema.humming import HummingInputSchema, HummingWeightSchema, is_humming_schema_compatible
 from humming.schema.modelopt import ModeloptInputSchema, ModeloptWeightSchema
 from humming.schema.mxfp4 import Mxfp4WeightSchema
 
@@ -43,4 +43,5 @@ __all__ = [
     "BaseWeightSchema",
     "HummingInputSchema",
     "HummingWeightSchema",
+    "is_humming_schema_compatible",
 ]

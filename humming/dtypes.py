@@ -10,6 +10,8 @@ class DataType:
     is_signed: bool = True
     is_integer_type: bool = False
     is_floating_point_type: bool = False
+    exponent_bits: int = 0
+    mantissa_bits: int = 0
 
     def __post_init__(self):
         assert self.__class__ is not DataType
