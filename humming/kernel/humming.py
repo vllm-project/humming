@@ -458,8 +458,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.is_tensor_input_scale:
             self.use_tma_as = False
             self.use_m_major_input_scale = False
-        elif self.has_input_scale and self.input_scale_group_size == 0 and self.mma_type != MmaType.MXMMA:
-            self.use_m_major_input_scale = True
+
         if self.mma_type == MmaType.MXMMA and self.input_scale_group_size == 0:
             self.use_tma_as = False
             self.use_m_major_input_scale = False
