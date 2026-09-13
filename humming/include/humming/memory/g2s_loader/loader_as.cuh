@@ -280,7 +280,7 @@ public:
         gmem_ptr = gmem_ptr_raw + ((row_offset * kProblemNumGroups) + col_offset);
       }
     } else {
-      gmem_ptr = gmem_ptr_raw + col_offset;
+      gmem_ptr = gmem_ptr_raw + (kUseMxScale ? col_offset / 4 : col_offset);
 
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kRowLoadIters; i++) {
