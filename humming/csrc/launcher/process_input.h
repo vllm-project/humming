@@ -240,7 +240,7 @@ inline ProcessInputShape process_input_shape(
   ProcessInputShape shape{num_input_rows, num_input_rows, num_input_rows, 1, 1, num_input_rows};
 
   if (data.layout == 0) {
-    ASSERT_CHECK(!expert_tokens.has_value() && !scatter_idx.has_value() && !num_valid_tokens.has_value(), "normal layout has no metadata");
+    ASSERT_CHECK(!expert_tokens.has_value() && !scatter_idx.has_value(), "normal layout does not use expert_tokens or scatter_idx");
   } else if (data.layout == 3) {
     ASSERT_CHECK(expert_tokens.has_value() && expert_tokens->dim() == 1, "grouped-mask requires 1D expert_tokens");
     ASSERT_CHECK(!scatter_idx.has_value() && !num_valid_tokens.has_value(), "grouped-mask layout does not use scatter metadata");

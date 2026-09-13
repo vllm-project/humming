@@ -87,7 +87,8 @@ def test_scatter_layout(quant_mode, group_scale_dtype, use_m_major_input_scale, 
 @pytest.mark.parametrize("zero_invalid", [False, True])
 @pytest.mark.parametrize("quant_mode", ["none", "dynamic_group", "dynamic_token", "dynamic_group_token"])
 @pytest.mark.parametrize("activation_type", ["none", "unary", "binary_split", "binary_interleaved"])
-def test_grouped_mask_layout(quant_mode, zero_invalid, activation_type):
+@pytest.mark.parametrize("layout", ["normal", "grouped_mask"])
+def test_masked_layout(quant_mode, zero_invalid, activation_type, layout):
     quant_mode = InputQuantizationMode(quant_mode)
     quant_dtype = "int8" if quant_mode.should_quantize else None
     group_scale_dtype = "float8e4m3" if quant_mode == InputQuantizationMode.DynamicGroupToken else "float32"
@@ -96,9 +97,15 @@ def test_grouped_mask_layout(quant_mode, zero_invalid, activation_type):
 
     inputs = torch.randn(14, 256, device="cuda")
     expert_tokens = torch.tensor([3, 1], device="cuda", dtype=torch.int64)
-    rows_per_expert = inputs.size(0) // expert_tokens.numel()
-    local_rows = torch.arange(rows_per_expert, device="cuda")
-    valid_rows = (local_rows[None, :] < expert_tokens[:, None]).flatten()
+    num_valid_tokens = None
+    if layout == "normal":
+        expert_tokens = None
+        num_valid_tokens = torch.tensor([3], device="cuda", dtype=torch.int32)
+        valid_rows = torch.arange(inputs.size(0), device="cuda") < num_valid_tokens
+    else:
+        rows_per_expert = inputs.size(0) // expert_tokens.numel()
+        local_rows = torch.arange(rows_per_expert, device="cuda")
+        valid_rows = (local_rows[None, :] < expert_tokens[:, None]).flatten()
 
     activation_impl = ACTIVATION_TYPE_IMPL_TEST_MAP[ActivationType(activation_type)]["impl"]
     options = dict(
@@ -107,8 +114,9 @@ def test_grouped_mask_layout(quant_mode, zero_invalid, activation_type):
         quant_group_size=128,
         group_scale_dtype=group_scale_dtype,
         activation_type=activation_type,
-        layout="grouped_mask",
+        layout=layout,
         expert_tokens=expert_tokens,
+        num_valid_tokens=num_valid_tokens,
         zero_invalid=zero_invalid,
     )
 

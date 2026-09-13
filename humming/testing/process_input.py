@@ -256,7 +256,7 @@ def apply_layout_ref(
 ):
     layout = ProcessInputLayoutType(layout)
     rows = inputs.size(0)
-    if layout == ProcessInputLayoutType.Normal:
+    if layout == ProcessInputLayoutType.Normal and num_valid_tokens is None:
         return inputs
 
     output_rows = rows * scatter_idx.size(1) if layout == ProcessInputLayoutType.Scatter else rows
@@ -276,10 +276,13 @@ def apply_layout_ref(
         source_rows = input_rows[:, None].expand_as(scatter_idx)[valid]
         output_rows = scatter_idx[valid].long()
     else:
-        assert rows % expert_tokens.numel() == 0
-        rows_per_expert = rows // expert_tokens.numel()
-        local_rows = torch.arange(rows_per_expert, device=inputs.device)
-        valid = (local_rows[None, :] < expert_tokens[:, None]).flatten()
+        if layout == ProcessInputLayoutType.Normal:
+            valid = input_rows < num_valid_tokens.reshape(())
+        else:
+            assert rows % expert_tokens.numel() == 0
+            rows_per_expert = rows // expert_tokens.numel()
+            local_rows = torch.arange(rows_per_expert, device=inputs.device)
+            valid = (local_rows[None, :] < expert_tokens[:, None]).flatten()
         source_rows = output_rows = input_rows[valid]
         if zero_invalid:
             destination[~valid] = 0

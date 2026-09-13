@@ -142,6 +142,7 @@ def process_input(
     Their numerical format is selected by group_scale_dtype, not the tensor dtype.
     Scatter targets outside [0, scatter_idx.numel()) are ignored. Targets at or
     above num_valid_tokens are zeroed when zero_invalid is set, otherwise ignored.
+    Normal layout applies the same valid-token bound to input row indices.
     Omitting num_valid_tokens makes all in-range targets valid.
     """
     options = dict(

@@ -85,7 +85,6 @@ struct ProcessInputContext : Config, TuningConfig {
       (kQuantGroupSize & (kQuantGroupSize - 1)) == 0));
   static_assert(Config::kScatterWidth > 0);
   static_assert(kLayout == ProcessInputLayoutType::Scatter || Config::kScatterWidth == 1);
-  static_assert(!Config::kZeroInvalid || kLayout != ProcessInputLayoutType::Normal);
 
   SharedStorage &smem;
   uint64_t input_row;
@@ -116,13 +115,13 @@ struct ProcessInputContext : Config, TuningConfig {
       zero_outputs[route] = false;
     }
     if (input_row >= num_input_rows) return;
+    int64_t valid_tokens = static_cast<int64_t>(num_input_rows * Config::kScatterWidth);
+    if (num_valid_tokens != nullptr) {
+      if (use_int64_num_valid_tokens) valid_tokens = *reinterpret_cast<const int64_t *>(num_valid_tokens);
+      else valid_tokens = *reinterpret_cast<const int32_t *>(num_valid_tokens);
+    }
     if constexpr (kLayout == ProcessInputLayoutType::Scatter) {
       uint64_t scatter_size = num_input_rows * Config::kScatterWidth;
-      int64_t valid_rows = static_cast<int64_t>(scatter_size);
-      if (num_valid_tokens != nullptr) {
-        if (use_int64_num_valid_tokens) valid_rows = *reinterpret_cast<const int64_t *>(num_valid_tokens);
-        else valid_rows = *reinterpret_cast<const int32_t *>(num_valid_tokens);
-      }
       uint32_t first_route = kScatterSingleOutput ? logical_row % Config::kScatterWidth : 0;
       PRAGMA_UNROLL
       for (uint32_t route = 0; route < kOutputsPerToken; ++route) {
@@ -132,7 +131,7 @@ struct ProcessInputContext : Config, TuningConfig {
         else output_row = reinterpret_cast<const int32_t *>(scatter_idx)[index];
         uint64_t row = static_cast<uint64_t>(output_row);
         if (row >= scatter_size) continue;
-        if (output_row < valid_rows) {
+        if (output_row < valid_tokens) {
           output_rows[route] = row;
           load = true;
         } else if constexpr (Config::kZeroInvalid) {
@@ -142,7 +141,7 @@ struct ProcessInputContext : Config, TuningConfig {
         }
       }
     } else if (input_row < num_output_rows) {
-      load = true;
+      load = static_cast<int64_t>(input_row) < valid_tokens;
       if constexpr (kLayout == ProcessInputLayoutType::GroupedMask) {
         uint32_t expert = input_row / max_tokens_per_expert;
         uint32_t local_row = input_row % max_tokens_per_expert;
@@ -150,8 +149,8 @@ struct ProcessInputContext : Config, TuningConfig {
         if (use_int64_expert_tokens) valid_rows = reinterpret_cast<const int64_t *>(expert_tokens)[expert];
         else valid_rows = reinterpret_cast<const int32_t *>(expert_tokens)[expert];
         load = static_cast<int64_t>(local_row) < valid_rows;
-        zero = !load && Config::kZeroInvalid;
       }
+      zero = !load && Config::kZeroInvalid;
       zero_outputs[0] = zero;
       if (load || zero) output_rows[0] = input_row;
     }
