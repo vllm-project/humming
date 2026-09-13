@@ -340,38 +340,30 @@ class HummingWeightSchema(BaseWeightSchema):
 @dataclasses.dataclass(kw_only=True)
 class HummingInputSchema(BaseInputSchema):
     quant_method: str = "humming"
-    input_dtype: dtypes.DataType | None = None
+    a_dtype: dtypes.DataType | None = None
     input_scale_group_size: int = 0
     input_scale_dtype: dtypes.DataType | None = None
     input_quant_mode: InputQuantizationMode | str | None = None
 
     KWARGS_ALIAS: ClassVar[dict[str, list[str]]] = {
-        "input_dtype": ["a_dtype", "dtype"],
+        "a_dtype": ["input_dtype", "dtype"],
         "input_scale_group_size": ["group_size"],
         "input_scale_dtype": ["scale_dtype"],
         "input_quant_mode": ["quant_mode", "quantization_mode"],
     }
 
     def __post_init__(self):
-        if isinstance(self.input_dtype, str):
-            self.input_dtype = dtypes.DataType.from_str(str(self.input_dtype))
+        if isinstance(self.a_dtype, str):
+            self.a_dtype = dtypes.DataType.from_str(str(self.a_dtype))
         if isinstance(self.input_scale_dtype, str):
             self.input_scale_dtype = dtypes.DataType.from_str(str(self.input_scale_dtype))
         if isinstance(self.input_quant_mode, str):
             self.input_quant_mode = InputQuantizationMode(self.input_quant_mode)
 
-    @property
-    def a_dtype(self) -> dtypes.DataType | None:
-        return self.input_dtype
-
-    @a_dtype.setter
-    def a_dtype(self, value: dtypes.DataType | None):
-        self.input_dtype = value
-
     def get_activation_bits(self):
-        if self.input_dtype is None:
+        if self.a_dtype is None:
             return 16
-        return self.input_dtype.num_bits
+        return self.a_dtype.num_bits
 
     @property
     def static_tensor_scale_name(self) -> str | None:
@@ -438,7 +430,7 @@ def is_humming_schema_compatible(
     if param_dtype not in (torch.float16, torch.bfloat16):
         return False
 
-    a_dtype = input_schema.input_dtype or dtypes.DataType.from_torch_dtype(param_dtype)
+    a_dtype = input_schema.a_dtype or dtypes.DataType.from_torch_dtype(param_dtype)
     b_dtype = weight_schema.b_dtype
     bs_dtype = weight_schema.bs_dtype or dtypes.DataType.from_torch_dtype(param_dtype)
     has_zero_point = weight_schema.has_zero_point
