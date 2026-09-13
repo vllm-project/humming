@@ -372,7 +372,7 @@ class CompressedTensorsInputSchema(BaseInputSchema):
             quant_mode = InputQuantizationMode.DynamicToken
 
         return HummingInputSchema(
-            input_dtype=a_dtype,
+            a_dtype=a_dtype,
             input_scale_group_size=self.group_size,
             input_quant_mode=quant_mode,
         )

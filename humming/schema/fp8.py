@@ -153,7 +153,7 @@ class Fp8InputSchema(BaseInputSchema):
             else InputQuantizationMode.DynamicToken
         )
         return HummingInputSchema(
-            input_dtype=dtypes.float8e4m3,
+            a_dtype=dtypes.float8e4m3,
             input_scale_group_size=0,
             input_quant_mode=quant_mode,
         )
