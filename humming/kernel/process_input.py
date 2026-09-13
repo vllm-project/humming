@@ -80,6 +80,7 @@ extern "C" __constant__ uint32_t QUANTIZATION_PHASE = static_cast<uint32_t>(Cont
 @dataclasses.dataclass(kw_only=True)
 class ProcessInputKernel(KernelRuntime, ProcessInputProblemConfig, ProcessInputTuningConfig):
     name: ClassVar[str] = "process_input_kernel"
+    disable_fast_math: ClassVar[bool] = True
     _str2kernel_cache: ClassVar[dict[tuple[object, ...], torch.Tensor]] = {}
     quantization_phase: QuantizationPhase = QuantizationPhase.Fused
 
