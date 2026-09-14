@@ -16,6 +16,7 @@ from humming.testing.process_input import (
     [
         (3, 768, 128, "static_tensor", "float32", False),
         (129, 32768, 512, "dynamic_token", "float32", False),
+        (129, 32768, 512, "dynamic_token", "float32", True),
         (3, 768, 128, "dynamic_token", "float32", True),
         (4, 7168, 128, "dynamic_group", "float32", False),
         (3, 768, 128, "dynamic_group", "float32", True),

@@ -336,6 +336,7 @@ public:
   void update_tensor_map_c() {
     if constexpr (kIsGroupedGemm && Ctx::kUseTmaC) {
       if (threadIdx.x < 32) {
+        tma_wait_store_group<0>();
         __syncwarp();
         if (threadIdx.x == 0) {
           tensor_map_replace_global_dim<1>(ctx.smem.tensor_map_buffer, current_shape_m);
