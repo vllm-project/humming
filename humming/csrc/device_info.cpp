@@ -5,7 +5,6 @@
 #include <cuda.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -155,7 +154,9 @@ int64_t get_l1_cache_size(int64_t sm_major, int64_t sm_minor) {
   }
 }
 
-int64_t get_fp16_tensorcore_ops_per_clock(int64_t sm_version) {
+int64_t get_fp16_tensorcore_ops_per_clock(int64_t sm_version, bool is_ppu) {
+  // PPU provides 4096 FP16 operations per SM per clock.
+  if (is_ppu) return 4096;
   int64_t sm_major = sm_version / 10;
   if (sm_major == 10 || sm_major == 11) return 8192;
 
@@ -197,6 +198,7 @@ PyObject *make_tensorcore_tops(const DeviceData &info) {
   int64_t sm_version = info.sm_major * 10 + info.sm_minor;
   bool half_rate_sm = sm_version == 75 || sm_version == 86 || sm_version == 89;
   for (const TensorCoreType &type : types) {
+    if (info.is_ppu && std::strcmp(type.name, "int4") == 0) continue;
     double tops = sm_version >= type.min_sm_version ? info.base_tensorcore_tops * type.multiplier : 0;
     bool float_type = type.name[0] == 'f' || type.name[0] == 'b';
     if (half_rate_sm && float_type) tops /= 2;
@@ -214,7 +216,6 @@ PyObject *make_tensorcore_tops(const DeviceData &info) {
 
 bool query_device_data(int64_t device_index, DeviceData *info) {
   info->index = device_index;
-  info->is_ppu = std::getenv("PPU_SDK") != nullptr;
 
   CUdevice device;
   bool success =
@@ -233,6 +234,7 @@ bool query_device_data(int64_t device_index, DeviceData *info) {
       get_attribute(device, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, &info->memory_bus_width) &&
       get_attribute(device, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, &info->sm_clock_khz);
   if (!success) return false;
+  info->is_ppu = std::strncmp(info->name, "PPU", 3) == 0 || std::strncmp(info->name, "ZW", 2) == 0;
   if (std::strstr(info->name, "ZW810E") != nullptr) info->sm_count = 20;
 
   int64_t sm_version = info->sm_major * 10 + info->sm_minor;
@@ -241,7 +243,8 @@ bool query_device_data(int64_t device_index, DeviceData *info) {
   // memory clock and require the usual DDR factor of two.
   int64_t memory_clock_multiplier = sm_version == 121 ? 1 : 2;
   info->memory_bandwidth_gbps = info->memory_clock_khz * memory_clock_multiplier * info->memory_bus_width / 8.0 / 1e6;
-  info->base_tensorcore_tops = info->sm_count * get_fp16_tensorcore_ops_per_clock(sm_version) * info->sm_clock_khz / 1e9;
+  info->base_tensorcore_tops =
+      info->sm_count * get_fp16_tensorcore_ops_per_clock(sm_version, info->is_ppu) * info->sm_clock_khz / 1e9;
   return true;
 }
 

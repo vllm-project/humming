@@ -274,6 +274,9 @@ class NVCCCompiler(Compiler):
 
         if current_device.is_ppu:
             flags.append("-DUSE_PPU=1")
+            # The PPU mbarrier yield analysis can loop indefinitely on dynamic
+            # barrier addresses in synchronous-load pipelines.
+            flags.extend(["-mllvm", "-ppu-mbar-yield-analysis=false"])
 
         return flags
 

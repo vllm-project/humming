@@ -36,6 +36,7 @@ class TopsBenchKernel(KernelRuntime):
     sf_dtype: str | dtypes.DataType | None = None
 
     def init_kernel(self):
+        torch.cuda.init()
         if isinstance(self.mma_type, str):
             self.mma_type = MmaType(self.mma_type)
         if isinstance(self.ab_dtype, str):
@@ -75,7 +76,6 @@ class TopsBenchKernel(KernelRuntime):
         self.ops_per_call = self.ops_per_mma_per_warp * self.num_warps * self.num_ctas
 
     def __call__(self):
-        func = self.load_cubin()
         device = torch.cuda.current_device()
         config = cbd.CUlaunchConfig()
         config.gridDimX = self.num_ctas
@@ -86,6 +86,7 @@ class TopsBenchKernel(KernelRuntime):
         config.blockDimZ = 1
         config.hStream = torch.cuda.current_stream(device).cuda_stream
 
+        func = self.load_cubin()
         tensor = torch.empty((1,), dtype=torch.uint32, device=device)
         arg_values = (tensor.data_ptr(),)
 
