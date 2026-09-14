@@ -5,11 +5,14 @@
 #include <cuda.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 struct DeviceData {
   int64_t index;
   char name[256];
+  bool is_ppu;
   int64_t sm_count;
   int64_t max_threads_per_block;
   int64_t max_threads_per_sm;
@@ -30,6 +33,7 @@ struct DeviceData {
 enum DeviceAttribute : uint32_t {
   INDEX,
   NAME,
+  IS_PPU,
   SM_COUNT,
   MAX_THREADS_PER_BLOCK,
   MAX_THREADS_PER_SM,
@@ -210,6 +214,7 @@ PyObject *make_tensorcore_tops(const DeviceData &info) {
 
 bool query_device_data(int64_t device_index, DeviceData *info) {
   info->index = device_index;
+  info->is_ppu = std::getenv("PPU_SDK") != nullptr;
 
   CUdevice device;
   bool success =
@@ -228,6 +233,7 @@ bool query_device_data(int64_t device_index, DeviceData *info) {
       get_attribute(device, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, &info->memory_bus_width) &&
       get_attribute(device, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, &info->sm_clock_khz);
   if (!success) return false;
+  if (std::strstr(info->name, "ZW810E") != nullptr) info->sm_count = 20;
 
   int64_t sm_version = info->sm_major * 10 + info->sm_minor;
   info->l1_cache_size = get_l1_cache_size(info->sm_major, info->sm_minor);
@@ -243,6 +249,7 @@ PyObject *make_attribute_value(const DeviceData &info, DeviceAttribute attribute
   switch (attribute) {
     case INDEX: return PyLong_FromLongLong(info.index);
     case NAME: return PyUnicode_FromString(info.name);
+    case IS_PPU: return PyBool_FromLong(info.is_ppu);
     case SM_COUNT: return PyLong_FromLongLong(info.sm_count);
     case MAX_THREADS_PER_BLOCK: return PyLong_FromLongLong(info.max_threads_per_block);
     case MAX_THREADS_PER_SM: return PyLong_FromLongLong(info.max_threads_per_sm);
@@ -380,7 +387,7 @@ PyObject *format_device_info(PyDeviceInfo *self) {
     }
   }
   PyObject *result = PyUnicode_FromFormat(
-      "DeviceInfo(index=%R, name=%R, sm_count=%R, max_threads_per_block=%R, "
+      "DeviceInfo(index=%R, name=%R, is_ppu=%R, sm_count=%R, max_threads_per_block=%R, "
       "max_threads_per_sm=%R, max_registers_per_sm=%R, "
       "sm_major=%R, sm_minor=%R, sm_version=%R, "
       "l2_cache_size=%R, l2_cache_size_mb=%R, l1_cache_size=%R, l1_cache_size_kb=%R, "
@@ -389,6 +396,7 @@ PyObject *format_device_info(PyDeviceInfo *self) {
       "sm_clock_khz=%R, memory_bandwidth_gbps=%R, tensorcore_tops=%R)",
       values[INDEX],
       values[NAME],
+      values[IS_PPU],
       values[SM_COUNT],
       values[MAX_THREADS_PER_BLOCK],
       values[MAX_THREADS_PER_SM],
@@ -431,6 +439,7 @@ PyObject *DeviceInfo_print(PyObject *object, PyObject *) {
 PyGetSetDef DeviceInfo_properties[] = {
     DEVICE_PROPERTY("index", INDEX),
     DEVICE_PROPERTY("name", NAME),
+    DEVICE_PROPERTY("is_ppu", IS_PPU),
     DEVICE_PROPERTY("sm_count", SM_COUNT),
     DEVICE_PROPERTY("max_threads_per_block", MAX_THREADS_PER_BLOCK),
     DEVICE_PROPERTY("max_threads_per_sm", MAX_THREADS_PER_SM),

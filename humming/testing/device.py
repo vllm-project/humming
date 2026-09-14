@@ -45,6 +45,9 @@ def skip_if_unsupported(
         if sm < min_sm:
             pytest.skip(f"a_dtype {a_dtype} requires SM>={min_sm}, current SM is {sm}")
 
+    if current_device.is_ppu and a_dtype == dtypes.int4:
+        pytest.skip("PPU does not support int4 mma")
+
     if use_cp_async and sm < 80:
         pytest.skip(f"cp.async requires SM>=80, current SM is {sm}")
 

@@ -55,9 +55,22 @@ public:
 
   template <bool kShouldAdvance = true>
   CUDA_INLINE void load(int4 *smem_ptr, void *mbar_ptr, uint32_t stage_id = 0) {
-    if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
+    if constexpr (USE_PPU && !kIsIndexedGemm && kUseCpAsync && !kUseTma) load_aiu(smem_ptr);
+    else if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
     else load_legacy(smem_ptr, stage_id);
     if constexpr (kShouldAdvance) advance();
+  }
+
+  CUDA_INLINE
+  void load_aiu(int4 *smem_ptr) {
+    const uint32_t warp_id = ctx.load_thread_id() / 32;
+    if (warp_id < CEIL_DIV(BlockShape::K, 1024 / ElementA::kBits)) {
+      aiu_load_gmem<ElementA::kBits>(
+          gmem_ptr_raw, smem_ptr + BlockShape::M * 1024 / 128 * warp_id,
+          shape_m, ProblemShape::K - PadShape::K,
+          row_offset, col_offset + warp_id * 1024 / ElementA::kBits,
+          BlockShape::M, MIN(1024 / ElementA::kBits, BlockShape::K));
+    }
   }
 
   CUDA_INLINE

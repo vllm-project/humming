@@ -66,6 +66,8 @@ class KernelRuntime:
             return NVCCCompiler
         elif compiler == "nvrtc":
             return NVRTCCompiler
+        elif current_device.is_ppu:
+            return NVCCCompiler
         else:
             try:
                 from cuda.bindings import nvrtc  # noqa

@@ -186,6 +186,10 @@ class NVRTCCompiler(Compiler):
             flags.append(f"-I{d}")
         if disable_fast_math:
             flags.remove("--use_fast_math")
+
+        if current_device.is_ppu:
+            flags.append("-DUSE_PPU=1")
+
         return flags
 
     @classmethod
@@ -267,6 +271,10 @@ class NVCCCompiler(Compiler):
         ]
         if disable_fast_math:
             flags.remove("--use_fast_math")
+
+        if current_device.is_ppu:
+            flags.append("-DUSE_PPU=1")
+
         return flags
 
     @classmethod

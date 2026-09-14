@@ -14,6 +14,7 @@ private:
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
   static constexpr bool kUseTma = Ctx::kUseTmaB;
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
+  static constexpr bool kUseAiu = USE_PPU && kUseCpAsync && !kUseTma;
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
   static constexpr uint32_t kLoadThreadOffset = Ctx::kNumThreads - kNumLoadThreads;
   static constexpr uint32_t kMultiCastSizeB = Ctx::kMultiCastSizeB;
@@ -46,9 +47,22 @@ public:
 
   template <bool kShouldAdvance = true>
   CUDA_INLINE void load(int4 *smem_ptr, void *mbar_ptr) {
-    if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
+    if constexpr (kUseAiu) load_aiu(smem_ptr);
+    else if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
     else load_legacy(smem_ptr);
     if constexpr (kShouldAdvance) advance();
+  }
+
+  CUDA_INLINE
+  void load_aiu(int4 *smem_ptr) {
+    uint32_t warp_id = ctx.load_thread_id() / 32;
+    if (warp_id == 0) {
+      aiu_load_gmem_linear_3d(
+          gmem_ptr, smem_ptr,
+          ProblemShape::K / kPackSizeK, ProblemShape::N / 32, kPackSizeK * ElementB::kBits,
+          row_offset, col_offset, 0,
+          BlockShape::K / kPackSizeK, BlockShape::N / 32, kPackSizeK * ElementB::kBits);
+    }
   }
 
   CUDA_INLINE
@@ -81,16 +95,17 @@ public:
   CUDA_INLINE
   void advance() {
     row_offset += BlockShape::K / kPackSizeK;
-    gmem_ptr += kGmemStride * BlockShape::K / kPackSizeK;
+    if constexpr (!kUseAiu) gmem_ptr += kGmemStride * BlockShape::K / kPackSizeK;
   }
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
-    row_offset = expert_id * (ProblemShape::K / kPackSizeK) + k_block_id * (BlockShape::K / kPackSizeK);
-    col_offset = n_block_id * (BlockShape::N * ElementB::kBits / 32);
+    row_offset = k_block_id * (BlockShape::K / kPackSizeK);
+    if constexpr (kUseTma) row_offset += expert_id * (ProblemShape::K / kPackSizeK);
+    col_offset = n_block_id * (kUseAiu ? BlockShape::N / 32 : BlockShape::N * ElementB::kBits / 32);
 
     uint64_t gmem_offset = expert_id * kGmemExpertStride;
-    gmem_offset += n_block_id * kSmemStride + k_block_id * (kGmemStride * BlockShape::K / kPackSizeK);
+    if constexpr (!kUseAiu) gmem_offset += n_block_id * kSmemStride + k_block_id * (kGmemStride * BlockShape::K / kPackSizeK);
     gmem_ptr = gmem_ptr_raw + gmem_offset;
   }
 };

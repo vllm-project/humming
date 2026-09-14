@@ -6,6 +6,7 @@ from humming.config import GemmType, LayerConfig
 from humming.device import DeviceInfo, get_device_index
 from humming.tune.base import DeviceHeuristics
 from humming.tune.raster import raster_group_m_for_config
+from humming.tune.ppu_sm80 import PPUSm80Heuristics
 from humming.tune.sm8x import (
     Sm80Heuristics,
     Sm86Heuristics,
@@ -34,9 +35,14 @@ heuristics_map: dict[int, type[DeviceHeuristics]] = {
 }
 
 
+ppu_heuristics_map: dict[int, type[DeviceHeuristics]] = {80: PPUSm80Heuristics}
+
+
 def get_heuristics_class(device: int | torch.device | None = None) -> type[DeviceHeuristics]:
     info = DeviceInfo(device)
     sm_version = info.sm_version
+    if info.is_ppu:
+        return ppu_heuristics_map[80]
     if sm_version == 90:
         if "H20" in info.name and "H200" not in info.name:
             return Sm90H20Heuristics

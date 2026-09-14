@@ -185,3 +185,59 @@ template <uint32_t N>
 CUDA_INLINE void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 };
+
+template <uint32_t kBits>
+CUDA_INLINE void aiu_load_gmem(
+    const void *gmem_ptr, void *smem_ptr,
+    uint32_t gmem_dim1, uint32_t gmem_dim2,
+    uint32_t gmem_offset1, uint32_t gmem_offset2,
+    uint32_t smem_dim1, uint32_t smem_dim2) {
+  uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
+  if constexpr (kBits == 16) {
+    asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.stride.2d.b16 "
+        "[%0], [%1], {1, %2, %3, 0, %4, %5}, {1, %6, %7, 1};"
+        :
+        : "r"(smem), "l"(gmem_ptr), "r"(gmem_dim1), "r"(gmem_dim2),
+          "r"(gmem_offset1), "r"(gmem_offset2), "r"(smem_dim1), "r"(smem_dim2));
+  } else if constexpr (kBits == 8) {
+    asm volatile(
+        "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.swzl.stride.2d.b8 "
+        "[%0], [%1], {0, %2, %3, 0, %4, %5}, {0, %6, %7, 1};"
+        :
+        : "r"(smem), "l"(gmem_ptr), "r"(gmem_dim1), "r"(gmem_dim2),
+          "r"(gmem_offset1), "r"(gmem_offset2), "r"(smem_dim1), "r"(smem_dim2));
+  }
+};
+
+
+CUDA_INLINE void aiu_load_gmem_linear_2d(
+    const void *gmem_ptr, void *smem_ptr,
+    uint32_t gmem_dim1, uint32_t gmem_dim2,
+    uint32_t gmem_offset1, uint32_t gmem_offset2,
+    uint32_t smem_dim1, uint32_t smem_dim2) {
+  uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.stride.2d.b32 "
+      "[%0], [%1], {1, %2, %3, 0, %4, %5}, {1, %6, %7, 1};"
+      :
+      : "r"(smem), "l"(gmem_ptr), "r"(gmem_dim1), "r"(gmem_dim2),
+        "r"(gmem_offset1), "r"(gmem_offset2), "r"(smem_dim1), "r"(smem_dim2));
+};
+
+
+CUDA_INLINE void aiu_load_gmem_linear_3d(
+    const void *gmem_ptr, void *smem_ptr,
+    uint32_t gmem_dim1, uint32_t gmem_dim2, uint32_t gmem_dim3,
+    uint32_t gmem_offset1, uint32_t gmem_offset2, uint32_t gmem_offset3,
+    uint32_t smem_dim1, uint32_t smem_dim2, uint32_t smem_dim3) {
+  uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "ppu.cp.async.aiu.bulk.tensor.shared.global.padz.linear.stride.3d.b32 "
+      "[%0], [%1], {%2, %3, %4, %5, %6, %7}, {%8, %9, %10, 1};"
+      :
+      : "r"(smem), "l"(gmem_ptr),
+        "r"(gmem_dim1), "r"(gmem_dim2), "r"(gmem_dim3),
+        "r"(gmem_offset1), "r"(gmem_offset2), "r"(gmem_offset3),
+        "r"(smem_dim1), "r"(smem_dim2), "r"(smem_dim3));
+};

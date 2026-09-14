@@ -3,6 +3,7 @@ import re
 
 import humming.dtypes as dtypes
 from humming.config.enum import MmaType
+from humming.device import current_device
 
 DTYPE_BIT_WIDTH_MAP = {
     "f32": 32,
@@ -125,6 +126,8 @@ class MmaOpClassImpl:
         if self.use_f8f6f4:
             asm_op += ".kind::f8f6f4"
         asm_op += f".m{shape[0]}n{shape[1]}k{shape[2]}.row.col"
+        if current_device.is_ppu:
+            asm_op = "ppu." + asm_op
         asm_op += f".{cd_dtype}.{a_dtype}.{b_dtype}.{cd_dtype}"
         if "s" in a_dtype:
             asm_op += ".satfinite"
@@ -278,7 +281,7 @@ class WgmmaOpClassImpl:
 
         cd_param_str = ""
         for i in range(math.ceil(len(cd_params) / 4)):
-            cd_params_part = cd_params[i * 4 : (i + 1) * 4]
+            cd_params_part = cd_params[i * 4:(i + 1) * 4]
             cd_params_part_str = ", ".join(cd_params_part) + ",\n"
             if cd_param_str:
                 cd_params_part_str = "    " + cd_params_part_str

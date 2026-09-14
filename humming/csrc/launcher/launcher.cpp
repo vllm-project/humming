@@ -104,6 +104,9 @@ inline int64_t get_num_sms(int64_t num_sms, int64_t dev) {
   CUdevice device;
   int32_t dev_sms;
   check_curesult(cuDeviceGet(&device, dev), "cuDeviceGet");
+  char device_name[256];
+  check_curesult(cuDeviceGetName(device_name, sizeof(device_name), device), "cuDeviceGetName");
+  if (std::string(device_name).find("ZW810E") != std::string::npos) return 20;
   check_curesult(
       cuDeviceGetAttribute(&dev_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device),
       "cuDeviceGetAttribute");

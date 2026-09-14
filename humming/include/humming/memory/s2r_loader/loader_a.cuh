@@ -20,6 +20,8 @@ public:
 
   CUDA_INLINE
   void load(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id, uint32_t stage_id = 0) {
+    if constexpr (USE_PPU && !Ctx::kIsIndexedGemm && Ctx::kUseCpAsync && !Ctx::kUseTmaA)
+      return load_aiu(smem_ptr, regs_ptr, iter_id);
     const uint32_t lane_id = ctx.lane_id();
     const uint32_t m_iter_id = ctx.m_warp_id();
     const uint32_t k_warp_id = ctx.k_warp_id();
@@ -32,7 +34,7 @@ public:
       uint32_t row = ctx.m_warp_offset() + load_iter_id * 16;
       uint32_t col = iter_id * 2 + k_warp_id * (Ctx::kWarpIters * 2);
 
-      if constexpr (MmaShape::M == 8) {
+      if constexpr (MmaShape::M == 8 || USE_PPU) {
         row += (lane_id / 16) * 8 + lane_id % 8;
         col += (lane_id / 8) % 2;
       } else {
@@ -60,4 +62,24 @@ public:
       }
     };
   };
+
+  CUDA_INLINE
+  void load_aiu(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    const uint32_t k_warp_id = ctx.k_warp_id();
+    uint32_t col = iter_id * 2 + k_warp_id * (Ctx::kWarpIters * 2);
+    uint32_t subblock_id = col / 8;
+    col = col % 8;
+
+    uint32_t row = ctx.m_warp_offset();
+    const int4 *smem_ptr_new = smem_ptr + subblock_id * (BlockShape::M * 1024 / 128);
+
+    PRAGMA_UNROLL
+    for (uint32_t load_iter_id = 0; load_iter_id < CEIL_DIV(WarpShape::M, 16); load_iter_id++) {
+      aiu_ld_shared<4>(
+          smem_ptr_new, regs_ptr + load_iter_id * 4,
+          BlockShape::M,
+          row, col * 16);
+      row += 16;
+    }
+  }
 };

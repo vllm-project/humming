@@ -200,8 +200,8 @@ public:
         for (uint32_t m = 0; m < inner_m; m++) {
           PRAGMA_UNROLL
           for (uint32_t n = 0; n < inner_n; n++) {
-            uint32_t row_index = i * inner_m + m;
-            uint32_t col_index = j * inner_n + n;
+            uint32_t row_index = i * inner_m + (USE_PPU ? n : m);
+            uint32_t col_index = j * inner_n + (USE_PPU ? m : n);
             write_to_smem(part_regs[n * inner_m + m], row_index, col_index);
           }
         }

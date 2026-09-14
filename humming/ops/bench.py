@@ -11,7 +11,7 @@ def tops_bench(dtype: str, mma_type: str | None = None, use_f16_accum: bool = Fa
 
     if mma_type == "mma":
         mma_shape_m = 8 if current_device.sm_version == 75 and dtype != "float16" else 16
-        mma_shape_n = 8
+        mma_shape_n = 16 if current_device.is_ppu else 8
         mma_k_bits = 128 if current_device.sm_version == 75 else 256
         dtype_bits = dtypes.DataType.from_str(dtype).num_bits
         mma_shape_k = mma_k_bits // dtype_bits

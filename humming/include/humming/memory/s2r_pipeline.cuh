@@ -76,6 +76,8 @@ public:
     auto &smem = ctx.smem;
 
     loader_b.load(smem.stages[stage_id].b, mma.regs_qb_as_ptr(buffer_id), iter_id);
+    if constexpr (USE_PPU && !kUseMxmma && kIsGroupOrBlockWeightScale)
+      loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), k_iter_id);
     if constexpr (!kUseWgmma && !Ctx::kUseUmma)
       loader_a.load(smem.stages[stage_id].a, mma.regs_a_as_ptr(buffer_id), iter_id, stage_id);
     if constexpr (kUseMxmma) {
@@ -86,7 +88,7 @@ public:
     } else {
       if constexpr (kIsGroupInputScale)
         loader_as.load(smem.stages[stage_id].as, mma.arith.regs_as_as_ptr(buffer_id), k_iter_id);
-      if constexpr (kIsGroupOrBlockWeightScale)
+      if constexpr (!USE_PPU && kIsGroupOrBlockWeightScale)
         loader_bs.load(smem.stages[stage_id].bs, mma.arith.regs_bs_as_ptr(buffer_id), k_iter_id);
     }
     if constexpr (kHasZeroPoint && (kIsGroupOrBlockWeightScale || kIsFirst)) {

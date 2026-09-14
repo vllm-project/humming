@@ -206,6 +206,8 @@ def find_all_cuda_paths():
     results = []
     seen_real = set()
     candidates = ["/usr/local/cuda"] + sorted(glob.glob("/usr/local/cuda-*"))
+    if "PPU_SDK" in os.environ:
+        candidates.append(os.path.join(os.environ["PPU_SDK"], "CUDA_SDK"))
     if "CUDA_HOME" in os.environ:
         candidates.append(os.environ["CUDA_HOME"])
 

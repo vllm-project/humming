@@ -53,6 +53,10 @@ class DeviceInfo:
         return self._get_value().name
 
     @property
+    def is_ppu(self) -> bool:
+        return self._get_value().is_ppu
+
+    @property
     def sm_count(self) -> int:
         return self._get_value().sm_count
 

@@ -3,6 +3,9 @@
 #include <cuda.h>
 
 
+#ifndef USE_PPU
+  #define USE_PPU 0
+#endif
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CEIL_DIV(a, b) ((a + b - 1) / (b))
