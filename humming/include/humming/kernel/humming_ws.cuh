@@ -222,10 +222,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             }
             s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
             mma.run(stage_id, warp_iter_id);
-            if (warp_iter_id == Ctx::kWarpIters - 2) consumer.arrive(stage_id);
             mma.transform_b(
                 (warp_iter_id + 1) % 2,
                 (warp_iter_id + 1) % Ctx::kWarpIters);
+            if (warp_iter_id == Ctx::kWarpIters - 1) consumer.arrive(stage_id);
           }
         }
       };
