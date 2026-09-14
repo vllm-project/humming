@@ -61,7 +61,7 @@ struct ProcessInputContext : Config, TuningConfig {
   static_assert(kDynamicGroupScale || std::is_same<DynamicGroupScaleType, Float32>::value);
   static_assert(kPhase == ProcessInputQuantizationPhase::Fused || kDynamicTokenMode);
   static_assert(!std::is_same<DynamicGroupScaleType, M3BFloat16>::value || kPhase == ProcessInputQuantizationPhase::Fused);
-  static_assert(!kUseMMajorInputScale || kDynamicGroupScale);
+  static_assert(!kUseMMajorInputScale || kDynamicScale);
   static_assert(kQuantize || !kDynamicScale);
   static_assert(kQuantize || !kStaticTensorScale);
   static_assert(kQuantize || kPhase == ProcessInputQuantizationPhase::Fused);

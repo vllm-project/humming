@@ -1,7 +1,8 @@
 import pytest
 
 from humming import dtypes
-from humming.config import ComputeConfig, GemmType, LayerConfig
+from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
+from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -40,6 +41,7 @@ def _case(
             input_scale_group_size=input_scale_group_size,
             weight_scale_group_size=weight_scale_group_size,
             has_bias=has_bias,
+            mma_type=MmaType.MMA if current_device.sm_version // 10 == 12 else None,
         ),
         compute_config=ComputeConfig(
             gemm_type=gemm_type,

@@ -78,6 +78,10 @@ public:
         repack_native_mxf8f6f4<ElementB>(regs_qb[buffer_id], regs_b_ptr, i);
       }
     } else {
+      if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
+        regs_qb[buffer_id][0] >>= ctx.warp_id() % 2 * (ElementA::kBits / 2);
+      }
+
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < WarpShape::N / 16; i++) {
         uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 16 / MmaShape::N]);
@@ -91,11 +95,13 @@ public:
 
   CUDA_INLINE
   uint32_t get_thread_id_a(uint32_t stage_id, uint32_t iter_id, uint32_t m_id) {
+    if constexpr (!kIsGroupInputScale) return 0;
     return m_id % 2;
   }
 
   CUDA_INLINE
   uint32_t get_thread_id_b(uint32_t stage_id, uint32_t iter_id, uint32_t n_id) {
+    if constexpr (!kIsGroupOrBlockWeightScale) return 0;
     if constexpr (kScaleVec == 1) {
       return n_id / 2;
     } else {
@@ -105,11 +111,13 @@ public:
 
   CUDA_INLINE
   uint32_t get_byte_id_a(uint32_t stage_id, uint32_t iter_id, uint32_t m_id) {
+    if constexpr (!kIsGroupInputScale) return 0;
     return (as_byte_phase + k_warp_byte_base + iter_id * kScaleVec) % 4;
   }
 
   CUDA_INLINE
   uint32_t get_byte_id_b(uint32_t stage_id, uint32_t iter_id, uint32_t n_id) {
+    if constexpr (!kIsGroupOrBlockWeightScale) return 0;
     if constexpr (kScaleVec == 4) {
       return 0;
     } else if constexpr (kScaleVec == 2) {
