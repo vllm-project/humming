@@ -14,6 +14,7 @@ dependencies = [
     "numpy",
     "safetensors",
     "jinja2",
+    "nvidia-ml-py",
     "cuda-bindings",
     "tqdm",
     "tabulate"
