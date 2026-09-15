@@ -35,6 +35,9 @@ def get_cubin_kernel_names(path: str | os.PathLike) -> list[str]:
         raise ValueError(f"not a 64-bit ELF file: {path}")
 
     byte_order = "<" if data[5] == 1 else ">"
+    machine = struct.unpack_from(f"{byte_order}H", data, 18)[0]
+    # PPU and CUDA use different st_other bits for kernel entry points.
+    kernel_flag = 0x20 if machine == 0x10E else 0x10
     section_offset = struct.unpack_from(f"{byte_order}Q", data, 40)[0]
     section_size = struct.unpack_from(f"{byte_order}H", data, 58)[0]
     num_sections = struct.unpack_from(f"{byte_order}H", data, 60)[0]
@@ -56,7 +59,7 @@ def get_cubin_kernel_names(path: str | os.PathLike) -> list[str]:
         symbol_entry_size = section[9]
         for offset in range(symbol_offset, symbol_offset + symbol_size, symbol_entry_size):
             name_offset, info, other, *_ = struct.unpack_from(symbol_format, data, offset)
-            if info & 0xF != 2 or not other & 0x10 or name_offset >= string_size:
+            if info & 0xF != 2 or not other & kernel_flag or name_offset >= string_size:
                 continue
             name_start = string_offset + name_offset
             name_end = data.index(b"\0", name_start, string_offset + string_size)

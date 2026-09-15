@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -77,7 +78,8 @@ public:
 
     for (int i = 0; i < ehdr->e_shnum; ++i) {
       if (shdrs[i].sh_type == 2) {
-        readSymbolTable(shdrs, ehdr->e_shnum, i);
+        // PPU marks kernel entry points with 0x20; CUDA uses 0x10.
+        readSymbolTable(shdrs, ehdr->e_shnum, i, ehdr->e_machine == 0x10E ? 0x20 : 0x10);
       }
     }
   }
@@ -102,7 +104,7 @@ public:
     return kernelNames;
   }
 
-  void readSymbolTable(const Elf64_Shdr *shdrs, int num_shdrs, int symIdx) {
+  void readSymbolTable(const Elf64_Shdr *shdrs, int num_shdrs, int symIdx, unsigned char kernel_flag) {
     const Elf64_Shdr &symtab = shdrs[symIdx];
     const Elf64_Shdr &strtab = shdrs[symtab.sh_link];
 
@@ -115,7 +117,7 @@ public:
       if (sym.st_name == 0 || sym.st_name >= strtab.sh_size) continue;
       if (sym.st_shndx >= num_shdrs) continue;
       std::string sName = names + sym.st_name;
-      if ((sym.st_info & 0xF) == 2 && (sym.st_other & 0x10) != 0) {
+      if ((sym.st_info & 0xF) == 2 && (sym.st_other & kernel_flag) != 0) {
         kernelNames.push_back(sName);
       }
 

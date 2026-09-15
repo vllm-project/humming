@@ -310,9 +310,17 @@ def transform_humming_weight(
         assert not use_fused_e8m0_scale, "use_packed_k_layout is incompatible with fused-e8m0 scale"
 
     if current_device.is_ppu:
+        ppu_perm = [0, 2, 4, 6, 1, 3, 5, 7]
         weight = weight.view(-1, shape_n // 8, 8, weight.size(-1))
-        weight = weight[:, :, [0, 2, 4, 6, 1, 3, 5, 7], :]
+        weight = weight[:, :, ppu_perm, :]
         weight = weight.view(-1, shape_n, weight.size(-1))
+        if should_preprocess_with_zp:
+            # Repacking subtracts the zero point before converting int weights.
+            # Match the permuted weight rows while keeping the caller's ZP intact.
+            unpacked_zp = ops.unpack_weight(zero_point.transpose(-1, -2).contiguous(), b_dtype.num_bits)
+            unpacked_zp = unpacked_zp.view(*unpacked_zp.shape[:-1], shape_n // 8, 8)
+            unpacked_zp = unpacked_zp[..., ppu_perm].flatten(-2).contiguous()
+            zero_point = ops.pack_weight(unpacked_zp, b_dtype.num_bits).transpose(-1, -2).contiguous()
 
     repacked_weight = ops.repack_weight(
         inputs=weight,
