@@ -8,7 +8,7 @@ steps:
     concurrency_group: humming/b200
     command: bash .buildkite/run-tests.sh
     artifact_paths:
-      - "test-results/**/*"
+      - "test-results/pytest.xml"
     plugins:
       - kubernetes:
           podSpec:
