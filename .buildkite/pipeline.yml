@@ -1,0 +1,27 @@
+steps:
+  - label: "Humming tests (B200, CUDA 13, PyTorch 2.13)"
+    key: humming-tests-b200
+    agents:
+      queue: b200-k8s
+    timeout_in_minutes: 180
+    concurrency: 1
+    concurrency_group: humming/b200
+    command: bash .buildkite/run-tests.sh
+    artifact_paths:
+      - "test-results/**/*"
+    plugins:
+      - kubernetes:
+          podSpec:
+            runtimeClassName: nvidia
+            containers:
+              - image: pytorch/pytorch:2.13.0-cuda13.0-cudnn9-devel
+                resources:
+                  limits:
+                    nvidia.com/gpu: 1
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
