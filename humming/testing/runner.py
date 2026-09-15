@@ -2,7 +2,7 @@ import dataclasses
 import json
 import os
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -571,7 +571,7 @@ class KernelTestRunner:
         path = Path(log_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "pytest_test": os.environ.get("PYTEST_CURRENT_TEST"),
             "test_case": dataclasses.asdict(self.test_case),
             "shape_m": shape_m,
