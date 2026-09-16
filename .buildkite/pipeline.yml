@@ -1,6 +1,6 @@
 steps:
-  - label: "Humming tests (B200, CUDA 13, PyTorch 2.13)"
-    key: humming-tests-b200
+  - label: "Humming Tests (B200)"
+    key: humming-b200-ci
     agents:
       queue: b200-k8s
     timeout_in_minutes: 180
@@ -25,3 +25,23 @@ steps:
               - name: devshm
                 emptyDir:
                   medium: Memory
+
+  - label: "Humming Tests (DGX Spark)"
+    key: humming-dgx-spark-ci
+    agents:
+      queue: dgx-spark
+    timeout_in_minutes: 180
+    concurrency: 1
+    concurrency_group: humming/dgx-spark
+    command: bash .buildkite/run-tests.sh
+    artifact_paths:
+      - "test-results/pytest.xml"
+    plugins:
+      - docker#v5.2.0:
+          # NGC 26.07 ARM64: PyTorch 2.13 development snapshot and CUDA 13.3.
+          image: nvcr.io/nvidia/pytorch:26.07-py3@sha256:7531d90bcbe0e43e1f7363029c7e145ce90eebeb494a7b4695fdba0329d7c3c3
+          always-pull: true
+          propagate-environment: true
+          gpus: all
+          volumes:
+            - /dev/shm:/dev/shm

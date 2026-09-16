@@ -384,6 +384,10 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         }
         assert self.a_dtype in dtype_map
         assert self.sm_version >= dtype_map[self.a_dtype]
+        if self.sm_version == 121 and self.mma_type == MmaType.MXMMA and self.a_dtype == dtypes.float4e0m3:
+            assert _cuda_compiler_version(self._get_compiler()) >= (13, 1), (
+                "E0M3 MXMMA on SM121 requires CUDA 13.1 or newer (PTX ISA 9.1)"
+            )
         assert self.b_dtype.num_bits <= 8
         assert self.b_dtype.num_bits <= self.a_dtype.num_bits
         if self.b_dtype.is_integer_type and self.a_dtype.is_integer_type:

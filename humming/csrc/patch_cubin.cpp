@@ -1,4 +1,4 @@
-// patch_cubin.cpp - in-place patch an sm_120a cubin to enable hardware
+// patch_cubin.cpp - in-place patch an sm_12xa cubin to enable hardware
 // narrow-float formats that PTX does not expose (only reachable by editing SASS
 // encoding bits).
 //
@@ -6,8 +6,9 @@
 //   E3M4 : hidden FP8 format, bias 3 / 4-mantissa / +/-30  (tensor-core QMMA / cvt F2FP)
 //
 // Constants below were established on RTX PRO 6000 (sm_120a, CUDA 13.3) by
-// bit-flipping + on-GPU numeric regression. Each instruction is 16 bytes,
-// little-endian; bit i lives in byte i/8, bit i%8.
+// bit-flipping + on-GPU numeric regression and validated on GB10 (sm_121a,
+// CUDA 13.3). Each instruction is 16 bytes, little-endian; bit i lives in byte
+// i/8, bit i%8.
 //
 //   OMMA (block-scaled FP4)  opcode[11:0] = 0x47f
 //         bit78 = A element format (0=E2M1, 1=E0M3), bit79 = B element format
@@ -21,7 +22,7 @@
 //
 // Only instructions whose riginal bits are the expected base format (E5M2 for
 // e3m4 modes, E2M1 for e0m3 modes) are modified; anything else is skipped.
-// A cubin that is not sm_120a is rejected outright.
+// A cubin that is not sm_120a or sm_121a is rejected outright.
 //
 // Usage:
 //   patch_cubin <mode> <cubin> [--dry-run] [--backup]
@@ -101,11 +102,11 @@ static T rd(const std::vector<uint8_t> &d, size_t o) {
   return v;
 }
 
-// Accept only EM_CUDA (0xBE) with SM field == 120. The cubin e_flags are
+// Accept only EM_CUDA (0xBE) with SM field == 120 or 121. The cubin e_flags are
 // identical for sm_120 / sm_120a / sm_120f (0x06007802), so the a/f suffix
 // cannot be told apart at the ELF level; block-scaled MMA only builds for
-// sm_120a anyway, so gating on the SM120 family is sufficient.
-static int check_sm120a(const std::vector<uint8_t> &d, std::string &why) {
+// architecture-specific or family-specific targets anyway.
+static int check_sm12xa(const std::vector<uint8_t> &d, std::string &why) {
   if (d.size() < 64 || d[0] != 0x7f || d[1] != 'E' || d[2] != 'L' || d[3] != 'F') {
     why = "not an ELF/cubin";
     return 1;
@@ -123,9 +124,9 @@ static int check_sm120a(const std::vector<uint8_t> &d, std::string &why) {
     return 1;
   }
   uint32_t sm = (eflags >> 8) & 0xff;
-  if (sm != 120) {
+  if (sm != 120 && sm != 121) {
     char b[80];
-    snprintf(b, 80, "target arch SM=%u (e_flags=0x%08x) is not sm_120", sm, eflags);
+    snprintf(b, 80, "target arch SM=%u (e_flags=0x%08x) is not sm_120 or sm_121", sm, eflags);
     why = b;
     return 1;
   }
@@ -248,7 +249,7 @@ static int handle(std::vector<uint8_t> &d, size_t o, const Mode &m, bool dry, st
 }
 
 struct PatchStats {
-  int rc = 0;      // 0 ok; 2 bad mode / read error; 3 not sm_120a; 4 I/O error
+  int rc = 0;      // 0 ok; 2 bad mode / read error; 3 not sm_12xa; 4 I/O error
   int matched = 0; // instructions of the mode's opcode class
   int patched = 0; // instructions actually modified
   int skipped = 0; // matched opcode but wrong source format
@@ -278,7 +279,7 @@ static PatchStats run_patch(const std::string &path, const std::string &mode_nam
   }
 
   std::string why;
-  if (check_sm120a(d, why)) {
+  if (check_sm12xa(d, why)) {
     st.rc = 3;
     st.message = "refused: " + why;
     return st;
@@ -372,7 +373,7 @@ static PatchStats run_patch(const std::string &path, const std::string &mode_nam
 // C-ABI entry point for loading as a shared library from Python via ctypes:
 //   g++ -O2 -std=c++17 -fPIC -shared patch_cubin.cpp -o libcubinpatch.so
 // Returns the number of patched instructions (>=0), or -rc on error
-// (2 bad mode/read, 3 not sm_120a, 4 I/O, 5 unsupported instruction config).
+// (2 bad mode/read, 3 not sm_12xa, 4 I/O, 5 unsupported instruction config).
 extern "C" int cubin_patch(const char *path, const char *mode, int dry, int backup) {
   PatchStats st = run_patch(path, mode, dry != 0, backup != 0, /*verbose=*/false);
   return st.rc ? -st.rc : st.patched;
@@ -383,7 +384,7 @@ extern "C" int cubin_patch(const char *path, const char *mode, int dry, int back
 // existing instructions are flipped, so the buffer is edited in place and its
 // size never changes. `data` must point to `n` writable bytes.
 // Returns the number of patched instructions (>=0), or -rc on error
-// (2 bad mode, 3 not sm_120a, 5 unsupported instruction config). Nothing is
+// (2 bad mode, 3 not sm_12xa, 5 unsupported instruction config). Nothing is
 // written back when dry != 0.
 extern "C" int cubin_patch_buffer(uint8_t *data, size_t n, const char *mode, int dry) {
   if (!data || n == 0 || !mode) return -2;
@@ -394,7 +395,7 @@ extern "C" int cubin_patch_buffer(uint8_t *data, size_t n, const char *mode, int
 
   std::vector<uint8_t> d(data, data + n);
   std::string why;
-  if (check_sm120a(d, why)) return -3;
+  if (check_sm12xa(d, why)) return -3;
 
   std::vector<Sec> secs;
   collect_exec_sections(d, secs);

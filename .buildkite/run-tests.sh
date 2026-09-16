@@ -15,8 +15,9 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 uv venv --system-site-packages .venv
-uv pip install --python .venv/bin/python --torch-backend cu130 \
-  'torch==2.13.0' pytest -e .
+uv pip install --python .venv/bin/python \
+  pytest safetensors jinja2 cuda-bindings tqdm tabulate
+uv pip install --python .venv/bin/python --no-deps -e .
 
 echo "--- Run tests"
 mkdir -p test-results
