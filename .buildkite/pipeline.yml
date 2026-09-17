@@ -14,7 +14,8 @@ steps:
           podSpec:
             runtimeClassName: nvidia
             containers:
-              - image: pytorch/pytorch:2.13.0-cuda13.0-cudnn9-devel
+              # NGC 26.07 multi-arch: PyTorch 2.13 development snapshot and CUDA 13.3.
+              - image: nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
                 resources:
                   limits:
                     nvidia.com/gpu: 1
@@ -38,10 +39,11 @@ steps:
       - "test-results/pytest.xml"
     plugins:
       - docker#v5.2.0:
-          # NGC 26.07 ARM64: PyTorch 2.13 development snapshot and CUDA 13.3.
-          image: nvcr.io/nvidia/pytorch:26.07-py3@sha256:7531d90bcbe0e43e1f7363029c7e145ce90eebeb494a7b4695fdba0329d7c3c3
+          # NGC 26.07 multi-arch: PyTorch 2.13 development snapshot and CUDA 13.3.
+          image: nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
           always-pull: true
           propagate-environment: true
+          propagate-uid-gid: true
           gpus: all
           volumes:
             - /dev/shm:/dev/shm

@@ -7,11 +7,18 @@ echo "--- :nvidia: GPU Info"
 nvidia-smi
 
 echo "--- Install test dependencies"
-apt-get update
-apt-get install -y --no-install-recommends curl ca-certificates git build-essential
+for tool in curl git make g++; do
+  command -v "${tool}" >/dev/null
+done
+
+export HOME="${TMPDIR:-/tmp}/humming-home"
+export UV_CACHE_DIR="${TMPDIR:-/tmp}/uv-cache"
+mkdir -p "${HOME}" "${UV_CACHE_DIR}"
 if ! command -v uv >/dev/null 2>&1; then
+  uv_install_dir="${TMPDIR:-/tmp}/uv-bin"
   curl -LsSf https://astral.sh/uv/install.sh \
-    | env UV_INSTALL_DIR=/usr/local/bin sh
+    | env UV_INSTALL_DIR="${uv_install_dir}" UV_NO_MODIFY_PATH=1 sh
+  export PATH="${uv_install_dir}:${PATH}"
 fi
 
 uv venv --system-site-packages .venv
