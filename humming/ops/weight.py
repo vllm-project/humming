@@ -147,6 +147,7 @@ def _repack_weight_op(
     zero_point: torch.Tensor | None = None,
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
+    use_ldmatrix_s4: bool = False,
 ) -> torch.Tensor:
     assert inputs.ndim in [2, 3]
     assert inputs.is_cuda
@@ -194,6 +195,7 @@ def _repack_weight_op(
             group_size_zp=group_size_zp,
             use_packed_k_layout=use_packed_k_layout,
             use_native_dequant=use_native_dequant,
+            use_ldmatrix_s4=use_ldmatrix_s4,
         )
 
         kernel(
@@ -338,6 +340,7 @@ def repack_weight(
     zero_point: torch.Tensor | None = None,
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
+    use_ldmatrix_s4: bool = False,
     outputs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     outputs = _prepare_output_arg(inputs, outputs, torch.int32)
@@ -359,6 +362,7 @@ def repack_weight(
         zero_point,
         use_packed_k_layout,
         use_native_dequant,
+        use_ldmatrix_s4,
     )
     return _select_output(outputs, returned_outputs)
 

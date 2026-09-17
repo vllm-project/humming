@@ -28,12 +28,21 @@ class RepackWeightKernel(KernelRuntime):
     group_size_zp: int = 0
     use_packed_k_layout: bool = False
     use_native_dequant: bool = False
+    use_ldmatrix_s4: bool = False
 
     def init_kernel(self):
         if self.should_preprocess_with_zp:
             assert self.should_preprocess_for_int2fp
         if self.use_packed_k_layout:
             assert self.weight_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
+        if self.use_ldmatrix_s4:
+            assert self.use_wgmma and self.is_weight_packed
+            assert not self.should_preprocess_for_int2fp and not self.use_fused_e8m0_scale
+            assert not self.use_native_dequant
+            assert self.use_packed_k_layout, "use_ldmatrix_s4 requires use_packed_k_layout"
+            assert self.weight_bits == 4, "use_ldmatrix_s4 requires 4-bit weight"
+            assert self.activation_bits == 8, "use_ldmatrix_s4 requires 8-bit activation"
+            assert not self.should_preprocess_with_zp, "use_ldmatrix_s4 (v1) requires a symmetric weight"
 
         should_transpose_mini_block = self.use_wgmma and not self.use_fused_e8m0_scale
 
@@ -56,7 +65,8 @@ class RepackWeightKernel(KernelRuntime):
             f"    {int(should_transpose_mini_block)},\n"
             f"    {self.group_size_zp},\n"
             f"    {int(self.use_packed_k_layout)},\n"
-            f"    {int(self.use_native_dequant)}>"
+            f"    {int(self.use_native_dequant)},\n"
+            f"    {int(self.use_ldmatrix_s4)}>"
         )
         self.arg_types = (
             ctypes.c_void_p,

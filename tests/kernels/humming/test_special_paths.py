@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from humming import dtypes
@@ -17,6 +19,7 @@ SPECIAL_FEATURES = {
     "use_int_weight_scale",
     "use_fused_e8m0_scale",
     "use_packed_k_layout",
+    "use_ldmatrix_s4",
 }
 
 
@@ -163,6 +166,19 @@ SPECIAL_WEIGHT_CASES = (
             mma_type=MmaType.WGMMA,
         ),
     ),
+    _kernel_case(
+        required_features=("use_packed_k_layout", "use_ldmatrix_s4"),
+        name="packed-k-ldmatrix-s4",
+        layer_config=_layer_config(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.uint4,
+            bs_dtype=dtypes.bfloat16,
+            weight_scale_group_size=128,
+            has_zero_point=False,
+            mma_type=MmaType.WGMMA,
+            # The test re-resolves selection after its environment checks.
+        ),
+    ),
 )
 
 
@@ -176,12 +192,24 @@ def test_special_weight_path(required_features, test_case):
     if "use_fused_e8m0_scale" in required_features and config.mma_type == MmaType.MXMMA:
         pytest.skip("fused E8M0 scale is not supported by MXMMA")
 
+    min_cuda_version = (13, 4) if "use_ldmatrix_s4" in required_features else None
+    skip_if_unsupported(
+        a_dtype=config.a_dtype,
+        mma_type=config.mma_type.value,
+        min_cuda_version=min_cuda_version,
+    )
+
+    if "use_ldmatrix_s4" in required_features:
+        config = dataclasses.replace(config, use_ldmatrix_s4=None)
+        if not config.can_use_ldmatrix_s4:
+            pytest.skip(str(config.ldmatrix_s4_rejection_reasons))
+        test_case = dataclasses.replace(test_case, layer_config=config)
+
     for feature in required_features:
         assert getattr(config, feature) is True
     if "use_int_weight_scale" in required_features or "use_fused_e8m0_scale" in required_features:
         assert config.weight_scale_2_type != WeightScale2Type.NONE
 
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
     results = KernelTestRunner(test_case).run()
     assert_kernel_test_shape_coverage(results)
 
@@ -197,11 +225,47 @@ def test_special_weight_path_coverage():
     int_scale_configs = configs_by_feature["use_int_weight_scale"]
     fused_configs = configs_by_feature["use_fused_e8m0_scale"]
     packed_k_configs = configs_by_feature["use_packed_k_layout"]
+    ldmatrix_s4_configs = configs_by_feature["use_ldmatrix_s4"]
     assert {config.a_dtype for config in int_scale_configs} == {dtypes.int4, dtypes.int8}
     assert {config.weight_scale_2_type.name for config in fused_configs} == {"CHANNEL", "TENSOR"}
     assert {config.a_dtype for config in packed_k_configs} == {dtypes.float8e4m3, dtypes.int8}
     assert any(config.use_int_weight_scale for config in packed_k_configs)
+    assert all(config.a_dtype == dtypes.int8 for config in ldmatrix_s4_configs)
+    assert all(config.b_dtype == dtypes.uint4 for config in ldmatrix_s4_configs)
+    assert all(not config.has_zero_point for config in ldmatrix_s4_configs)
 
     odd_bit_fallback = next(case.layer_config for _, case in SPECIAL_WEIGHT_CASES if "odd-bit" in case.name)
     assert odd_bit_fallback.b_dtype.num_bits % 2 == 1
     assert odd_bit_fallback.use_packed_k_layout is False
+
+
+def test_use_ldmatrix_s4_default_matches_eligibility():
+    skip_if_unsupported(mma_type="wgmma", min_cuda_version=(13, 4))
+    config = _layer_config(
+        a_dtype=dtypes.int8,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128,
+        has_zero_point=False,
+        mma_type=MmaType.WGMMA,
+    )
+    assert config.use_ldmatrix_s4 == config.can_use_ldmatrix_s4
+
+
+def test_use_ldmatrix_s4_incompatible_geometry_rejected():
+    skip_if_unsupported(mma_type="wgmma", min_cuda_version=(13, 4))
+    from humming.testing.tuning import _is_legal_geometry
+
+    config = _layer_config(
+        a_dtype=dtypes.int8,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128,
+        has_zero_point=False,
+        mma_type=MmaType.WGMMA,
+        use_ldmatrix_s4=None,
+    )
+    if not config.can_use_ldmatrix_s4:
+        pytest.skip(str(config.ldmatrix_s4_rejection_reasons))
+    assert not _is_legal_geometry(config, block_shape=(64, 128, 128), warp_shape=(64, 32, 128))
+    assert _is_legal_geometry(config, block_shape=(64, 128, 64), warp_shape=(64, 32, 64))

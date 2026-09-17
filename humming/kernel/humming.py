@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import hashlib
 import json
 from typing import ClassVar
 
@@ -17,6 +18,7 @@ from humming.config import (
     TuningConfig,
 )
 from humming.config.config import _cuda_compiler_version
+from humming.config.ldmatrix_s4 import resolve_specialization_loader
 from humming.device import current_device, get_device_index
 from humming.jit.runtime import KernelRuntime
 from humming.tune import get_heuristics_config
@@ -127,6 +129,12 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         self.check_dtype()
         self.check_scale()
         self.check_config()
+        # LayerConfig chooses storage; only the actual specialization can select a loader.
+        self.selected_loader_variant, self.loader_selection_reasons = resolve_specialization_loader(
+            json.loads(LayerConfig.to_str(self)),
+            json.loads(self.to_str()),
+            self.ldmatrix_s4_rejection_reasons,
+        )
         self.mma_op_class = self.select_mma_op_class()
 
         assert self.bs_dtype is not None
@@ -164,6 +172,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             f"    TuningConfig>"
         )
 
+        self.specialization_identity = hashlib.sha256((self.code + self.kernel_expr).encode()).hexdigest()
         self.prepare()
         self.register_kernel()
 
@@ -172,6 +181,10 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
         kernel_filename = self.kernel_filename
         self.kernel_id, self.kernel_name = ops.register_kernel(kernel_filename)
+        actual_loader = torch.ops.humming.get_kernel_loader_variant(self.kernel_id)
+        if actual_loader != self.selected_loader_variant:
+            raise RuntimeError(f"compiled loader {actual_loader} differs from generated selection")
+        self.selected_loader_variant = actual_loader
         self._id2kernel[self.kernel_id] = self
 
     @property

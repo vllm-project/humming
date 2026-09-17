@@ -1,6 +1,7 @@
 #pragma once
 
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/ldmatrix_s4.cuh>
 
 
 template <class Ctx>
@@ -62,7 +63,39 @@ public:
   }
 
   CUDA_INLINE
+  void load_ldmatrix_s4(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    static_assert(Ctx::kPartMmaShapeK == 32);
+    static_assert(ElementA::kBits == 8);
+    static_assert(Ctx::kUseWgmma);
+    static_assert(WarpShape::K == 64, "load_ldmatrix_s4 only supports WarpShape::K == 64");
+    static_assert(K_WARPS == 1, "load_ldmatrix_s4 does not support K_WARPS > 1");
+
+    // one ldmatrix.x4 call covers one 32-wide K slab; WarpShape::K == 64
+    // needs two, each into a separate register range
+    constexpr uint32_t kNumKSlabs = WarpShape::K / Ctx::kPartMmaShapeK;
+    static_assert(kNumKSlabs == 2);
+
+    uint32_t lane_id = ctx.lane_id();
+    uint32_t matrix_idx = lane_id / 8;
+    uint32_t row_in_matrix = lane_id % 8;
+    uint32_t m_subgroup = matrix_idx % 2;
+    uint32_t k_half = matrix_idx / 2;
+    uint32_t m_base = ctx.n_warp_offset() + iter_id * 16;
+    uint32_t address_row = m_base + m_subgroup * 8 + row_in_matrix;
+
+    // matches process.cuh's kUseLdmatrixS4 packer: 32 bytes/row, K-major,
+    // slab 0 = bytes [0,16), slab 1 = bytes [16,32)
+    const uint8_t *smem_bytes = reinterpret_cast<const uint8_t *>(smem_ptr);
+    PRAGMA_UNROLL
+    for (uint32_t slab = 0; slab < kNumKSlabs; slab++) {
+      uint32_t slab_byte_offset = slab * 16 + k_half * 8;
+      ld_shared_s4x4(&smem_bytes[address_row * 32 + slab_byte_offset], &regs_ptr[slab * 4]);
+    }
+  }
+
+  CUDA_INLINE
   void load(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    if constexpr (Ctx::kUseLdmatrixS4) return load_ldmatrix_s4(smem_ptr, regs_ptr, iter_id);
     if constexpr (Ctx::kUsePackedKLayout) return load_packed_k(smem_ptr, regs_ptr, iter_id);
     uint32_t warp_id = ctx.warp_id();
     uint32_t n_warp_id = ctx.n_warp_id();

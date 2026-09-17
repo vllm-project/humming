@@ -166,6 +166,16 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
         block_shape_k = 64
         warp_shape_n = 32
         warp_shape_k = 64
+
+    if layer_config.use_ldmatrix_s4:
+        # loader_b.cuh's load_ldmatrix_s4 requires WarpShape::K == 64, K_WARPS == 1;
+        # the heuristic above has no visibility into that and picks for throughput
+        assert layer_config.shape_k % 64 == 0, (
+            "use_ldmatrix_s4 requires shape_k a multiple of 64 (WarpShape::K == 64)"
+        )
+        warp_shape_k = 64
+        block_shape_k = 64
+
     config = {
         "block_shape": (block_shape_m, block_shape_n, block_shape_k),
         "warp_shape": (block_shape_m, warp_shape_n, warp_shape_k),

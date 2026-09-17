@@ -23,12 +23,23 @@ def skip_if_unsupported(
     use_tma=None,
     use_warp_spec=None,
     use_mbarrier=None,
+    min_cuda_version: tuple[int, int] | None = None,
 ) -> None:
-    """Skip a test whose hardware requirements aren't met by the current GPU."""
+    """Skip a test whose hardware or toolchain requirements aren't met."""
     import pytest
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
+
+    if min_cuda_version is not None:
+        from humming.config.config import _cuda_compiler_version
+        from humming.jit.runtime import KernelRuntime
+
+        cuda_version = _cuda_compiler_version(KernelRuntime._get_compiler())
+        if cuda_version < min_cuda_version:
+            pytest.skip(
+                f"requires CUDA >= {min_cuda_version}, current compiler reports {cuda_version}"
+            )
 
     sm = current_device.sm_version
 

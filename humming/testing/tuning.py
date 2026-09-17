@@ -94,6 +94,9 @@ def _is_legal_geometry(
     )
     if layer_config.use_packed_k_layout and is_warp_k_gt_groupsize:
         return False
+    if layer_config.use_ldmatrix_s4 and (warp_shape[2] != 64 or block_shape[2] != 64):
+        # loader_b.cuh's load_ldmatrix_s4 requires WarpShape::K == 64, K_WARPS == 1
+        return False
     ratios = tuple(block // warp for block, warp in zip(block_shape, warp_shape, strict=True))
     return all(ratio > 0 and ratio & (ratio - 1) == 0 for ratio in ratios)
 

@@ -145,6 +145,20 @@ Tensor launch_kernel_impl(
   }
   KernelLaunchData kernel_launch_data = find_kernel_launch_data(configs, valid_shape_m, context);
   KernelData &kernel_data = kernel_launch_data.metadata;
+  if (kernel_data.use_ldmatrix_s4) {
+    ASSERT_CHECK(
+        kernel_data.gemm_type_id == 0 && !sorted_ids_.has_value() &&
+            !expert_ids_.has_value() && !num_tokens_padded_.has_value() &&
+            !expert_layout_.has_value(),
+        "ldmatrix.s8.s4 does not support MoE/EP routing metadata");
+    ASSERT_CHECK(
+        reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0,
+        "ldmatrix.s8.s4 B requires 16-byte alignment");
+    CUstreamCaptureStatus capture_status;
+    check_curesult(cuStreamIsCapturing(get_current_cuda_stream(dev), &capture_status), "cuStreamIsCapturing");
+    ASSERT_CHECK(capture_status == CU_STREAM_CAPTURE_STATUS_NONE,
+                 "ldmatrix.s8.s4 does not support CUDA Graph capture; prepare legacy weights");
+  }
   int64_t &num_sms = kernel_launch_data.num_sms;
   Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
   uint32_t num_ctas = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
@@ -324,7 +338,8 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getBool("USE_TMA_BZP"),
       reader.getBool("USE_TMA_BIAS"),
       reader.getBool("USE_PDL"),
-      reader.getBool("USE_PACKED_K_LAYOUT")};
+      reader.getBool("USE_PACKED_K_LAYOUT"),
+      reader.getBool("USE_LDMATRIX_S4")};
 
   std::unique_lock lock(g_kernel_mutex);
   auto path_it = g_path_ids.find(cubin_path);
@@ -341,6 +356,12 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
   auto result = std::make_tuple(hash_id, kernel_name);
   g_path_ids[cubin_path] = result;
   return result;
+}
+
+std::string get_kernel_loader_variant(int64_t kernel_id) {
+  KernelData metadata = find_registered_kernel_data(kernel_id);
+  if (metadata.use_ldmatrix_s4) return "ldmatrix_s8_s4";
+  return metadata.use_packed_k_layout ? "packed_k_legacy" : "generic";
 }
 
 int64_t get_kernel_smem_size(int64_t kernel_id) {
@@ -413,6 +434,7 @@ COMMON_TORCH_LIBRARY(humming, m) {
   m.def("register_kernel(str cubin_path) -> (int, str)");
   m.def("register_process_input_kernel(str cubin_path) -> (int, str)");
   m.def("get_kernel_smem_size(int kernel_id) -> int");
+  m.def("get_kernel_loader_variant(int kernel_id) -> str");
   m.def(
       "launch_process_input(Tensor configs, Tensor inputs, Tensor(a!) outputs, "
       "Tensor(b!)? group_scales, Tensor(c!)? token_scales, Tensor? expert_tokens, "
@@ -433,6 +455,7 @@ COMMON_TORCH_LIBRARY_IMPL(humming, Undefined, m) {
   m.impl("register_kernel", COMMON_TORCH_BOX(&register_kernel));
   m.impl("register_process_input_kernel", COMMON_TORCH_BOX(&register_process_input_kernel));
   m.impl("get_kernel_smem_size", COMMON_TORCH_BOX(&get_kernel_smem_size));
+  m.impl("get_kernel_loader_variant", COMMON_TORCH_BOX(&get_kernel_loader_variant));
 };
 
 COMMON_TORCH_LIBRARY_IMPL(humming, Meta, m) {
