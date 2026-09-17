@@ -106,6 +106,7 @@ class MmaOpClassImpl:
             "",
             "CUDA_INLINE",
             f"static void fma(uint32_t *a, uint32_t *b, {reg_cd_type} *c, {reg_cd_type} *d) {{",
+            *[f"  d[{i}] = c[{i}];" for i in range(self.reg_cd_count)],
             *self.generate_ptx(indent=2).strip("\n").split("\n"),
             "};",
         ]
@@ -135,16 +136,18 @@ class MmaOpClassImpl:
         start = 0
         end = 0
         param_placeholders_list = []
-        counts = [self.reg_cd_count, self.reg_a_count, self.reg_b_count, self.reg_cd_count]
+        counts = [self.reg_cd_count, self.reg_a_count, self.reg_b_count]
         for i in range(len(counts)):
             end += counts[i]
             placeholder_str = ", ".join(f"%{x}" for x in range(start, end))
             param_placeholders_list.append("{" + placeholder_str + "}")
             start += counts[i]
+        # Keep C tied to D; merging equal C inputs can create partial register
+        # overlap that is miscompiled when MMA expands to multiple instructions.
+        param_placeholders_list.append(param_placeholders_list[0])
 
         a_params = []
         b_params = []
-        c_params = []
         d_params = []
         for i in range(self.reg_a_count):
             a_params.append(f' "r"(a[{i}])')
@@ -152,7 +155,6 @@ class MmaOpClassImpl:
             b_params.append(f' "r"(b[{i}])')
         for i in range(self.reg_cd_count):
             t = "f" if cd_dtype == "f32" else "r"
-            c_params.append(f' "{t}"(c[{i}])')
             d_params.append(f'"+{t}"(d[{i}])')
 
         asm_code = f"""
@@ -161,8 +163,7 @@ class MmaOpClassImpl:
           "{", ".join(param_placeholders_list)};\\n"
           : {", ".join(d_params)}
           : {", ".join(a_params)},
-            {", ".join(b_params)},
-            {", ".join(c_params)}
+            {", ".join(b_params)}
         );
         """
 
