@@ -19,7 +19,7 @@ venv/
 *.tar
 
 # Local files
-/tmp/
+**/tmp/
 *.ipynb
 .ipynb_checkpoints/
 
