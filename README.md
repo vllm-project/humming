@@ -37,8 +37,21 @@ Humming is a high-performance, lightweight, and highly flexible JIT (Just-In-Tim
 
 ### Installation
 
+```bash
+pip install humming-kernels
 ```
-pip install git+https://github.com/inclusionAI/humming.git
+
+To also install CUDA dependencies, choose the extra matching your PyTorch CUDA version:
+
+```bash
+pip install "humming-kernels[cu12]"  # CUDA 12
+pip install "humming-kernels[cu13]"  # CUDA 13
+```
+
+Or install from source:
+
+```bash
+pip install git+https://github.com/vllm-project/humming.git
 ```
 
 

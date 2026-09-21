@@ -1,13 +1,23 @@
 [build-system]
-requires = ["setuptools", "wheel", "setuptools_scm>=8"]
+requires = ["setuptools>=77.0.3", "wheel", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "humming-kernels"
 dynamic = ["version"]
-description = "Quantization GEMM Kernel"
+description = "JIT-compiled GPU GEMM kernels for quantized inference"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "Humming contributors"}]
+keywords = ["cuda", "gemm", "quantization", "inference"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.7",
     "triton",
@@ -18,6 +28,13 @@ dependencies = [
     "tqdm",
     "tabulate"
 ]
+
+[project.urls]
+Homepage = "https://github.com/vllm-project/humming"
+Source = "https://github.com/vllm-project/humming"
+Issues = "https://github.com/vllm-project/humming/issues"
+Documentation = "https://github.com/vllm-project/humming/tree/main/docs"
+"Release notes" = "https://github.com/vllm-project/humming/releases"
 
 [project.optional-dependencies]
 cu12 = [
