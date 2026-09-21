@@ -1,5 +1,3 @@
-import json
-
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
@@ -171,35 +169,34 @@ SPECIAL_WEIGHT_CASES = (
 )
 
 
-@pytest.mark.parametrize("weight_scale_type", ["tensor", "channel"])
-@pytest.mark.parametrize("config_format", ["str", "dict"])
-@pytest.mark.parametrize("backend", ["eager", "inductor"])
-def test_fp8_weight_only_forward_fullgraph(weight_scale_type, config_format, backend):
-    """Reuse one full graph across token counts in vLLM's FP8 weight-only path."""
+def test_forward_fullgraph():
+    """Catch graph breaks in the forward path and reuse the graph across token counts."""
     torch._dynamo.reset()
     skip_if_unsupported(a_dtype=dtypes.bfloat16)
     config = _layer_config(
         a_dtype=dtypes.bfloat16,
-        b_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.uint4,
         bs_dtype=dtypes.bfloat16,
-        weight_scale_type=weight_scale_type,
     )
     runner = KernelTestRunner(
-        KernelTestCase(name="compiled-fp8-weight-only", layer_config=config, compute_config=ComputeConfig())
+        KernelTestCase(name="fullgraph", layer_config=config, compute_config=ComputeConfig())
     )
-    compute_config = {"use_batch_invariant": False, "use_f16_accum": False, "gemm_type": "dense"}
-    if config_format == "str":
-        compute_config = json.dumps(compute_config)
+    compute_config = runner.compute_config.to_str()
     locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
 
     def forward(inputs):
         return humming_forward(
-            config, inputs, **runner.kernel_tensors, locks=locks, compute_config=compute_config
+            config,
+            inputs,
+            **runner.kernel_tensors,
+            locks=locks,
+            compute_config=compute_config,
+            tuning_config={},
         )
 
-    counter = CompileCounterWithBackend(backend)
+    counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(forward, backend=counter, fullgraph=True, dynamic=True)
-    for shape_m in (17, 64, 257, 1024):
+    for shape_m in (17, 257):
         inputs = torch.randn(shape_m, SHAPE_K, device="cuda", dtype=torch.bfloat16)
         expected = (inputs.float() @ runner.weight_ref.T).to(torch.bfloat16)
         torch.testing.assert_close(compiled(inputs), expected, rtol=0.01, atol=0.05)

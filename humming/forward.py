@@ -12,7 +12,13 @@ def _prepare_forward_configs(
     compute_config: dict | str | None,
     tuning_config: dict | list | str | None,
 ) -> tuple[str | None, str | None, bool]:
-    """Resolve static JSON configs outside Dynamo tracing, returning only scalars."""
+    """Constant-fold static config processing that Dynamo cannot trace.
+
+    Keep JSON parsing/serialization and similar config-only work here so
+    humming_forward supports full-graph capture. Return strings and scalar
+    metadata to avoid Dynamo guards on parsed dictionaries. Tensor- or
+    shape-dependent work must stay outside this helper.
+    """
     parsed_compute_config = compute_config
     if isinstance(parsed_compute_config, str) and parsed_compute_config:
         parsed_compute_config = json.loads(parsed_compute_config)
