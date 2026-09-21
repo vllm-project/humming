@@ -2,6 +2,7 @@ import json
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounterWithBackend
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, WeightScale2Type
@@ -174,7 +175,8 @@ SPECIAL_WEIGHT_CASES = (
 @pytest.mark.parametrize("config_format", ["str", "dict"])
 @pytest.mark.parametrize("backend", ["eager", "inductor"])
 def test_fp8_weight_only_forward_fullgraph(weight_scale_type, config_format, backend):
-    """Compile the public forward path used by vLLM's FP8 weight-only layers."""
+    """Reuse one full graph across token counts in vLLM's FP8 weight-only path."""
+    torch._dynamo.reset()
     skip_if_unsupported(a_dtype=dtypes.bfloat16)
     config = _layer_config(
         a_dtype=dtypes.bfloat16,
@@ -188,7 +190,6 @@ def test_fp8_weight_only_forward_fullgraph(weight_scale_type, config_format, bac
     compute_config = {"use_batch_invariant": False, "use_f16_accum": False, "gemm_type": "dense"}
     if config_format == "str":
         compute_config = json.dumps(compute_config)
-    inputs = torch.randn(17, SHAPE_K, device="cuda", dtype=torch.bfloat16)
     locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
 
     def forward(inputs):
@@ -196,9 +197,13 @@ def test_fp8_weight_only_forward_fullgraph(weight_scale_type, config_format, bac
             config, inputs, **runner.kernel_tensors, locks=locks, compute_config=compute_config
         )
 
-    expected = (inputs.float() @ runner.weight_ref.T).to(torch.bfloat16)
-    compiled = torch.compile(forward, backend=backend, fullgraph=True)
-    torch.testing.assert_close(compiled(inputs), expected, rtol=0.01, atol=0.05)
+    counter = CompileCounterWithBackend(backend)
+    compiled = torch.compile(forward, backend=counter, fullgraph=True, dynamic=True)
+    for shape_m in (17, 64, 257, 1024):
+        inputs = torch.randn(shape_m, SHAPE_K, device="cuda", dtype=torch.bfloat16)
+        expected = (inputs.float() @ runner.weight_ref.T).to(torch.bfloat16)
+        torch.testing.assert_close(compiled(inputs), expected, rtol=0.01, atol=0.05)
+    assert counter.frame_count == 1
 
 
 @pytest.mark.parametrize(
