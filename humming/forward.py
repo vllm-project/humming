@@ -7,6 +7,27 @@ from humming.config import LayerConfig, MmaType
 from humming.tune import get_heuristics_class
 
 
+@torch.compiler.assume_constant_result
+def _prepare_forward_configs(
+    compute_config: dict | str | None,
+    tuning_config: dict | list | str | None,
+) -> tuple[str | None, str | None, bool]:
+    """Resolve static JSON configs outside Dynamo tracing, returning only scalars."""
+    parsed_compute_config = compute_config
+    if isinstance(parsed_compute_config, str) and parsed_compute_config:
+        parsed_compute_config = json.loads(parsed_compute_config)
+
+    m_major_scale = False
+    if isinstance(parsed_compute_config, dict):
+        m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
+
+    if isinstance(compute_config, dict):
+        compute_config = json.dumps(compute_config)
+    if isinstance(tuning_config, (list, dict)):
+        tuning_config = json.dumps(tuning_config)
+    return compute_config, tuning_config, m_major_scale
+
+
 def _resolve_use_pdl(
     config: LayerConfig,
     inputs: torch.Tensor,
@@ -135,13 +156,7 @@ def humming_forward(
     hadamard_block_size: int | None = None,
     use_pdl: bool | None = None,
 ) -> torch.Tensor:
-    parsed_compute_config = compute_config
-    if isinstance(parsed_compute_config, str) and parsed_compute_config:
-        parsed_compute_config = json.loads(parsed_compute_config)
-
-    m_major_scale = False
-    if isinstance(parsed_compute_config, dict):
-        m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
+    compute_config, tuning_config, m_major_scale = _prepare_forward_configs(compute_config, tuning_config)
 
     unquantized_dtype = [torch.bfloat16, torch.float16, torch.float32]
     should_quantize = config.input_quant_mode.should_quantize
@@ -162,11 +177,6 @@ def humming_forward(
         )
         input_scale = group_scales if config.input_quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if config.input_quant_mode.has_secondary_scale else None
-
-    if isinstance(compute_config, dict):
-        compute_config = json.dumps(compute_config)
-    if isinstance(tuning_config, (list, dict)):
-        tuning_config = json.dumps(tuning_config)
 
     return ops.humming_gemm(
         layer_config=config.to_str(),
