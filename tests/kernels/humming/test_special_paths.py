@@ -179,7 +179,11 @@ def test_forward_fullgraph():
         bs_dtype=dtypes.bfloat16,
     )
     runner = KernelTestRunner(
-        KernelTestCase(name="fullgraph", layer_config=config, compute_config=ComputeConfig())
+        KernelTestCase(
+            name="fullgraph",
+            layer_config=config,
+            compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        )
     )
     compute_config = runner.compute_config.to_str()
     locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
