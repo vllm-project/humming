@@ -172,7 +172,7 @@ def test_moe_case_coverage():
 @pytest.mark.parametrize("use_stream_k", [False, True])
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
 def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype):
-    """Graph replay uses live expert offsets and leaves wholly unused tiles untouched."""
+    """Graph replay uses live expert offsets and leaves unused rows untouched."""
     skip_if_unsupported(a_dtype=dtypes.bfloat16)
     layer = LayerConfig(
         shape_n=512,
@@ -231,6 +231,4 @@ def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype):
             reference = (expert_input @ runner.weight_ref[expert].float().T).bfloat16()
             torch.testing.assert_close(output[start : start + count], reference, atol=0.01, rtol=0.01)
             start += count
-        # Keep the last partial tile to preserve the original reduction order.
-        tail_start = start + (-counts[-1]) % tuning["block_shape"][0]
-        assert (output[tail_start:] == -123).all()
+        assert (output[start:] == -123).all()

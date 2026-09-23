@@ -40,7 +40,6 @@ private:
   static constexpr int32_t ct_gcd(int32_t a, int32_t b) { return b == 0 ? a : ct_gcd(b, a % b); }
 
   uint32_t m_blocks;
-  uint32_t valid_m_blocks;
   uint32_t mn_blocks;
   uint32_t mnk_blocks;
 
@@ -170,8 +169,7 @@ public:
           if (index < kNumExperts) {
             uint32_t expert_tokens;
             if constexpr (kIsGroupedContiguousGemm) {
-              uint32_t next_offset =
-                  index + 1 < kNumExperts ? ctx.smem.expert_offset[index + 1] : ctx.params.shape_m;
+              uint32_t next_offset = ctx.smem.expert_offset[index + 1];
               expert_tokens = next_offset - ctx.smem.expert_offset[index];
               ctx.smem.expert_tokens[index] = expert_tokens;
             } else {
@@ -187,14 +185,6 @@ public:
 
       __syncthreads();
       m_blocks = ctx.smem.total_m_blocks[0];
-      if constexpr (kIsGroupedContiguousGemm) {
-        // Preserve the Stream-K partition while skipping unused buffer capacity.
-        uint32_t last_offset = ctx.smem.expert_offset[kNumExperts - 1];
-        uint32_t valid_end = ctx.smem.expert_offset[kNumExperts];
-        uint32_t last_capacity_blocks = CEIL_DIV(ctx.params.shape_m - last_offset, BlockShape::M);
-        uint32_t last_valid_blocks = CEIL_DIV(valid_end - last_offset, BlockShape::M);
-        valid_m_blocks = m_blocks - last_capacity_blocks + last_valid_blocks;
-      }
     }
   }
 
@@ -238,9 +228,6 @@ public:
 
     if constexpr (kIsIndexedGemm) {
       if (has_next_block) fetch_moe_index_block();
-    }
-    if constexpr (kIsGroupedContiguousGemm) {
-      if (has_next_block && m_block_id >= valid_m_blocks) return false;
     }
     if constexpr (kIsGroupedGemm) {
       if (has_next_block) fetch_moe_group_block();
