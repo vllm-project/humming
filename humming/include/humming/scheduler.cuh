@@ -19,7 +19,7 @@ private:
   static constexpr uint32_t kNumThreads = Ctx::kNumThreads;
   static constexpr uint32_t kNumMathThreads = Ctx::kNumMathThreads;
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = kNumThreads - kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = Ctx::kLoadThreadOffset;
   static constexpr uint32_t kMultiCastSizeA = Ctx::kMultiCastSizeA;
   static constexpr uint32_t kMultiCastSizeB = Ctx::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
@@ -111,6 +111,13 @@ public:
 
       streamk_mnk_total_iters = CEIL_DIV(streamk_mnk_blocks, kNumCtaGroups);
 
+      if constexpr (Ctx::kUseUmma) {
+        using ElementC = typename Ctx::ElementC;
+        constexpr uint32_t kMaxSlices = 1u << (ElementC::kMantissaBits / 2);
+        constexpr uint32_t kMinSliceIters = CEIL_DIV(K_BLOCKS - 1, kMaxSlices - 1);
+        streamk_mnk_total_iters = MAX(streamk_mnk_total_iters, kMinSliceIters);
+      }
+
       constexpr int32_t blocks_per_group = MAX(kMaxGroupSize / BlockShape::K, kAsBlocksPerWord);
       constexpr int32_t bpg = blocks_per_group > 1 ? blocks_per_group : 1;
       constexpr int32_t align_iters = bpg / ct_gcd(bpg, (int32_t)kNumStages) * (int32_t)kNumStages;
@@ -161,7 +168,7 @@ public:
       if constexpr (kUseCpAsync) cp_async_wait_group<0>();
       __syncthreads();
 
-      if (ctx.warp_id() == 0) {
+      if (threadIdx.x < 32) {
         uint32_t tmp_m_blocks = 0;
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < CEIL_DIV(kNumExperts, 32); i++) {
@@ -282,10 +289,28 @@ public:
     m_block_in_expert += delta_m_block_id;
 
     while (m_block_in_expert >= current_expert_m_blocks) {
-      m_block_in_expert -= current_expert_m_blocks;
-      expert_id++;
-      current_expert_num_tokens = ctx.smem.expert_tokens[expert_id];
-      current_expert_m_blocks = CEIL_DIV(current_expert_num_tokens, BlockShape::M);
+      uint32_t lane = threadIdx.x % 32;
+      uint32_t index = expert_id + lane;
+      uint32_t tokens = index < kNumExperts ? ctx.smem.expert_tokens[index] : 0;
+      uint32_t blocks = CEIL_DIV(tokens, BlockShape::M);
+      uint32_t prefix = blocks;
+      PRAGMA_UNROLL
+      for (uint32_t offset = 1; offset < 32; offset *= 2) {
+        uint32_t preceding = __shfl_up_sync(0xffffffff, prefix, offset);
+        if (lane >= offset) prefix += preceding;
+      }
+      uint32_t matches = __ballot_sync(0xffffffff, m_block_in_expert < prefix);
+      if (matches) {
+        uint32_t selected_lane = __ffs(matches) - 1;
+        m_block_in_expert -= __shfl_sync(0xffffffff, prefix - blocks, selected_lane);
+        current_expert_num_tokens = __shfl_sync(0xffffffff, tokens, selected_lane);
+        current_expert_m_blocks = __shfl_sync(0xffffffff, blocks, selected_lane);
+        expert_id += selected_lane;
+        break;
+      }
+      m_block_in_expert -= __shfl_sync(0xffffffff, prefix, 31);
+      expert_id += 32;
+      current_expert_m_blocks = 0;
     }
 
     old_m_block_id = m_block_id;
@@ -305,11 +330,13 @@ public:
   CUDA_INLINE
   void fetch_moe_index_block() {
     expert_id = ctx.params.expert_ids_ptr[m_block_id];
-    if (kUseWarpSpec && ctx.is_math_thread()) return;
+    if (kUseWarpSpec && !ctx.is_load_thread()) return;
 
     const uint32_t *gmem_ptr = ctx.params.sorted_ids_ptr + m_block_id * BlockShape::M;
     const int4 *gmem_ptr_load = reinterpret_cast<const int4 *>(gmem_ptr);
-    int4 *smem_ptr_load = reinterpret_cast<int4 *>(ctx.smem.wr_row_index);
+    uint32_t *wr_row_index = ctx.get_wr_row_index();
+    uint32_t *rd_row_index = ctx.get_rd_row_index();
+    int4 *smem_ptr_load = reinterpret_cast<int4 *>(wr_row_index);
 
     legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumLoadThreads, kLoadThreadOffset>(gmem_ptr_load, smem_ptr_load);
     if constexpr (kUseCpAsync) cp_async_commit_group();
@@ -318,13 +345,13 @@ public:
     ctx.sync_load_threads();
 
     uint32_t thread_id = threadIdx.x;
-    if constexpr (kUseWarpSpec) thread_id = thread_id - kNumMathThreads;
+    if constexpr (kUseWarpSpec) thread_id = ctx.load_thread_id();
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
       uint32_t index = kNumLoadThreads * i + thread_id;
       if (index < BlockShape::M) {
-        uint32_t idx = ctx.smem.wr_row_index[index];
-        ctx.smem.rd_row_index[index] = idx / ctx.params.top_k;
+        uint32_t idx = wr_row_index[index];
+        rd_row_index[index] = idx / ctx.params.top_k;
       };
     }
 
@@ -334,10 +361,10 @@ public:
   CUDA_INLINE
   void update_tensor_map_c() {
     if constexpr (kIsGroupedGemm && Ctx::kUseTmaC) {
-      if (threadIdx.x < 32) {
+      if (ctx.math_thread_id() < 32 && ctx.is_math_thread()) {
         tma_wait_store_group<0>();
         __syncwarp();
-        if (threadIdx.x == 0) {
+        if (ctx.math_thread_id() == 0) {
           tensor_map_replace_global_dim<1>(ctx.smem.tensor_map_buffer, current_shape_m);
           ctx.params.tensor_map_buffer[blockIdx.x] = ctx.smem.tensor_map_buffer[0];
           tensor_map_release_cta();
