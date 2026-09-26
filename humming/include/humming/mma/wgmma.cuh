@@ -2,7 +2,6 @@
 
 #include <humming/utils/all.cuh>
 
-
 template <uint32_t swizzle_bytes = 128>
 CUDA_INLINE uint64_t make_wgmma_smem_desc(uint32_t addr) {
   static_assert(swizzle_bytes == 128 || swizzle_bytes == 64);
@@ -34,6 +33,7 @@ public:
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
   static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
+  static constexpr bool kUseSharedASPromotion = Ctx::kUseSharedASPromotion;
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kSwizzleBytes = ElementA::kBits * BlockShape::K >= 1024 ? 128 : 64;
@@ -51,6 +51,7 @@ public:
   typename MmaOpClass::BRegisters regs_b[2][kUsePackedKLayout ? 1 : (WarpShape::N * 4 / MmaShape::N / kPackedKFactor)][kRegsBKDim];
   alignas(16) CRegistersArrayType regs_c[2];
   uint32_t smem_offset = 0;
+  uint32_t m_scale_offset = 0;
 
   CUDA_INLINE
   WGMMA(Ctx &ctx, ArithClass &arith)
@@ -65,6 +66,11 @@ public:
     smem_offset += (col_offset % kSwizzleSizeK) * ElementA::kBits / 128;
     smem_offset += (col_offset / kSwizzleSizeK) * (BlockShape::M * kSwizzleBytes / 16);
     smem_offset = smem_offset * sizeof(int4);
+  }
+
+  CUDA_INLINE void set_m_scale_offset(uint32_t value) {
+    // Grouped M-major scale tiles carry four rows of alignment padding.
+    m_scale_offset = value % 4;
   }
 
   CUDA_INLINE
@@ -107,7 +113,7 @@ public:
   };
 
   CUDA_INLINE
-  void run(uint32_t stage_id, uint32_t iter_id) {
+  void issue(uint32_t stage_id, uint32_t iter_id) {
     static_assert(WarpShape::M == MmaShape::M);
     static_assert(kPartMmaShapeK == MmaShape::K);
     uint32_t buffer_id = iter_id % 2;
@@ -145,8 +151,55 @@ public:
     }
 
     wgmma_commit();
+  };
+
+  CUDA_INLINE
+  void wait_and_promote(uint32_t stage_id, uint32_t iter_id) {
+    constexpr uint32_t kNumIters = kUsePackedKLayout ? 1 : (WarpShape::N / (MmaShape::N / 4) / kPackedKFactor);
+    constexpr uint32_t kRunKLoop = kUsePackedKLayout ? kNumKSlabs : kPackedKFactor;
+
+    uint32_t delta_m = kUsePackedKLayout ? iter_id : 0;
+    uint32_t delta_j = final_regs_c_index() == 0 ? delta_m : 0;
+
     wgmma_wait<0>();
     may_fence_regs(delta_j);
+
+    if constexpr (kUseSharedASPromotion) {
+      static_assert(Ctx::kUseFusedE8m0Scale);
+      static_assert(Ctx::kUseMMajorInputScale);
+      static_assert(Ctx::kInputScaleGroupSize == 128);
+      static_assert(Ctx::kWeightScaleGroupSize == 32);
+      static_assert(!kUsePackedKLayout);
+      static_assert(MmaShape::K == 32 && WarpShape::K == 128);
+      static_assert(WarpShape::M == MmaShape::M);
+      static_assert(WarpShape::N * 4 == MmaShape::N);
+
+      // A single activation scale covers the four K32 issues in this K128
+      // stage.  Reading it here removes two 32-float ping-pong fragments from
+      // the math warpgroup's live set.  The row mapping is exactly the one in
+      // S2RMemoryLoaderAS for transposed WGMMA + M-major grouped scales.
+      if (iter_id == Ctx::kWarpIters - 1) {
+        const uint32_t lane = ctx.lane_id();
+        const uint32_t sub_row = (lane % 4) * 2;
+        const uint32_t m_base =
+            ctx.m_warp_offset() + m_scale_offset;
+        const float *scale = reinterpret_cast<const float *>(
+            ctx.smem.stages[stage_id].as);
+        float2 *partial = reinterpret_cast<float2 *>(regs_c[0][0][0]);
+        float2 *final = reinterpret_cast<float2 *>(regs_c[1][0][0]);
+
+        PRAGMA_UNROLL
+        for (uint32_t index = 0;
+             index < MmaShape::M * 16 / 64; ++index) {
+          const uint32_t scale_pair = index / 2;
+          const float as_0 = scale[m_base + scale_pair * 8 + sub_row + 0];
+          const float as_1 = scale[m_base + scale_pair * 8 + sub_row + 1];
+          final[index].x += as_0 * partial[index].x;
+          final[index].y += as_1 * partial[index].y;
+        }
+      }
+      return;
+    }
 
     PRAGMA_UNROLL
     for (uint32_t k = 0; k < kRunKLoop; k++) {
@@ -155,6 +208,12 @@ public:
         arith.may_apply_as_and_bs_on_wgmma_c(regs_c_as_ptr(), j, k, iter_id, delta_m);
       }
     }
+  };
+
+  CUDA_INLINE
+  void run(uint32_t stage_id, uint32_t iter_id) {
+    issue(stage_id, iter_id);
+    wait_and_promote(stage_id, iter_id);
   };
 
   CUDA_INLINE void may_fence_regs(uint32_t delta_j) {

@@ -71,6 +71,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr uint32_t kWarpIters = kUsePackedKLayout ? (WarpShape::N / 16) : (WarpShape::K / kPartMmaShapeK);
 
   static constexpr uint32_t kUseWarpSpec = TuningConfig_::kUseWarpSpec;
+  static constexpr bool kUseSharedASPromotion = TuningConfig_::kUseSharedASPromotion;
   static constexpr uint32_t kNumThreads = TuningConfig_::kNumThreads;
   static constexpr uint32_t kNumMathThreads = TuningConfig_::kNumMathThreads;
   static constexpr uint32_t kNumLoadThreads = TuningConfig_::kNumLoadThreads;

@@ -462,6 +462,10 @@ class TuningConfig(BaseHummingConfig):
     use_pdl: bool = False
     raster_group_m: int = 1
 
+    # Warp-specialized scheduling and GS128 scale-promotion/mainloop policies.
+    use_flat_grouped_raster: bool = False
+    use_shared_as_promotion: bool = False
+
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "num_threads",
         "num_math_threads",
@@ -475,6 +479,7 @@ class TuningConfig(BaseHummingConfig):
         "use_tma_bs": "kUseTmaBS",
         "use_tma_bs2": "kUseTmaBS2",
         "use_tma_bzp": "kUseTmaBZP",
+        "use_shared_as_promotion": "kUseSharedASPromotion",
     }
 
     def __post_init__(self):

@@ -84,6 +84,7 @@ def estimate_smem_size_layer(
     reduce_overlap_last_stage_only: bool = False,
     use_mbarrier: bool = False,
     use_warp_spec: bool = False,
+    use_flat_grouped_raster: bool = False,
     num_write_splits: int = 1,
     mma_accum_bits: int = 32,
 ) -> int:
@@ -157,6 +158,8 @@ def estimate_smem_size_layer(
     elif gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED):
         add(128, 64)  # tensor_map_buffer[1] (CUtensorMap)
         add(layer_config.num_experts * 4, 4)  # expert_tokens
+        if use_flat_grouped_raster:
+            add((layer_config.num_experts + 1) * 4, 4)  # expert_m_block_offset
         add(4, 4)  # total_m_blocks
         if gemm_type == GemmType.GROUPED_CONTIGUOUS:
             add((layer_config.num_experts + 1) * 4, 4)  # expert_offset
@@ -196,6 +199,7 @@ def estimate_smem_size_config(
         reduce_overlap_last_stage_only=tuning_config.reduce_overlap_last_stage_only,
         use_mbarrier=bool(tuning_config.use_mbarrier),
         use_warp_spec=bool(tuning_config.use_warp_spec),
+        use_flat_grouped_raster=tuning_config.use_flat_grouped_raster,
         num_write_splits=tuning_config.num_write_splits,
         mma_accum_bits=16 if compute_config.use_f16_accum else 32,
     )

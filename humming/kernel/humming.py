@@ -30,11 +30,11 @@ CODE_TEMPLATE = jinja2.Template("""
 
 {{tuning_config_macro}}
 
-#if {{use_warp_spec}}
+{% if use_warp_spec %}
 #include <humming/kernel/humming_ws.cuh>
-#else
+{% else %}
 #include <humming/kernel/humming.cuh>
-#endif
+{% endif %}
 
 class MmaOpClass {
 public:
@@ -463,6 +463,21 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         assert self.gemm_type is not None, "gemm_type must be specify for MoE GEMM"
+        if self.use_flat_grouped_raster:
+            assert self.use_warp_spec and self.is_grouped_contiguous_gemm
+            assert not self.use_stream_k
+            assert self.multi_cast_size_a == self.multi_cast_size_b == 1
+            assert self.raster_group_m == 1
+        if self.use_shared_as_promotion:
+            assert self.use_warp_spec and self.mma_type == MmaType.WGMMA
+            assert self.use_m_major_input_scale and not self.use_packed_k_layout
+            assert self.use_fused_e8m0_scale
+            assert self.a_dtype == dtypes.float8e4m3
+            assert self.b_dtype == dtypes.float4e2m1
+            assert self.as_dtype == dtypes.float32
+            assert self.bs_dtype == dtypes.float8e8m0
+            assert self.input_scale_group_size == 128
+            assert self.weight_scale_group_size == 32
         if self.reduce_overlap_last_stage_only:
             assert not self.is_indexed_gemm, "reduce_overlap_last_stage_only does not support indexed GEMM"
 

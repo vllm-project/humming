@@ -61,7 +61,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       MmaOpClass, ProblemShape, BlockShape, WarpShape, PadShape,
       ElementA, ElementB, ElementC, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
-  using Scheduler = Scheduler<Ctx>;
+  using KernelScheduler = Scheduler<Ctx>;
   using ProducerPipeline = ProducerPipeline<Ctx>;
   using ConsumerPipeline = ConsumerPipeline<Ctx>;
   using MainloopArithmetic = MainloopArithmetic<Ctx>;
@@ -72,6 +72,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr uint32_t kAccumulatorRegistersPerThread = sizeof(typename MMA::CRegistersArrayType) / sizeof(uint32_t) * (MMA::final_regs_c_index() + 1);
   constexpr bool kUseRegisterReallocation = TuningConfig::kNumMathThreads > 128 || ProblemShape::K > BlockShape::K * 16;
   constexpr bool kUseTwoStageReduceBarrier = SharedStorage::kUseTwoStageReduceBarrier;
+  static_assert(!TuningConfig::kUseFlatGroupedRaster || Ctx::kIsGroupedContiguousGemm);
+  static_assert(!TuningConfig::kUseSharedASPromotion || Ctx::kUseWgmma);
   static_assert(Ctx::kWarpIters >= 2, "warp-specialized mainloop requires at least two warp iterations");
 
   extern __shared__ int4 shared_memory[];
@@ -86,7 +88,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       tensor_map_buffer, locks};
   auto ctx = Ctx(smem, params);
 
-  auto scheduler = Scheduler(ctx);
+  auto scheduler = KernelScheduler(ctx);
   if (ctx.is_load_thread()) ProducerPipeline::init_mbarrier(ctx);
 
   mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
@@ -134,7 +136,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         if constexpr (kNumStages == 2) {
           producer.load_stage(stage_id, remaining_iters > kNumStages);
         } else {
-          producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+          constexpr uint32_t target_stage = TuningConfig::kUseFlatGroupedRaster
+              ? (stage_id + kNumStages - 1) % kNumStages
+              : stage_id + kNumStages - 1;
+          producer.load_stage(target_stage, remaining_iters >= kNumStages);
         }
       };
 
@@ -181,6 +186,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
     while (scheduler.get_next_block()) {
       debug_kernel_timeout_check(debug_start_clock);
+      if constexpr (TuningConfig::kUseSharedASPromotion)
+        mma.set_m_scale_offset(scheduler.m_offset);
       mma.zero_accum();
 
       uint32_t &slice_iters = scheduler.slice_iters;
@@ -221,10 +228,17 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
               consumer.wait_stage((stage_id + 1) % kNumStages);
             }
             s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
-            mma.run(stage_id, warp_iter_id);
+            if constexpr (TuningConfig::kUseSharedASPromotion) {
+              // Convert the next B fragment while this WGMMA is in flight.
+              mma.issue(stage_id, warp_iter_id);
+            } else {
+              mma.run(stage_id, warp_iter_id);
+            }
             mma.transform_b(
                 (warp_iter_id + 1) % 2,
                 (warp_iter_id + 1) % Ctx::kWarpIters);
+            if constexpr (TuningConfig::kUseSharedASPromotion)
+              mma.wait_and_promote(stage_id, warp_iter_id);
             if (warp_iter_id == Ctx::kWarpIters - 1) consumer.arrive(stage_id);
           }
         }

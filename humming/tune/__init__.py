@@ -19,6 +19,7 @@ from humming.tune.sm90_h20 import Sm90H20Heuristics
 from humming.tune.sm100 import Sm100Heuristics
 from humming.tune.sm120 import Sm120Heuristics
 from humming.tune.sm121 import Sm121Heuristics
+from humming.tune.sm90_policies import apply_w4a8_config, specialize_w4a8_ranges
 
 heuristics_map: dict[int, type[DeviceHeuristics]] = {
     75: Sm75Heuristics,
@@ -91,6 +92,17 @@ def _apply_raster_group_m(config: dict, layer_config, gemm_type) -> None:
         pass
 
 
+def _apply_common_overrides(
+    config: dict,
+    layer_config: LayerConfig,
+    use_m_major_input_scale: bool,
+    gemm_type: GemmType,
+) -> None:
+    _apply_m_major_input_scale(config, use_m_major_input_scale, layer_config, gemm_type)
+    _disable_indexed_input_scale_tma(config, gemm_type)
+    _apply_raster_group_m(config, layer_config, gemm_type)
+
+
 @functools.lru_cache(maxsize=1024)
 def _get_heuristics_config(
     layer_config: LayerConfig,
@@ -117,22 +129,19 @@ def _get_heuristics_config(
             use_batch_invariant=use_batch_invariant,
             gemm_type=gemm_type,
         )
-        _apply_m_major_input_scale(config, use_m_major_input_scale, layer_config, gemm_type)
-        _disable_indexed_input_scale_tma(config, gemm_type)
-        _apply_raster_group_m(config, layer_config, gemm_type)
+        _apply_common_overrides(config, layer_config, use_m_major_input_scale, gemm_type)
+        apply_w4a8_config(config, layer_config, use_m_major_input_scale, gemm_type, shape_m)
         return config
-    else:
-        configs = heuristics_cls.get_configs(
-            layer_config=layer_config,
-            use_f16_accum=use_f16_accum,
-            use_batch_invariant=use_batch_invariant,
-            gemm_type=gemm_type,
-        )
-        for entry in configs:
-            _apply_m_major_input_scale(entry[2], use_m_major_input_scale, layer_config, gemm_type)
-            _disable_indexed_input_scale_tma(entry[2], gemm_type)
-            _apply_raster_group_m(entry[2], layer_config, gemm_type)
-        return configs
+
+    configs = heuristics_cls.get_configs(
+        layer_config=layer_config,
+        use_f16_accum=use_f16_accum,
+        use_batch_invariant=use_batch_invariant,
+        gemm_type=gemm_type,
+    )
+    for _, _, config in configs:
+        _apply_common_overrides(config, layer_config, use_m_major_input_scale, gemm_type)
+    return specialize_w4a8_ranges(configs, layer_config, use_m_major_input_scale, gemm_type)
 
 
 def get_heuristics_config(
