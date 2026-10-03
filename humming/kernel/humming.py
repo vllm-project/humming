@@ -17,6 +17,7 @@ from humming.config import (
     TuningConfig,
 )
 from humming.config.config import _cuda_compiler_version
+from humming.config.mma import get_default_mma_type
 from humming.device import current_device, get_device_index
 from humming.jit.runtime import KernelRuntime
 from humming.tune import get_heuristics_config
@@ -117,6 +118,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     def __post_init__(self):
         LayerConfig.__post_init__(self)
         ComputeConfig.__post_init__(self)
+        self.mma_type = MmaType(self.mma_type) if self.mma_type is not None else get_default_mma_type(self)
         self.use_umma_pipeline = self.mma_type == MmaType.UMMA
         if self.use_umma_pipeline:
             self.use_warp_spec = True
@@ -247,7 +249,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert mma_shape_k % group == 0
             scale_vec = mma_shape_k // group
 
-            self.mma_b_dtype = self.b_dtype if self.mxmma_native_mixed else self.a_dtype
+            use_native_weight = self.use_raw_weight or self.mxmma_native_mixed
+            self.mma_b_dtype = self.b_dtype if use_native_weight else self.a_dtype
             sf_dtype = (
                 self.bs_dtype
                 if self.is_group_weight_scale or self.is_block_weight_scale
@@ -314,7 +317,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             and self.a_dtype.num_bits <= 8
             and self.b_dtype.is_floating_point_type
         )
-        self.mma_b_dtype = self.b_dtype if mma_native_mixed or umma_native_mixed else self.a_dtype
+        use_native_weight = self.use_raw_weight or mma_native_mixed or umma_native_mixed
+        self.mma_b_dtype = self.b_dtype if use_native_weight else self.a_dtype
 
         scale_dtype = dtypes.float8e8m0
         if self.is_group_input_scale:
@@ -452,13 +456,26 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
                 assert self.a_dtype in allowed_f16_dtypes
 
     def check_config(self):
+        is_low_bit_mma = self.mma_type == MmaType.MMA and self.a_dtype.num_bits < 16
+        has_canonical_group_scales = self.is_group_weight_scale and not self.use_fused_e8m0_scale
+        if is_low_bit_mma and has_canonical_group_scales and not current_device.is_ppu:
+            assert self.block_shape[1] >= 64, "MMA group scales require block_n >= 64"
+        if self.use_block_scaled_mma:
+            assert not self.use_f16_accum, "block-scaled layers require FP32 accumulation"
+            expected_mma = MmaType.MXMMA if self.sm_version // 10 == 12 else MmaType.UMMA
+            assert self.mma_type == expected_mma, "MMA type must support the layer's block-scaled layout"
+        if self.mma_type == MmaType.UMMA:
+            assert self.is_umma_supported, "UMMA does not support these layer parameters"
+            assert _cuda_compiler_version(self._get_compiler()) >= (12, 9)
+        if self.mma_type == MmaType.WGMMA:
+            assert self.sm_version == 90, "WGMMA requires SM90"
+        if self.use_raw_weight and self.a_dtype.num_bits != self.b_dtype.num_bits:
+            assert self.mma_type == MmaType.UMMA, "mixed raw weights require UMMA SS"
         assert self.num_threads <= 1024
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         if self.mma_type != MmaType.UMMA:
-            assert self.umma_cta_group_size == 1 and self.umma_output_chunk_rows == 0, (
-                "UMMA cooperative execution and chunked output require mma_type=umma"
-            )
+            assert self.umma_cta_group_size == 1, "UMMA cooperative execution requires mma_type=umma"
         if self.use_umma_ss:
             assert self.use_tma_b, "SS weight operands require TMA loading"
         if self.mma_type == MmaType.UMMA:
@@ -523,14 +540,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert block_k * self.a_dtype.num_bits >= 512, (
                 "UMMA requires at least 64 bytes per activation row"
             )
-            assert self.num_write_splits == 1, "UMMA requires num_write_splits == 1"
             assert self.num_stages >= 2
             assert self.multi_cast_size_a == self.multi_cast_size_b == 1
             assert self.umma_cta_group_size in (1, 2)
-            assert self.umma_output_chunk_rows in (0, 32)
             if self.umma_cta_group_size == 2:
                 assert block_m % 16 == 0, "two-CTA UMMA requires block M divisible by 16"
-                assert self.umma_output_chunk_rows == 32
                 assert self.problem_shape[1] % (2 * block_n) == 0
                 assert self.num_ctas_per_sm == 1
 
@@ -586,13 +600,22 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert not self.use_tma_as, "indexed GEMM does not support TMA input scale loads"
             assert not self.use_tma_as2, "indexed GEMM does not support TMA secondary input scale loads"
 
+        # The scheduler maps multicast CTAs along one axis. Across M, MoE
+        # clusters can cross expert boundaries and therefore cannot share B.
+        assert self.multi_cast_size_a == 1 or self.multi_cast_size_b == 1, (
+            "simultaneous A and B multicast is unsupported"
+        )
+        if self.multi_cast_size_b > 1:
+            assert self.gemm_type == GemmType.DENSE, "B multicast requires dense GEMM"
         if self.multi_cast_size_a * self.multi_cast_size_b > 1:
+            assert self.use_warp_spec, "multicast requires warp specialization"
             assert self.sm_version == 90 or self.sm_version // 10 in (10, 11)
 
         if self.use_tma_as:
             assert self.use_m_major_input_scale, "use_tma_as requires use_m_major_input_scale=True"
 
         if self.use_packed_k_layout:
+            assert self.mma_type == MmaType.WGMMA, "packed-K weights require WGMMA"
             warp_k = self.warp_shape[2]
             assert warp_k == 128, "use_packed_k_layout requires warp_k=128"
             # Fused weight scales are applied to each B slab before WGMMA.

@@ -53,12 +53,22 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kIsGroupedMaskedGemm = ComputeConfig::kGemmType == GemmType::GROUPED_MASKED;
   static constexpr bool kIsGroupedGemm = kIsGroupedContiguousGemm || kIsGroupedMaskedGemm;
 
-  static constexpr bool kUseWmma = LayerConfig::kMmaType == MmaType::MMA;
-  static constexpr bool kUseUmma = LayerConfig::kMmaType == MmaType::UMMA;
-  static constexpr bool kUseWgmma = LayerConfig::kMmaType == MmaType::WGMMA;
-  static constexpr bool kUseMxmma = LayerConfig::kMmaType == MmaType::MXMMA;
+  static constexpr bool kUseWmma = TuningConfig::kMmaType == MmaType::MMA;
+  static constexpr bool kUseUmma = TuningConfig::kMmaType == MmaType::UMMA;
+  static constexpr bool kUseWgmma = TuningConfig::kMmaType == MmaType::WGMMA;
+  static constexpr bool kUseWgmmaSs = kUseWgmma && LayerConfig::kUseRawWeight;
+  static constexpr bool kUseWgmmaTmaNPermute = kUseWgmmaSs && TuningConfig::kUseTmaB;
+  static constexpr bool kUseWgmmaTmaKPack = kUseWgmmaTmaNPermute;
+  static constexpr bool kUseWgmmaTmaAPack = kUseWgmma && TuningConfig::kUseTmaA && ElementA::kBits >= 8 && !kIsIndexedGemm &&
+      (ProblemShape::K - PadShape::K) * ElementA::kBits % 1024 == 0 && BlockShape::K * ElementA::kBits > 1024;
+  static constexpr bool kUseWgmmaCpAsyncNPermute =
+      kUseWgmmaSs && !TuningConfig::kUseTmaB && TuningConfig::kUseCpAsync && WarpShape::N > 16;
+  static constexpr bool kUseWgmmaSsNLayout = kUseWgmmaSs && !kUseWgmmaTmaNPermute && !kUseWgmmaCpAsyncNPermute;
+  static constexpr bool kUseMxmma = TuningConfig::kMmaType == MmaType::MXMMA;
 
   static constexpr bool kUseBlockScaledMma = LayerConfig::kUseBlockScaledMma;
+  static constexpr bool kUseMmaGroupScaleLayout1 = !USE_PPU && kUseWmma && ElementA::kBits < 16 &&
+                                                   LayerConfig::kIsGroupWeightScale && !LayerConfig::kUseFusedE8m0Scale;
   static constexpr bool kUseUmmaSplitLoads = false;
   static constexpr bool kUseUmmaSeparateInputScale = false;
   static constexpr bool kUseUmmaAsyncActivationLoads = false;
@@ -68,8 +78,8 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static_assert(!kUsePackedKLayout || WarpShape::K == 128);
   static constexpr uint32_t kPackedKFactor = kUsePackedKLayout ? 2 : 1;
   static constexpr bool kUsePackedLateAS = kUseWgmma && kUsePackedKLayout && WarpShape::N == 16 &&
-      LayerConfig::kUseFusedE8m0Scale && ElementA::kBits == 8 && ElementA::kIsFloatingPointType && MmaOpClass::kCTypeBits == 32 &&
-      LayerConfig::kInputScaleGroupSize == 128 && ComputeConfig::kUseMMajorInputScale;
+                                           LayerConfig::kUseFusedE8m0Scale && ElementA::kBits == 8 && ElementA::kIsFloatingPointType && MmaOpClass::kCTypeBits == 32 &&
+                                           LayerConfig::kInputScaleGroupSize == 128 && ComputeConfig::kUseMMajorInputScale;
 
 
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
@@ -119,6 +129,10 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   CUDA_INLINE uint32_t k_warp_id() { return K_WARPS == 1 ? 0 : (warp_id() / (M_WARPS * N_WARPS)); }
 
   CUDA_INLINE uint32_t m_warp_offset() { return m_warp_id() * WarpShape::M; }
+  // N16 fragment index in the contiguous SS accumulator layout.
+  CUDA_INLINE uint32_t wgmma_ss_n_tile(uint32_t fragment) {
+    return n_warp_id() / 4 * (WarpShape::N / 16 * 4) + n_warp_id() % 4 + fragment * 4;
+  }
   CUDA_INLINE uint32_t n_warp_offset() { return n_warp_id() * WarpShape::N; }
   CUDA_INLINE uint32_t k_warp_offset() { return k_warp_id() * WarpShape::K; }
 
@@ -140,7 +154,6 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
   using TuningConfig = typename Base::TuningConfig;
   static_assert(BlockShape::M == WarpShape::M, "UMMA requires block M to equal warp M");
   static_assert(BlockShape::K == WarpShape::K, "UMMA requires block K to equal warp K");
-  static_assert(TuningConfig::kNumWriteSplits == 1, "UMMA requires num_write_splits == 1");
   static constexpr bool kHasStageWeightScale = Base::kIsGroupWeightScale || Base::kIsBlockWeightScale;
   static constexpr bool kCanSplitWeightScaleLoad = !kHasStageWeightScale || Base::kUseTmaBS;
   static constexpr bool kCanSplitZeroPointLoad =

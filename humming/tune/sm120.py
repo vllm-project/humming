@@ -2,6 +2,7 @@ import math
 
 from humming import dtypes
 from humming.config import GemmType, MmaType
+from humming.config.mma import get_default_mma_type
 from humming.device import current_device
 from humming.tune.sm8x import Sm89Heuristics
 from humming.utils.math import round_up
@@ -33,7 +34,8 @@ class Sm120Heuristics(Sm89Heuristics):
         num_ctas_per_sm: int,
     ) -> int:
         block_shape_m, block_shape_n = block_shape
-        unsupported = gemm_type != GemmType.DENSE or layer_config.mma_type not in (MmaType.MMA, MmaType.MXMMA)
+        mma_type = get_default_mma_type(layer_config)
+        unsupported = gemm_type != GemmType.DENSE or mma_type not in (MmaType.MMA, MmaType.MXMMA)
         unsuitable_m = block_shape_m <= 16 or shape_m <= block_shape_m <= 32
         if unsupported or unsuitable_m:
             return block_shape_m
@@ -318,7 +320,7 @@ class Sm120Heuristics(Sm89Heuristics):
                 smem_reuse_mode=candidate.get("smem_reuse_mode", "all_stages"),
                 use_mbarrier=True,
                 use_warp_spec=candidate.get("use_warp_spec", False),
-                num_write_splits=candidate.get("num_write_splits", 1),
+                output_chunk_rows=candidate.get("output_chunk_rows", 0),
             )
             if smem <= cls.max_smem_size:
                 candidate["num_stages"] = num_stages
@@ -368,7 +370,7 @@ class Sm120Heuristics(Sm89Heuristics):
                 smem_reuse_mode=smem_reuse_mode,
                 use_mbarrier=True,
                 use_warp_spec=config["use_warp_spec"],
-                num_write_splits=config.get("num_write_splits", 1),
+                output_chunk_rows=config.get("output_chunk_rows", 0),
             )
             if smem <= cls.max_smem_size:
                 best = num_stages

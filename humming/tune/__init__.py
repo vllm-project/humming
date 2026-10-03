@@ -1,8 +1,10 @@
 import functools
+import os
 
 import torch
 
 from humming.config import GemmType, LayerConfig
+from humming.config.mma import get_default_mma_type
 from humming.device import DeviceInfo, get_device_index
 from humming.tune.base import DeviceHeuristics
 from humming.tune.ppu_sm80 import PPUSm80Heuristics
@@ -101,6 +103,7 @@ def _get_heuristics_config(
     use_m_major_input_scale: bool = False,
     gemm_type: str | GemmType | None = "dense",
     device_index: int = 0,
+    is_heuristic_test: bool = False,
 ):
     if gemm_type is None:
         if layer_config.num_experts:
@@ -108,6 +111,9 @@ def _get_heuristics_config(
         gemm_type = GemmType.DENSE
     if isinstance(gemm_type, str):
         gemm_type = GemmType(gemm_type)
+
+    if use_f16_accum and layer_config.use_block_scaled_mma:
+        raise ValueError("block-scaled layers require FP32 accumulation")
 
     heuristics_cls = get_heuristics_class(device=device_index)
     if isinstance(shape_m, int):
@@ -118,6 +124,7 @@ def _get_heuristics_config(
             use_batch_invariant=use_batch_invariant,
             gemm_type=gemm_type,
         )
+        config.setdefault("mma_type", get_default_mma_type(layer_config).value)
         _apply_m_major_input_scale(config, use_m_major_input_scale, layer_config, gemm_type)
         _disable_indexed_input_scale_tma(config, gemm_type)
         _apply_raster_group_m(config, layer_config, gemm_type)
@@ -131,6 +138,7 @@ def _get_heuristics_config(
             gemm_type=gemm_type,
         )
         for entry in configs:
+            entry[2].setdefault("mma_type", get_default_mma_type(layer_config).value)
             _apply_m_major_input_scale(entry[2], use_m_major_input_scale, layer_config, gemm_type)
             _disable_indexed_input_scale_tma(entry[2], gemm_type)
             _apply_raster_group_m(entry[2], layer_config, gemm_type)
@@ -147,6 +155,9 @@ def get_heuristics_config(
     device: int | torch.device | None = None,
 ):
     device_index = get_device_index(device)
+    # Backend heuristics inspect the test environment; keep their cache entries separate.
+    default_test_source = "heuristic" if "PYTEST_CURRENT_TEST" in os.environ else ""
+    is_heuristic_test = os.environ.get("HUMMING_TEST_TUNING_SOURCE", default_test_source) == "heuristic"
     with torch.cuda.device(device_index):
         if isinstance(layer_config, dict):
             layer_config = LayerConfig(**layer_config)
@@ -159,4 +170,5 @@ def get_heuristics_config(
             use_m_major_input_scale,
             gemm_type,
             device_index,
+            is_heuristic_test,
         )

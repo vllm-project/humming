@@ -2,7 +2,8 @@ import pytest
 import torch
 
 from humming import dtypes, ops
-from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
+from humming.config import ComputeConfig, GemmType, LayerConfig
+from humming.config.mma import get_default_mma_type
 from humming.kernel.humming import HummingKernel
 from humming.testing import (
     KernelTestCase,
@@ -56,6 +57,53 @@ def _case(
 
 
 MOE_CASES = (
+    _case(
+        "indexed-uint8-zp",
+        GemmType.INDEXED,
+        b_dtype=dtypes.uint8,
+        weight_scale_group_size=64,
+        has_zero_point=True,
+    ),
+    _case("grouped-masked-fp6", GemmType.GROUPED_MASKED, b_dtype=dtypes.float6e3m2),
+    _case("grouped-contiguous-fp8", GemmType.GROUPED_CONTIGUOUS, b_dtype=dtypes.float8e3m4),
+    _case(
+        "grouped-contiguous-nvfp4",
+        GemmType.GROUPED_CONTIGUOUS,
+        b_dtype=dtypes.float4e2m1,
+        bs_dtype=dtypes.float8e4m3,
+        weight_scale_group_size=16,
+        weight_scale_2_type="tensor",
+    ),
+    _case(
+        "indexed-mxfp4",
+        GemmType.INDEXED,
+        b_dtype=dtypes.float4e2m1,
+        bs_dtype=dtypes.float8e8m0,
+        weight_scale_group_size=32,
+    ),
+    _case(
+        "grouped-masked-block-scale",
+        GemmType.GROUPED_MASKED,
+        bs_dtype=dtypes.float32,
+        weight_scale_type="block",
+        weight_scale_group_size=64,
+        weight_scale_group_size_n=64,
+    ),
+    _case(
+        "indexed-secondary-channel",
+        GemmType.INDEXED,
+        b_dtype=dtypes.uint3,
+        weight_scale_group_size=64,
+        weight_scale_2_type="channel",
+        has_bias=True,
+    ),
+    _case(
+        "grouped-contiguous-fp-zp",
+        GemmType.GROUPED_CONTIGUOUS,
+        weight_scale_group_size=64,
+        has_zero_point=True,
+        is_fp_zero_point=True,
+    ),
     _case("indexed", GemmType.INDEXED),
     _case(
         "indexed-static-input",
@@ -70,7 +118,7 @@ MOE_CASES = (
         b_dtype=dtypes.float4e2m1,
         input_scale_group_size=16,
         input_quant_mode="static_tensor_dynamic_group",
-        mma_type=MmaType.MXMMA,
+        sm_version=120,
     ),
     _case(
         "indexed-dynamic-group-token",
@@ -79,7 +127,7 @@ MOE_CASES = (
         b_dtype=dtypes.float4e2m1,
         input_scale_group_size=16,
         input_quant_mode="dynamic_group_token",
-        mma_type=MmaType.MXMMA,
+        sm_version=120,
     ),
     _case("indexed-partial-k-tile", GemmType.INDEXED, shape_k=96),
     _case("grouped-contiguous", GemmType.GROUPED_CONTIGUOUS),
@@ -91,7 +139,7 @@ MOE_CASES = (
         b_dtype=dtypes.float4e2m1,
         input_scale_group_size=16,
         input_quant_mode="dynamic_group_token",
-        mma_type=MmaType.MXMMA,
+        sm_version=120,
     ),
     _case("grouped-masked", GemmType.GROUPED_MASKED),
     _case(
@@ -102,7 +150,7 @@ MOE_CASES = (
         b_dtype=dtypes.float4e2m1,
         input_scale_group_size=16,
         input_quant_mode="dynamic_group_token",
-        mma_type=MmaType.MXMMA,
+        sm_version=120,
     ),
     _case(
         "indexed-bias-pad-k",
@@ -146,7 +194,7 @@ def test_moe(test_case):
     config = test_case.layer_config
     assert config.num_experts == NUM_EXPERTS
     assert test_case.compute_config.gemm_type != GemmType.DENSE
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=get_default_mma_type(config).value)
     results = KernelTestRunner(test_case).run()
     if test_case.compute_config.gemm_type == GemmType.INDEXED:
         assert all(not result.tuning_config.use_tma_as for result in results)
@@ -236,3 +284,49 @@ def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype, ra
             torch.testing.assert_close(output[start : start + count], reference, atol=0.01, rtol=0.01)
             start += count
         assert (output[start:] == -123).all()
+
+
+@pytest.mark.parametrize(
+    "gemm_type", (GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED),
+)
+@pytest.mark.parametrize("multicast", (1, 2))
+@pytest.mark.parametrize("use_stream_k", (False, True))
+def test_raw_wgmma_tma_b_general_moe(gemm_type, multicast, use_stream_k, monkeypatch):
+    skip_if_unsupported(a_dtype=dtypes.float8e4m3, mma_type="wgmma")
+    case = _case(
+        "raw-wgmma-tma-b-general", gemm_type,
+        a_dtype=dtypes.float8e4m3, b_dtype=dtypes.float8e4m3, has_bias=True,
+    )
+    tuning = dict(
+        mma_type="wgmma", block_shape=(16, 256, 128), warp_shape=(16, 32, 128),
+        num_stages=3, use_tma=True, use_warp_spec=True,
+        use_stream_k=use_stream_k, multi_cast_size_b=multicast,
+        use_tma_a=gemm_type != GemmType.INDEXED, use_tma_c=gemm_type != GemmType.INDEXED,
+    )
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: dict(tuning))
+    if multicast > 1:
+        with pytest.raises(AssertionError, match="B multicast requires dense GEMM"):
+            KernelTestRunner(case).run((1,))
+        return
+    results = KernelTestRunner(case).run((1, 17, 129))
+    assert_kernel_test_shape_coverage(results, (1, 17, 129))
+
+
+@pytest.mark.parametrize("gemm_type", (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED))
+@pytest.mark.parametrize("a_dtype,b_dtype", (("float8e4m3", "float8e4m3"), ("bfloat16", "uint4")))
+@pytest.mark.parametrize("pad_k", (0, 128, 32))
+@pytest.mark.parametrize("use_stream_k", (False, True))
+def test_wgmma_tma_a_general_moe(gemm_type, a_dtype, b_dtype, pad_k, use_stream_k, monkeypatch):
+    skip_if_unsupported(a_dtype=a_dtype, mma_type="wgmma")
+    case = _case(
+        "wgmma-tma-a-general-moe", gemm_type, a_dtype=a_dtype, b_dtype=b_dtype,
+        shape_k=1024, pad_shape_k=pad_k, has_bias=True,
+    )
+    tuning = dict(
+        mma_type="wgmma", block_shape=(16, 128, 256),
+        warp_shape=(16, 32, 64 if a_dtype == "bfloat16" else 128),
+        num_stages=3, use_tma=True, use_warp_spec=True, use_stream_k=use_stream_k,
+    )
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: dict(tuning))
+    results = KernelTestRunner(case).run((1, 17, 129))
+    assert_kernel_test_shape_coverage(results, (1, 17, 129))

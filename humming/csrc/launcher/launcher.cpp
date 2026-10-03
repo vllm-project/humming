@@ -291,6 +291,7 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getUint32("BLOCK_SHAPE_M"),
       reader.getUint32("BLOCK_SHAPE_N"),
       reader.getUint32("BLOCK_SHAPE_K"),
+      reader.getUint32("WARP_SHAPE_N"),
       reader.getUint32("PAD_SHAPE_N"),
       reader.getUint32("PAD_SHAPE_K"),
       reader.getUint32("NUM_EXPERTS"),
@@ -299,11 +300,11 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getUint32("WEIGHT_SCALE_GROUP_SIZE_N"),
       reader.getUint32("NUM_CTAS_PER_SM"),
       reader.getUint32("UMMA_CTA_GROUP_SIZE"),
-      reader.getUint32("UMMA_OUTPUT_CHUNK_ROWS"),
+      reader.getUint32("OUTPUT_CHUNK_ROWS"),
       reader.getUint32("MULTI_CAST_SIZE_A"),
       reader.getUint32("MULTI_CAST_SIZE_B"),
       reader.getUint32("GEMM_TYPE_ID"),
-      reader.getUint32("MMA_TYPE_ID"),
+      static_cast<MmaType>(reader.getUint32("MMA_TYPE_ID")),
 
       reader.getBool("USE_STREAM_K"),
       reader.getBool("IS_FP_ZERO_POINT"),
@@ -330,7 +331,9 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getBool("USE_TMA_BIAS"),
       reader.getBool("USE_PDL"),
       reader.getBool("USE_PACKED_K_LAYOUT"),
-      reader.getBool("USE_UMMA_SS")};
+      reader.getBool("USE_UMMA_SS"),
+      reader.getBool("USE_RAW_WEIGHT"),
+      reader.getBool("USE_BLOCK_SCALED_MMA")};
 
   std::unique_lock lock(g_kernel_mutex);
   auto path_it = g_path_ids.find(cubin_path);

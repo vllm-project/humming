@@ -129,7 +129,7 @@ private:
   static constexpr bool kHasInputScale = LayerConfig::kHasInputScale;
   static constexpr bool kHasInputScale2 = LayerConfig::kHasInputScale2;
   static constexpr bool kIsChannelInputScale = kHasInputScale && !LayerConfig::kIsGroupInputScale && !LayerConfig::kIsTensorInputScale;
-  static constexpr bool kIsChannelInputScale2 = LayerConfig::kMmaType != MmaType::UMMA && kHasInputScale2 && !LayerConfig::kIsTensorInputScale2;
+  static constexpr bool kIsChannelInputScale2 = TuningConfig::kMmaType != MmaType::UMMA && kHasInputScale2 && !LayerConfig::kIsTensorInputScale2;
   static constexpr bool kIsGroupInputScale = kHasInputScale && LayerConfig::kIsGroupInputScale;
   static constexpr bool kHasChannelInputScale = kIsChannelInputScale || kIsChannelInputScale2;
   static constexpr bool kIsChannelWeightScale = LayerConfig::kIsChannelWeightScale;
@@ -148,14 +148,16 @@ public:
   static constexpr uint32_t kNumExperts = LayerConfig::kNumExperts;
   static constexpr uint32_t kNumStages = TuningConfig::kNumStages;
   static constexpr uint32_t kNumMathMbarriers = kNumStages + 1;
-  static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpsDimK = BlockShape::K / WarpShape::K;
   static constexpr uint32_t kMmaCTypeBits = MmaOpClass::kCTypeBits;
   static constexpr uint32_t M_WARPS = (BlockShape::M / WarpShape::M);
   static constexpr uint32_t kWarpReduceBuffers = kNumWarpsDimK <= 4 ? kNumWarpsDimK - 1 : kNumWarpsDimK / 2;
   static constexpr uint32_t kWarpReduceSize = M_WARPS * 16 * BlockShape::N * kMmaCTypeBits / 128 * kWarpReduceBuffers;
-  static constexpr uint32_t kBlockOutputSize = (TuningConfig::kUmmaOutputChunkRows ? 2 * TuningConfig::kUmmaOutputChunkRows : BlockShape::M) * BlockShape::N / 2 / 4 / kNumWriteSplits;
+  static constexpr uint32_t kOutputRows = TuningConfig::kOutputChunkRows ? MIN(TuningConfig::kOutputChunkRows, BlockShape::M) : BlockShape::M;
+  static constexpr bool kUseDynamicOutputMap = TuningConfig::kUseTmaC && (kIsGroupedGemm || BlockShape::M % kOutputRows != 0);
+  static constexpr uint32_t kOutputBuffers = TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 2 : 1;
+  static constexpr uint32_t kBlockOutputSize = kOutputBuffers * kOutputRows * BlockShape::N / 8;
   static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
 
   static constexpr uint32_t kSmemStrideA = BlockShape::K * ElementA::kBits / 32 / 4;
@@ -172,7 +174,7 @@ public:
   static constexpr uint32_t kScaleBlockM = BlockShape::M + (kIsGroupedGemm ? kScaleMAlignment : 0);
 
   static constexpr uint32_t kStageSizeA = BlockShape::M / TuningConfig::kUmmaCtaGroupSize * kSmemStrideA;
-  static constexpr bool kExpandUmmaWeight = LayerConfig::kUseUmmaSs && ElementA::kBits == 8 && ElementB::kBits < 8;
+  static constexpr bool kExpandUmmaWeight = TuningConfig::kUseUmmaSs && ElementA::kBits == 8 && ElementB::kBits < 8;
   static constexpr uint32_t kWeightSmemBits = kExpandUmmaWeight ? 8 : ElementB::kBits;
   // Expanded TMA coordinates are 128-element aligned; cover the leading K offset.
   static constexpr uint32_t kWeightKAlignment = BlockShape::K % 128 == 0 ? 128 : (BlockShape::K % 64 == 0 ? 64 : 32);
@@ -181,27 +183,27 @@ public:
                                                 : BlockShape::K;
   static constexpr uint32_t kUmmaScaleWords = CEIL_DIV(BlockShape::K, 4 * LayerConfig::kMmaScaleGroupSize);
   static constexpr uint32_t kUmmaWeightScaleRows = MAX(BlockShape::N, 128);
-  static constexpr bool kUseUmmaDirectWeightScale = LayerConfig::kUseUmmaSs && kIsGroupWeightScale &&
+  static constexpr bool kUseUmmaDirectWeightScale = TuningConfig::kUseUmmaSs && kIsGroupWeightScale &&
                                                     BlockShape::N >= 128 && BlockShape::K % (4 * MAX(1u, kGroupSizeB)) == 0;
   static constexpr uint32_t kUmmaWeightScaleScratchRows = kIsGroupWeightScale && !kUseUmmaDirectWeightScale ? kUmmaWeightScaleRows : 0;
   static constexpr uint32_t kUmmaInputScaleRows = CEIL_DIV(BlockShape::M, 128) * 128;
   // Keep contiguous scale vectors intact during indexed cp.async gathers.
   // Only the stage layout changes; the input tensor keeps its original layout.
-  static constexpr bool kUseUmmaRowMajorSmemInputScale = LayerConfig::kUseUmmaSs && kIsIndexedGemm && kIsGroupInputScale &&
+  static constexpr bool kUseUmmaRowMajorSmemInputScale = TuningConfig::kUseUmmaSs && kIsIndexedGemm && kIsGroupInputScale &&
                                                          BlockShape::K % (16 * MAX(1u, kGroupSizeA)) == 0;
-  static constexpr bool kUseUmmaInplaceInputScale = LayerConfig::kUseUmmaSs && kIsGroupInputScale &&
+  static constexpr bool kUseUmmaInplaceInputScale = TuningConfig::kUseUmmaSs && kIsGroupInputScale &&
                                                     BlockShape::M % 128 == 0;
   static constexpr uint32_t kUmmaInputScaleScratchRows = kIsGroupInputScale && !kUseUmmaInplaceInputScale ? kUmmaInputScaleRows : 0;
-  static constexpr uint32_t kStageSizeUmmaScales = LayerConfig::kUseUmmaSs && kUseBlockScaledMma
+  static constexpr uint32_t kStageSizeUmmaScales = TuningConfig::kUseUmmaSs && kUseBlockScaledMma
                                                        ? kUmmaScaleWords * (kUmmaWeightScaleScratchRows + kUmmaInputScaleScratchRows) / 4
                                                        : 0;
-  static constexpr uint32_t kWeightStageN = LayerConfig::kUseUmmaSs ? MAX(BlockShape::N, 128) : BlockShape::N;
+  static constexpr uint32_t kWeightStageN = TuningConfig::kUseUmmaSs ? MAX(BlockShape::N, 128) : BlockShape::N;
   static constexpr uint32_t kStageSizeB = kWeightStageK * kWeightStageN * kWeightSmemBits / 128;
   static constexpr uint32_t kNumGroupsAStorage = CEIL_DIV(kNumGroupsA, 4) * 4;
   static constexpr uint32_t kStageSizeAS = kUseBlockScaledMma
                                                ? CEIL_DIV(kNumGroupsAStorage * kScaleBlockM, sizeof(int4))
                                                : kNumGroupsA * kScaleBlockM / 4;
-  static constexpr uint32_t kStageSizeBS = kUseBlockScaledMma && LayerConfig::kMmaType == MmaType::UMMA
+  static constexpr uint32_t kStageSizeBS = kUseBlockScaledMma && TuningConfig::kMmaType == MmaType::UMMA
                                                ? CEIL_DIV(kNumGroupsB, 4) * MAX(BlockShape::N, 128) / 4
                                                : kNumGroupsB * kSmemStrideBS;
   static constexpr uint32_t kStageSizeBZP = kNumGroupsB * kSmemStrideBZP;
@@ -229,7 +231,7 @@ public:
   static constexpr bool kUseMBarrier = TuningConfig::kUseMBarrier;
   struct StageStorage {
     alignas(1024) int4 a[kStageSizeA];
-    alignas(LayerConfig::kUseUmmaSs ? 1024 : 128) int4 b[kStageSizeB];
+    alignas(LayerConfig::kUseRawWeight ? 1024 : 128) int4 b[kStageSizeB];
     IF_HAS_STAGE_INPUT_SCALE(alignas(128) int4 as[kStageSizeAS];)
     IF_HAS_STAGE_WEIGHT_SCALE(alignas(128) int4 bs[kStageSizeBS];)
     IF_HAS_STAGE_ZERO_POINT(alignas(128) int4 bzp[kStageSizeBZP];)
@@ -259,7 +261,9 @@ public:
   IF_IS_INDEXED_GEMM(uint32_t wr_row_index_next[BlockShape::M];)
 #endif
 
-  IF_IS_GROUPED_GEMM(CUtensorMap tensor_map_buffer[1];)
+#if HUMMING_IS_GROUPED_GEMM || (HUMMING_USE_TMA_C && HUMMING_OUTPUT_CHUNK_ROWS > 0 && HUMMING_BLOCK_SHAPE_M % HUMMING_OUTPUT_CHUNK_ROWS != 0 && HUMMING_OUTPUT_CHUNK_ROWS < HUMMING_BLOCK_SHAPE_M)
+  CUtensorMap tensor_map_buffer[1];
+#endif
   IF_IS_GROUPED_GEMM(uint32_t expert_tokens[kNumExperts];)
   IF_USE_GROUPED_RASTER(uint32_t expert_m_block_offset[kNumExperts + 1];)
   IF_IS_GROUPED_GEMM(uint32_t total_m_blocks[1];)
