@@ -55,6 +55,38 @@ def uses_undocumented_fp_operand(a_dtype: dtypes.DataType, b_dtype: dtypes.DataT
     return a_dtype in UNDOCUMENTED_FP_DTYPES or has_raw_undocumented_weight
 
 
+def get_mma_b_dtype(
+    a_dtype: dtypes.DataType,
+    b_dtype: dtypes.DataType,
+    has_zero_point: bool,
+    sm_version: int,
+) -> dtypes.DataType:
+    fp8_dtypes = (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4)
+    fp4_dtypes = (dtypes.float4e2m1, dtypes.float4e0m3)
+    if a_dtype in fp8_dtypes and b_dtype in fp8_dtypes:
+        return b_dtype
+    if a_dtype in fp4_dtypes and b_dtype in fp4_dtypes:
+        return b_dtype
+    if a_dtype not in fp8_dtypes or b_dtype.num_bits >= a_dtype.num_bits:
+        return a_dtype
+
+    candidates = (a_dtype, dtypes.float8e4m3)
+    if supports_undocumented_fp_dtypes(sm_version):
+        candidates += (dtypes.float8e3m4,)
+    for target_dtype in candidates:
+        if b_dtype.is_integer_type:
+            if b_dtype.num_bits <= target_dtype.mantissa_bits + (1 if has_zero_point else 2):
+                return target_dtype
+        else:
+            required_mantissa = b_dtype.mantissa_bits - (b_dtype.exponent_bits == 0)
+            fits_mantissa = required_mantissa <= target_dtype.mantissa_bits
+            fits_exponent = b_dtype.exponent_bits <= target_dtype.exponent_bits
+            if fits_mantissa and fits_exponent:
+                return target_dtype
+    # Keep unsupported conversions visible to schema/kernel validation.
+    return a_dtype
+
+
 SF_DTYPE_MAP = {
     "e8m0": "ue8m0",
     "e4m3": "ue4m3",
@@ -77,7 +109,7 @@ def get_mxmma_scale_config(layer_config):
     group_size = (
         layer_config.weight_scale_group_size
         or layer_config.input_scale_group_size
-        or (32 if layer_config.a_dtype.num_bits == 4 else mma_shape_k)
+        or (layer_config.mma_scale_group_size if layer_config.a_dtype.num_bits == 4 else mma_shape_k)
     )
     assert mma_shape_k % group_size == 0
     scale_dtype = (
@@ -541,7 +573,7 @@ class MxMmaOpClassImpl:
             self.kind = "kind::mxf8f6f4"
             self.scale_vec = "scale_vec::1X"
 
-        self.native_mixed = self.kind == "kind::mxf8f6f4" and self.a_dtype != self.b_dtype
+        self.native_mixed = self.kind == "kind::mxf8f6f4" and DTYPE_BIT_WIDTH_MAP[self.b_dtype] < 8
         b_reg_dtype = self.b_dtype
         if self.kind == "kind::mxf8f6f4" and DTYPE_BIT_WIDTH_MAP[self.b_dtype] < 8:
             b_reg_dtype = "e4m3"

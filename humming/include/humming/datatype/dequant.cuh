@@ -18,11 +18,14 @@ CUDA_INLINE void dequant_b1248(const uint32_t *qb, uint32_t *res, uint32_t j, ui
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < 4; i++) {
     uint32_t index = j * 4 + i;
+    if constexpr (kIsFpToFp) {
+      index = index / reverse_pattern * reverse_pattern + reverse_pattern - 1 - index % reverse_pattern;
+    }
     uint32_t zp_val = kHasZeroPoint ? zp_vals[i] : 0;
     uint32_t qb_index = kResultPackedNumSourceBits * index / 32;
 
     uint32_t shift_count;
-    if constexpr (SourceType::kBits * 4 % TargetType::kBits == 0) {
+    if constexpr (!kIsFpToFp && SourceType::kBits * 4 % TargetType::kBits == 0) {
       shift_count = SourceType::kBits * i % TargetType::kBits;
     } else {
       shift_count = SourceType::kBits * index % TargetType::kBits;
@@ -31,12 +34,7 @@ CUDA_INLINE void dequant_b1248(const uint32_t *qb, uint32_t *res, uint32_t j, ui
     uint32_t qb_val = qb[qb_index];
     if (kIsFpToFp && shift_count) qb_val = qb_val << shift_count;
     if (!kIsFpToFp && shift_count) qb_val = qb_val >> shift_count;
-    if constexpr (!kIsFpToFp) {
-      res[i] = dequant_single<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(qb_val, zp_val);
-    } else {
-      uint32_t reversed_index = i / reverse_pattern * reverse_pattern + reverse_pattern - 1 - i % reverse_pattern;
-      res[reversed_index] = dequant_single<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(qb_val, zp_val);
-    }
+    res[i] = dequant_single<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(qb_val, zp_val);
   }
 }
 

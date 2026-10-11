@@ -28,6 +28,7 @@ public:
   using BlockShape = typename Ctx::BlockShape;
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
+  using ElementQB = typename Ctx::ElementQB;
   using ElementB = typename Ctx::ElementB;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::N][WarpShape::M / MmaShape::M];
@@ -48,7 +49,7 @@ public:
 
   Ctx &ctx;
   ArithClass &arith;
-  uint32_t regs_qb[2][kUsePackedKLayout ? kNumKSlabs * ElementB::kBits / 2 : ElementB::kBits * (16 / ElementA::kBits)];
+  uint32_t regs_qb[2][kUsePackedKLayout ? kNumKSlabs * ElementQB::kBits / 2 : ElementQB::kBits * (16 / ElementA::kBits)];
   typename MmaOpClass::BRegisters regs_b[2][kUsePackedKLayout ? 1 : (WarpShape::N * 4 / MmaShape::N / kPackedKFactor)][kRegsBKDim];
   alignas(16) CRegistersArrayType regs_c[2];
   uint32_t smem_offset = 0;
@@ -80,14 +81,14 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id, uint32_t iter_id) {
-    if constexpr (Ctx::kUseRawWeight || std::is_same<ElementA, ElementB>::value) return;
+    if constexpr (Ctx::kUseRawWeight || std::is_same<ElementB, ElementQB>::value) return;
 
     if constexpr (kUseFusedE8m0Scale) {
       uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id]);
       constexpr uint32_t kTransformIters = kUsePackedKLayout ? kNumKSlabs : WarpShape::N / 16;
-      fused_dequant_for_mxfp4<ElementA, kTransformIters, true>(regs_qb[buffer_id], regs_b_ptr, arith.bs[buffer_id]);
+      fused_dequant_for_mxfp4<ElementB, kTransformIters, true>(regs_qb[buffer_id], regs_b_ptr, arith.bs[buffer_id]);
     } else {
-      if constexpr (ElementB::kBits == 1 && kNumWarpShapeNSplits == 2) {
+      if constexpr (ElementQB::kBits == 1 && kNumWarpShapeNSplits == 2) {
         regs_qb[buffer_id][0] = regs_qb[buffer_id][0] >> (ctx.warp_id() % 2 * (ElementA::kBits / 2));
       }
 
@@ -110,7 +111,7 @@ public:
           zp_vals.z = tmp;
         }
         uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
-        dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
+        dequant<ElementQB, ElementB, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
         if constexpr (!kUsePackedKLayout) {
           uint32_t tmp = regs_b_ptr[1];
           regs_b_ptr[1] = regs_b_ptr[2];
@@ -157,7 +158,7 @@ public:
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < kNumIters; j++) {
         if constexpr (Ctx::kUseRawWeight) {
-          constexpr uint32_t kSwizzleK = kSwizzleBytes * 8 / ElementB::kBits;
+          constexpr uint32_t kSwizzleK = kSwizzleBytes * 8 / ElementQB::kBits;
           uint32_t row = ctx.n_warp_id() / 4 * (WarpShape::N * 4) + j * MmaShape::N;
           if constexpr (Ctx::kUseWgmmaTmaNPermute) {
             constexpr uint32_t kFragmentPlaneRows = BlockShape::N / WarpShape::N * 16;
@@ -165,7 +166,7 @@ public:
           }
           uint32_t col = ctx.k_warp_offset() + k_slab * kPartMmaShapeK;
           uint32_t offset = (col / kSwizzleK * BlockShape::N + row) * kSwizzleBytes;
-          offset += col % kSwizzleK * ElementB::kBits / 8;
+          offset += col % kSwizzleK * ElementQB::kBits / 8;
           const uint32_t b_addr = stage_addr + offsetof(typename SharedStorage::StageStorage, b);
           uint64_t b_desc = make_wgmma_smem_desc<kSwizzleBytes>(b_addr);
           reinterpret_cast<uint32_t *>(&b_desc)[0] += offset / 16;
@@ -233,7 +234,7 @@ public:
 
   template <class T = uint32_t>
   CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
-    if constexpr (std::is_same<ElementA, ElementB>::value) {
+    if constexpr (std::is_same<ElementB, ElementQB>::value) {
       return reinterpret_cast<T *>(regs_b[buffer_id]);
     } else {
       return reinterpret_cast<T *>(regs_qb[buffer_id]);

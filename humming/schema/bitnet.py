@@ -73,7 +73,7 @@ class BitnetWeightSchema(BaseWeightSchema):
 
     def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
         return HummingWeightSchema(
-            b_dtype=dtypes.uint2,
+            b_dtype=dtypes.float2e0m1,
             bs_dtype=dtypes.DataType.from_torch_dtype(param_dtype),
             weight_scale_type="tensor",
         )
@@ -87,14 +87,15 @@ class BitnetWeightSchema(BaseWeightSchema):
         num_experts: int | None = None,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         schema = HummingWeightSchema(
-            b_dtype=dtypes.uint2,
+            b_dtype=dtypes.float2e0m1,
             bs_dtype=dtypes.DataType.from_torch_dtype(param_dtype),
             weight_scale_group_size=0,
         )
 
         weight = tensors["weight"]
         weight = weight.transpose(-1, -2).contiguous().view(torch.int32)
-        weight = ops.unpack_weight(weight, 2) + 1
+        weight = ops.unpack_weight(weight, 2) - 1
+        weight = weight.abs() | ((weight < 0).to(torch.int32) << 1)
         weight = weight.transpose(-1, -2).contiguous()
         weight = ops.pack_weight(weight, 2)
         weight = weight.squeeze(0) if num_experts is None else weight

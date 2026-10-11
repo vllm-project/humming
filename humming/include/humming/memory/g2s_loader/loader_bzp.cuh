@@ -9,7 +9,7 @@ private:
   using ProblemShape = typename Ctx::ProblemShape;
   using BlockShape = typename Ctx::BlockShape;
   using ElementA = typename Ctx::ElementA;
-  using ElementB = typename Ctx::ElementB;
+  using ElementQB = typename Ctx::ElementQB;
 
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
   static constexpr bool kUseTma = Ctx::kUseTmaBZP;
@@ -25,7 +25,7 @@ private:
 
   static constexpr uint32_t kPartMmaShapeK = Ctx::kPartMmaShapeK;
   static constexpr uint32_t kNumGroupsPerMma = Ctx::kUseBlockScaledMma && ElementA::kBits == 4 && kIsGroup ? kPartMmaShapeK / kGroupSize : 1;
-  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementQB::kBits));
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4 * kNumGroupsPerMma;
   static constexpr uint32_t kGmemStride = ProblemShape::N * kNumZPBits / 32 / 4 * kNumGroupsPerMma;
   static constexpr uint32_t kProblemNumRows = CEIL_DIV(ProblemShape::K, kGroupSize) / kNumGroupsPerMma;

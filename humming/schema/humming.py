@@ -3,10 +3,10 @@ from typing import Any, ClassVar
 
 import torch
 
-from humming import dtypes
+from humming import dtypes, ops
 from humming.config import InputQuantizationMode
 from humming.config.enum import WeightScale2Type, WeightScaleType
-from humming.config.mma import supports_undocumented_fp_dtypes, uses_undocumented_fp_operand
+from humming.config.mma import get_mma_b_dtype, supports_undocumented_fp_dtypes, uses_undocumented_fp_operand
 from humming.device import current_device
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.utils.weight import decode_e5m3_scale, dequantize_weight, quantize_weight
@@ -287,6 +287,36 @@ class HummingWeightSchema(BaseWeightSchema):
         dequanted_weight = self.dequant_tensors(tensors)
         return self.quant_tensor(dequanted_weight, target_weight_schema, param_dtype)
 
+    def convert_symmetric_integer_weight(
+        self, tensors: dict[str, torch.Tensor]
+    ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
+        num_bits = self.b_dtype.num_bits
+        has_integer_zero_point = self.has_zero_point and not self.is_fp_zero_point
+        if not self.b_dtype.is_integer_type or not 2 <= num_bits <= 8 or has_integer_zero_point:
+            return self, tensors
+
+        # Humming integer weights use offset-binary codes, even for signed source formats.
+        weight = ops.unpack_weight(tensors["weight"], num_bits)
+        if torch.any(weight == 0):
+            return self, tensors
+
+        midpoint = 1 << (num_bits - 1)
+        output_tensors = tensors.copy()
+        if self.has_zero_point:
+            zero_point = tensors["zero_point"]
+            centered_zero_point = zero_point - midpoint
+            if not torch.equal(centered_zero_point.float() + midpoint, zero_point.float()):
+                return self, tensors
+            output_tensors["zero_point"] = centered_zero_point
+
+        weight = weight - midpoint
+        weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
+        output_tensors["weight"] = ops.pack_weight(weight, num_bits)
+        weight_dtype = dtypes.FloatingPointType(
+            num_bits=num_bits, exponent_bits=0, mantissa_bits=num_bits - 1
+        )
+        return dataclasses.replace(self, b_dtype=weight_dtype), output_tensors
+
     def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
@@ -446,6 +476,7 @@ def is_humming_schema_compatible(
     b_dtype = weight_schema.b_dtype
     bs_dtype = weight_schema.bs_dtype or dtypes.DataType.from_torch_dtype(param_dtype)
     has_zero_point = weight_schema.has_zero_point
+    mma_b_dtype = get_mma_b_dtype(a_dtype, b_dtype, has_zero_point, sm_version)
 
     dtype_min_sm_version_map = {
         dtypes.float16: 75,
@@ -462,7 +493,7 @@ def is_humming_schema_compatible(
     if sm_version < dtype_min_sm_version_map.get(a_dtype, 9999):
         return False
 
-    if uses_undocumented_fp_operand(a_dtype, b_dtype) and not supports_undocumented_fp_dtypes(sm_version):
+    if uses_undocumented_fp_operand(a_dtype, mma_b_dtype) and not supports_undocumented_fp_dtypes(sm_version):
         return False
 
     if b_dtype.num_bits > min(8, a_dtype.num_bits):
@@ -471,7 +502,11 @@ def is_humming_schema_compatible(
     is_mxfp4_weight = b_dtype == dtypes.float4e2m1 and bs_dtype == dtypes.float8e8m0
     is_mxfp4_weight = is_mxfp4_weight and weight_schema.weight_scale_group_size == 32
 
-    if a_dtype == dtypes.int4:
+    is_e0m_weight = b_dtype.is_floating_point_type and b_dtype.exponent_bits == 0
+    if a_dtype.is_integer_type and is_e0m_weight:
+        if a_dtype != dtypes.int8 or b_dtype.num_bits >= 8 or has_zero_point:
+            return False
+    elif a_dtype == dtypes.int4:
         if not b_dtype.is_integer_type or b_dtype.num_bits > 4:
             return False
         if b_dtype in [dtypes.int4, dtypes.uint4] and has_zero_point:
@@ -482,21 +517,40 @@ def is_humming_schema_compatible(
         if b_dtype in [dtypes.int8, dtypes.uint8] and has_zero_point:
             return False
     elif b_dtype.is_integer_type:
-        if b_dtype.num_bits > a_dtype.mantissa_bits + 2:
+        if b_dtype.num_bits >= mma_b_dtype.num_bits or b_dtype.num_bits > mma_b_dtype.mantissa_bits + 2:
             return False
-        elif has_zero_point and b_dtype.num_bits > a_dtype.mantissa_bits + 1:
+        elif has_zero_point and b_dtype.num_bits > mma_b_dtype.mantissa_bits + 1:
             return False
     elif b_dtype.is_floating_point_type:
         assert b_dtype.is_floating_point_type and a_dtype.is_floating_point_type
-        if b_dtype.mantissa_bits > a_dtype.mantissa_bits:
-            return False
-        if b_dtype.exponent_bits > a_dtype.exponent_bits:
-            return False
-        if a_dtype.exponent_bits != 0 and b_dtype.exponent_bits == 0:
-            return False
+        if b_dtype.exponent_bits == 0:
+            if b_dtype != mma_b_dtype and b_dtype.mantissa_bits > mma_b_dtype.mantissa_bits + 1:
+                return False
+        else:
+            if b_dtype.mantissa_bits > mma_b_dtype.mantissa_bits:
+                return False
+            if b_dtype.exponent_bits > mma_b_dtype.exponent_bits:
+                return False
 
     input_group_size = input_schema.input_scale_group_size
     weight_group_size = weight_schema.weight_scale_group_size
+    if sm_version // 10 in (10, 11):
+        has_e3m4_operand = dtypes.float8e3m4 in (a_dtype, mma_b_dtype)
+        if has_e3m4_operand:
+            has_mx_input_scale = input_group_size == 0 or (
+                input_group_size == 32 and input_schema.input_scale_dtype in (None, dtypes.float8e8m0)
+            )
+            has_mx_weight_scale = weight_group_size == 0 or (
+                weight_group_size == 32 and bs_dtype == dtypes.float8e8m0
+            )
+            if not has_mx_input_scale or not has_mx_weight_scale:
+                return False
+            if weight_schema.weight_scale_type == WeightScaleType.BLOCK:
+                return False
+        has_e0m3_operand = dtypes.float4e0m3 in (a_dtype, mma_b_dtype)
+        if has_e0m3_operand and (input_group_size or weight_group_size or 16) != 16:
+            return False
+
     is_fp8_gs128_mxfp4_gs32 = (
         sm_version == 90
         and a_dtype == dtypes.float8e4m3
@@ -523,7 +577,7 @@ def is_humming_schema_compatible(
     elif a_dtype == dtypes.int4 and (0 < weight_group_size < 64 or 0 < input_group_size < 64):
         return False
     elif a_dtype.num_bits == 4 and weight_group_size > 0 and uses_fp4_weights:
-        as_dtype = input_schema.input_scale_dtype
+        as_dtype = input_schema.input_scale_dtype or bs_dtype
         if bs_dtype not in [dtypes.float8e8m0, dtypes.float8e4m3]:
             return False
         if input_group_size > 0 and as_dtype not in [dtypes.float8e8m0, dtypes.float8e4m3]:

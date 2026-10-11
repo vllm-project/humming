@@ -16,7 +16,7 @@ __global__ void dequant_unpacked_fp_type(
   const uint32_t mask = (1 << (exponent_bits + mantissa_bits)) - 1;
   const uint32_t sign_mask = is_signed ? mask + 1 : 0;
 
-  uint32_t exp_offset = 128 - (1 << (exponent_bits - 1));
+  uint32_t exp_offset = exponent_bits == 0 ? 0 : 128 - (1 << (exponent_bits - 1));
   uint32_t scale_factor = (exp_offset << 23) + 0x3F800000;
   float scale_factor_float = *reinterpret_cast<float *>(&scale_factor);
 

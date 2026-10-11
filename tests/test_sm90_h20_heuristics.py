@@ -25,12 +25,12 @@ def _layer(shape_n: int, shape_k: int, num_experts: int = 0) -> LayerConfig:
     )
 
 
-def _mxfp4_layer(shape_n: int, shape_k: int) -> LayerConfig:
+def _mxfp4_layer(shape_n: int, shape_k: int, a_dtype=dtypes.bfloat16) -> LayerConfig:
     return LayerConfig(
         shape_n=shape_n,
         shape_k=shape_k,
         num_experts=96,
-        a_dtype=dtypes.bfloat16,
+        a_dtype=a_dtype,
         b_dtype=dtypes.float4e2m1,
         c_dtype=dtypes.bfloat16,
         bs_dtype=dtypes.float8e8m0,
@@ -87,9 +87,10 @@ def test_sparse_long_k_moe_keeps_two_n_tiles_per_expert(shape_n, block_n):
 
 
 @pytest.mark.parametrize("shape_m", [3072, 12288, 24576])
-def test_large_mxfp4_grouped_contiguous_uses_three_resident_ctas(shape_m):
+@pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16])
+def test_large_mxfp4_grouped_contiguous_uses_three_resident_ctas(shape_m, a_dtype):
     config = Sm90H20Heuristics.get_config(
-        _mxfp4_layer(4608, 5120),
+        _mxfp4_layer(4608, 5120, a_dtype),
         shape_m,
         gemm_type=GemmType.GROUPED_CONTIGUOUS,
     )
@@ -100,9 +101,10 @@ def test_large_mxfp4_grouped_contiguous_uses_three_resident_ctas(shape_m):
     assert not config["use_stream_k"]
 
 
-def test_small_mxfp4_grouped_contiguous_keeps_small_expert_tiles():
+@pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16, dtypes.float8e4m3, dtypes.int8])
+def test_small_mxfp4_grouped_contiguous_keeps_small_expert_tiles(a_dtype):
     config = Sm90H20Heuristics.get_config(
-        _mxfp4_layer(4608, 5120),
+        _mxfp4_layer(4608, 5120, a_dtype),
         2048,
         gemm_type=GemmType.GROUPED_CONTIGUOUS,
     )

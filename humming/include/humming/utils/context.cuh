@@ -26,7 +26,7 @@ struct KernelParams {
 
 template <
     class MmaOpClass_, class ProblemShape_, class BlockShape_, class WarpShape_, class PadShape_,
-    class ElementA_, class ElementB_, class ElementC_, class ElementBS_,
+    class ElementA_, class ElementQB_, class ElementC_, class ElementBS_,
     class LayerConfig_, class ComputeConfig_, class TuningConfig_>
 struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   using MmaOpClass = MmaOpClass_;
@@ -35,7 +35,8 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   using WarpShape = WarpShape_;
   using PadShape = PadShape_;
   using ElementA = ElementA_;
-  using ElementB = ElementB_;
+  using ElementQB = ElementQB_;
+  using ElementB = typename MmaOpClass::ElementB;
   using ElementC = ElementC_;
   using ElementBS = ElementBS_;
   using LayerConfig = LayerConfig_;
@@ -44,7 +45,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   using MmaShape = typename MmaOpClass::MmaShape;
 
   using SharedStorage = ::SharedStorage<
-      MmaOpClass, BlockShape, WarpShape, ElementA, ElementB, ElementBS,
+      MmaOpClass, BlockShape, WarpShape, ElementA, ElementQB, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
 
   static constexpr bool kIsDenseGemm = ComputeConfig::kGemmType == GemmType::DENSE;

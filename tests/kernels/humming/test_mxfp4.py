@@ -229,7 +229,11 @@ def test_fp4_weight_schema_compatibility(
     )
     has_supported_groups = not has_fp8_activation or group_size >= 32
     has_supported_dtype = a_dtype != "float8e3m4" or sm_version in (100, 103, 120, 121)
-    assert inputs.is_compatible_with(weight, torch.bfloat16) == (has_supported_groups and has_supported_dtype)
+    has_supported_scales = True
+    if a_dtype == "float8e3m4" and sm_version in (100, 103):
+        has_supported_scales = group_size == 32 and bs_dtype == "float8e8m0"
+    is_supported = has_supported_groups and has_supported_dtype and has_supported_scales
+    assert inputs.is_compatible_with(weight, torch.bfloat16) == is_supported
 
 
 @pytest.mark.parametrize("sm_version", [89, 90, 100, 103, 107, 110, 120, 121])

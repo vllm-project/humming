@@ -107,6 +107,46 @@ BS2_CASES = tuple(
 )
 
 SCALE_CASES = (
+    *(
+        _case(
+            f"mixed-e5m2-{b_dtype}-group{group_size}",
+            a_dtype=dtypes.float8e5m2,
+            b_dtype=b_dtype,
+            bs_dtype=dtypes.float8e8m0 if group_size == 32 else dtypes.bfloat16,
+            input_scale_group_size=group_size,
+            weight_scale_group_size=group_size,
+        )
+        for b_dtype in (dtypes.uint5, dtypes.float5e0m4, dtypes.float8e4m3)
+        for group_size in (32, 64)
+    ),
+    *(
+        _case(
+            f"e0m-group64-{a_dtype}-bs-{bs_dtype}",
+            a_dtype=a_dtype,
+            b_dtype=dtypes.float8e0m7,
+            c_dtype=a_dtype,
+            bs_dtype=bs_dtype,
+            weight_scale_group_size=64,
+        )
+        for a_dtype in (dtypes.float16, dtypes.bfloat16)
+        for bs_dtype in (a_dtype, dtypes.float8e8m0)
+    ),
+    _case(
+        "e0m-fp8-group32",
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float5e0m4,
+        bs_dtype=dtypes.float8e8m0,
+        input_scale_group_size=32,
+        weight_scale_group_size=32,
+    ),
+    _case(
+        "e0m-fp4-group16",
+        a_dtype=dtypes.float4e2m1,
+        b_dtype=dtypes.float3e0m2,
+        bs_dtype=dtypes.float8e4m3,
+        input_scale_group_size=16,
+        weight_scale_group_size=16,
+    ),
     _case(
         "channel-bfloat16",
         a_dtype=dtypes.bfloat16,

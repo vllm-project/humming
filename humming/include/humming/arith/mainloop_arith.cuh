@@ -14,6 +14,7 @@ private:
   using BlockShape = typename Ctx::BlockShape;
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
+  using ElementQB = typename Ctx::ElementQB;
   using ElementB = typename Ctx::ElementB;
   using ElementC = typename Ctx::ElementC;
   using ElementBS = typename Ctx::ElementBS;
@@ -40,7 +41,7 @@ private:
   static constexpr bool kUseIntWeightScale = Ctx::kUseIntWeightScale;
   static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
   static constexpr bool kUseNativeDequantB =
-      Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementB, ElementA>;
+      Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementQB, ElementB>;
   static constexpr bool kUseNativeDequantBS =
       kIsGroupWeightScale && !kUseFusedE8m0Scale &&
       kNativeScaleDequantSupported<ElementBS, ElementA>;
@@ -53,7 +54,7 @@ private:
   static constexpr uint32_t kPackedKFactor = Ctx::kPackedKFactor;
   static constexpr uint32_t kNumKSlabs = WarpShape::K / kPartMmaShapeK;
   static constexpr uint2 kExpOffset = get_mainloop_exp_offset<
-      ElementA, ElementB, ElementBS, kHasZeroPoint,
+      ElementA, ElementQB, ElementB, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale,
       kIsGroupOrBlockWeightScale && !kUseFusedE8m0Scale,
       MmaOpClass::kNativeMixed, kUseNativeDequantB, kUseNativeDequantBS>();
@@ -72,14 +73,14 @@ public:
   static constexpr uint32_t kNumLoadedBS = kUsePackedKLayout && kUseFusedE8m0Scale ? 2 * kNumKSlabs : kNumBSPerGroup;
   alignas(16) uint32_t bs[2][CEIL_DIV(kNumLoadedBS, 8) * 8 * ElementBS::kBits / 32];
   uint32_t dq_bs[CEIL_DIV(kNumBSPerGroup, 8) * 8 * kDequantBSBits / 32];
-  uint32_t zp[2][(kIsFpZeroPoint ? 4 : CEIL_DIV(ElementB::kBits, 4)) * kNumZPGroupsPerMma];
+  uint32_t zp[2][(kIsFpZeroPoint ? 4 : CEIL_DIV(ElementQB::kBits, 4)) * kNumZPGroupsPerMma];
 
   uint32_t _dummy;
 
   CUDA_INLINE
   uint4 prepare_zp_for_dequant(uint32_t buffer_id, uint32_t index) {
     uint32_t zp_vals[4] = {0, 0, 0, 0};
-    constexpr uint32_t kNumZPBits = 4 * CEIL_DIV(ElementB::kBits, 4);
+    constexpr uint32_t kNumZPBits = 4 * CEIL_DIV(ElementQB::kBits, 4);
     constexpr uint32_t kNumZPsPerInt = 32 / kNumZPBits;
 
     buffer_id = kIsChannelWeightScale ? 0 : buffer_id;
@@ -100,12 +101,12 @@ public:
             dzp_val = dzp_val >> (j * kNumZPBits);
           } else {
             uint32_t n_id = 0;
-            if (WarpShape::N == 64 && ElementB::kBits > 4 && index >= 2) n_id = 1;
+            if (WarpShape::N == 64 && ElementQB::kBits > 4 && index >= 2) n_id = 1;
             dzp_val = zp[buffer_id][n_id];
             dzp_val = dzp_val >> ((index * 2 + j) % kNumZPsPerInt * kNumZPBits);
           }
           uint32_t zp_idx = kUseWgmma ? (i * 2 + j) : (j * 2 + i);
-          zp_vals[zp_idx] = dequant_single_zero_point<ElementB, ElementA>(dzp_val);
+          zp_vals[zp_idx] = dequant_single_zero_point<ElementQB, ElementB>(dzp_val);
         }
       }
     }
@@ -191,11 +192,15 @@ public:
 
       if constexpr (kIsFpZeroPoint) {
         static_assert(kHasZeroPoint);
-        static_assert(!ElementB::kIsSigned && ElementB::kIsIntegerType);
+        if constexpr (ElementQB::kIsFloatingPointType) {
+          static_assert(ElementQB::kExponentBits == 0);
+        } else {
+          static_assert(!ElementQB::kIsSigned);
+        }
         uint32_t zp_buffer_id = kIsChannelWeightScale ? 0 : buffer_id;
         scalar_t2 bzp2_ptr = *reinterpret_cast<scalar_t2 *>(&zp[zp_buffer_id][j]);
 
-        if constexpr (std::is_same<ElementA, BFloat16>::value && ElementB::kNumBits >= 7) {
+        if constexpr (std::is_same<ElementA, BFloat16>::value && ElementQB::kIsIntegerType && ElementQB::kNumBits >= 7) {
           uint32_t exp_val = ((int32_t)kExpOffset.x - 133) + ((1 << (ElementA::kExponentBits - 1)) - 1);
           uint32_t scale_factor_uint = 0x00010001 * (exp_val << ElementA::kMantissaBits);
           scalar_t2 scale_factor = *reinterpret_cast<scalar_t2 *>(&scale_factor_uint);

@@ -13,6 +13,7 @@ private:
   using BlockShape = typename Ctx::BlockShape;
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
+  using ElementQB = typename Ctx::ElementQB;
   using ElementB = typename Ctx::ElementB;
   using ElementC = typename Ctx::ElementC;
   using ElementBS = typename Ctx::ElementBS;
@@ -38,13 +39,13 @@ private:
   static constexpr bool kUseNativeChannelScale = Ctx::kUseUmma && ElementA::kBits <= 8 && kHasChannelWeightScale;
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
   static constexpr bool kUseNativeDequantB =
-      Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementB, ElementA>;
+      Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementQB, ElementB>;
   static constexpr bool kUseNativeDequantBS =
       kIsGroupWeightScale && !Ctx::kUseFusedE8m0Scale &&
       kNativeScaleDequantSupported<ElementBS, ElementA>;
 
   static constexpr uint2 kExpOffset = get_epilogue_exp_offset<
-      ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
+      ElementA, ElementQB, ElementB, ElementC, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale,
       kIsGroupOrBlockWeightScale && !Ctx::kUseFusedE8m0Scale,
       MmaOpClass::kNativeMixed, kUseNativeDequantB, kUseNativeDequantBS>();

@@ -363,6 +363,15 @@ def test_decision_rejects_an_illegal_selection():
         (100, "float4e2m1", "uint2", 16, "float8e4m3", False, False, True, {"umma"}),
         (103, "float4e2m1", "uint2", 32, "float8e8m0", False, False, True, {"umma"}),
         (120, "float4e0m3", "uint3", 16, "float8e4m3", False, False, True, {"mxmma"}),
+        (90, "float8e4m3", "float8e5m2", 0, "bfloat16", False, False, False, {"mma", "wgmma"}),
+        (90, "float8e5m2", "uint5", 0, "bfloat16", False, False, False, {"mma", "wgmma"}),
+        (100, "float8e5m2", "uint6", 0, "bfloat16", False, False, False, {"umma"}),
+        (100, "float8e5m2", "uint5", 0, "bfloat16", False, False, True, {"umma"}),
+        (100, "float8e4m3", "float8e3m4", 0, "bfloat16", False, False, False, {"umma"}),
+        (120, "float8e5m2", "uint5", 0, "bfloat16", False, False, False, {"mxmma"}),
+        (120, "float8e5m2", "uint5", 64, "bfloat16", False, False, True, {"mma"}),
+        (120, "float8e4m3", "float8e5m2", 0, "bfloat16", False, False, False, {"mxmma"}),
+        (120, "float4e2m1", "float4e0m3", 16, "float8e8m0", False, False, False, {"mxmma"}),
     ),
 )
 def test_sampled_backends_match_fixed_layout(
@@ -467,19 +476,23 @@ def test_output_chunk_rows_rejects_invalid_heights(output_chunk_rows):
 
 @pytest.mark.parametrize("sm_version", (100, 103, 107, 110))
 @pytest.mark.parametrize(
-    "a_dtype,b_dtype,small_m_backend",
+    "a_dtype,b_dtype,small_m_backend,shape_n",
     (
-        (dtypes.bfloat16, dtypes.uint4, "mma"),
-        (dtypes.float16, dtypes.uint4, "mma"),
-        (dtypes.int8, dtypes.int8, "mma"),
-        (dtypes.float8e4m3, dtypes.float8e4m3, "umma"),
-        (dtypes.float8e4m3, dtypes.float4e2m1, "umma"),
-        (dtypes.float4e2m1, dtypes.float4e2m1, "umma"),
-        (dtypes.float8e3m4, dtypes.float8e3m4, "umma"),
-        (dtypes.float8e3m4, dtypes.float6e2m3, "umma"),
+        (dtypes.bfloat16, dtypes.uint4, "mma", 256),
+        (dtypes.float16, dtypes.uint4, "mma", 256),
+        (dtypes.int8, dtypes.int8, "mma", 256),
+        (dtypes.float8e4m3, dtypes.float8e4m3, "umma", 256),
+        (dtypes.float8e4m3, dtypes.float4e2m1, "umma", 256),
+        (dtypes.float4e2m1, dtypes.float4e2m1, "umma", 256),
+        (dtypes.float8e3m4, dtypes.float8e3m4, "umma", 256),
+        (dtypes.float8e3m4, dtypes.float6e2m3, "umma", 256),
+        (dtypes.float8e4m3, dtypes.float8e5m2, "mma", 192),
+        (dtypes.float8e5m2, dtypes.float8e4m3, "mma", 192),
+        (dtypes.float8e5m2, dtypes.float5e0m4, "mma", 192),
+        (dtypes.float8e5m2, dtypes.uint5, "mma", 192),
     ),
 )
-def test_umma_architecture_selection(sm_version, a_dtype, b_dtype, small_m_backend, monkeypatch):
+def test_umma_architecture_selection(sm_version, a_dtype, b_dtype, small_m_backend, shape_n, monkeypatch):
     from humming.config import MmaType
     from humming.config.mma import get_default_mma_type
     from humming.device import current_device
@@ -499,7 +512,7 @@ def test_umma_architecture_selection(sm_version, a_dtype, b_dtype, small_m_backe
         )
     config = LayerConfig(
         sm_version=sm_version,
-        shape_n=256,
+        shape_n=shape_n,
         shape_k=256,
         a_dtype=a_dtype,
         b_dtype=b_dtype,
@@ -513,7 +526,8 @@ def test_umma_architecture_selection(sm_version, a_dtype, b_dtype, small_m_backe
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     if a_dtype == dtypes.int8:
         small_m_backend = expected.value
-    for shape_m, backend in ((17, small_m_backend), (257, expected.value)):
+    large_m_backend = expected.value if shape_n % 128 == 0 else "mma"
+    for shape_m, backend in ((17, small_m_backend), (257, large_m_backend)):
         tuning = Sm100Heuristics.get_config(config, shape_m)
         assert tuning["mma_type"] == backend
 
@@ -637,6 +651,8 @@ def test_device_register_budget(registers_per_sm, expected, monkeypatch):
         ("float4e0m3", "float4e0m3", 16, 0, "float8e8m0", True),
         ("float4e0m3", "float4e0m3", 0, 16, "float8e4m3", False),
         ("float4e2m1", "float4e2m1", 0, 0, "float8e8m0", False),
+        ("float4e0m3", "float4e0m3", 0, 0, "float8e8m0", True),
+        ("float4e2m1", "float4e0m3", 0, 0, "float8e8m0", True),
     ),
 )
 def test_mxmma_compiler_version_matches_scale_format(

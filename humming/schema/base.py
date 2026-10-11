@@ -107,15 +107,19 @@ class BaseWeightSchema:
         param_dtype: torch.dtype,
         num_experts: int | None = None,
         device: int | torch.device | None = None,
+        convert_symmetric_integer: bool = True,
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
         with torch.cuda.device(device):
-            return self._convert_humming(
+            schema, output_tensors = self._convert_humming(
                 tensors,
                 shape_n_stacks,
                 shape_k_stacks,
                 param_dtype,
                 num_experts,
             )
+            if convert_symmetric_integer:
+                return schema.convert_symmetric_integer_weight(output_tensors)
+            return schema, output_tensors
 
     def _convert_humming(
         self,
