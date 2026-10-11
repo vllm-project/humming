@@ -8,7 +8,7 @@ import random
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
-from humming.config.mma import get_register_budget_error
+from humming.config.mma import get_mma_b_dtype, get_register_budget_error
 from humming.device import current_device
 from humming.tune import get_heuristics_config
 from humming.utils.smem import estimate_smem_size_config, fits_device_smem
@@ -86,11 +86,13 @@ def _is_legal_mma_type(layer_config, compute_config, mma_type):
     if sm_version < min_sm.get(layer_config.a_dtype, 999):
         return False
     if layer_config.a_dtype.is_floating_point_type and layer_config.b_dtype.is_floating_point_type:
-        if layer_config.b_dtype.exponent_bits > layer_config.a_dtype.exponent_bits:
+        mma_b_dtype = get_mma_b_dtype(
+            layer_config.a_dtype, layer_config.b_dtype, layer_config.has_zero_point, sm_version
+        )
+        if layer_config.b_dtype.exponent_bits > mma_b_dtype.exponent_bits:
             return False
-        if layer_config.b_dtype.mantissa_bits > layer_config.a_dtype.mantissa_bits:
-            return False
-        if layer_config.a_dtype.exponent_bits and not layer_config.b_dtype.exponent_bits:
+        required_mantissa = layer_config.b_dtype.mantissa_bits - (layer_config.b_dtype.exponent_bits == 0)
+        if required_mantissa > mma_b_dtype.mantissa_bits:
             return False
     return True
 

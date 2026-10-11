@@ -109,6 +109,18 @@ BS2_CASES = tuple(
 SCALE_CASES = (
     *(
         _case(
+            f"mixed-e5m2-{b_dtype}-group{group_size}",
+            a_dtype=dtypes.float8e5m2,
+            b_dtype=b_dtype,
+            bs_dtype=dtypes.float8e8m0 if group_size == 32 else dtypes.bfloat16,
+            input_scale_group_size=group_size,
+            weight_scale_group_size=group_size,
+        )
+        for b_dtype in (dtypes.uint5, dtypes.float5e0m4, dtypes.float8e4m3)
+        for group_size in (32, 64)
+    ),
+    *(
+        _case(
             f"e0m-group64-{a_dtype}-bs-{bs_dtype}",
             a_dtype=a_dtype,
             b_dtype=dtypes.float8e0m7,

@@ -4,7 +4,8 @@ import pytest
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig
-from humming.config.mma import get_default_mma_type
+from humming.config.mma import get_default_mma_type, get_mma_b_dtype
+from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -42,7 +43,8 @@ def _supports_integer_zero_point(a_dtype, b_dtype) -> bool:
         return False
     if a_dtype.is_integer_type:
         return b_dtype.num_bits < a_dtype.num_bits
-    return b_dtype.num_bits <= a_dtype.mantissa_bits + 1
+    mma_b_dtype = get_mma_b_dtype(a_dtype, b_dtype, True, current_device.sm_version)
+    return b_dtype.num_bits <= mma_b_dtype.mantissa_bits + 1
 
 
 def _make_cases() -> list[KernelTestCase]:

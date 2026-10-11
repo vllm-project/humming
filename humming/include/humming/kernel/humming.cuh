@@ -27,7 +27,7 @@ CUDA_INLINE const void *param_to_ptr(void *const &x) { return x; }
 template <
     class MmaOpClass,
     class ProblemShape, class BlockShape, class WarpShape, class PadShape,
-    class ElementA, class ElementB, class ElementC, class ElementBS,
+    class ElementA, class ElementQB, class ElementC, class ElementBS,
     class LayerConfig, class ComputeConfig, class TuningConfig>
 __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPerSm) void humming(
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaA>::Type A,
@@ -55,11 +55,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr bool kUsePdl = TuningConfig::kUsePdl;
 
   using SharedStorage = SharedStorage<
-      MmaOpClass, BlockShape, WarpShape, ElementA, ElementB, ElementBS,
+      MmaOpClass, BlockShape, WarpShape, ElementA, ElementQB, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
   using Ctx = KernelContext<
       MmaOpClass, ProblemShape, BlockShape, WarpShape, PadShape,
-      ElementA, ElementB, ElementC, ElementBS,
+      ElementA, ElementQB, ElementC, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
   using Scheduler = Scheduler<Ctx>;
   using ProducerPipeline = ProducerPipeline<Ctx>;

@@ -20,6 +20,7 @@ from humming.config import (
 from humming.config.config import _cuda_compiler_version
 from humming.config.mma import (
     get_default_mma_type,
+    get_mma_b_dtype,
     get_mxmma_compiler_error,
     get_mxmma_scale_config,
     get_register_budget_error,
@@ -54,6 +55,7 @@ CODE_TEMPLATE = jinja2.Template("""
 
 class MmaOpClass {
 public:
+using ElementB = {{mma_b_dtype}};
 {{mma_op_class}}
 };
 
@@ -145,6 +147,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
     def init_kernel(self) -> None:
         self.check_shape()
+        self.select_mma_dtypes()
         self.check_dtype()
         self.check_scale()
         self.check_config()
@@ -155,6 +158,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         template_args.update(
             use_umma_pipeline=self.use_umma_pipeline,
             mma_op_class=self.mma_op_class.to_cpp_str(),
+            mma_b_dtype=self.mma_b_dtype.to_cpp_str(),
             problem_shape=self.problem_shape,
             pad_shape=self.pad_shape,
             block_shape=self.block_shape,
@@ -240,9 +244,26 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
             patch_cubin(cubin_path=cubin_path, mode=mode)
 
-    def select_mma_op_class(self):
+    def select_mma_dtypes(self):
         self.mma_a_dtype = self.a_dtype
-        self.mma_b_dtype = self.a_dtype
+        mma_native_mixed = (
+            self.mma_type == MmaType.MMA
+            and not self.use_fused_e8m0_scale
+            and self.sm_version // 10 == 12
+            and self.warp_shape[0] % 16 == 0
+            and self.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4)
+            and self.b_dtype in (dtypes.float4e2m1, dtypes.float6e3m2, dtypes.float6e2m3)
+        )
+        use_native_weight = self.use_raw_weight or mma_native_mixed
+        use_native_weight |= self.mma_type == MmaType.MXMMA and self.mxmma_native_mixed
+        if use_native_weight:
+            self.mma_b_dtype = self.b_dtype
+        else:
+            self.mma_b_dtype = get_mma_b_dtype(
+                self.a_dtype, self.b_dtype, self.has_zero_point, self.sm_version
+            )
+
+    def select_mma_op_class(self):
         if self.mma_type == MmaType.MXMMA:
             mma_shape_m, mma_shape_n = 16, 8
             mma_shape_k = 256 // self.a_dtype.num_bits
@@ -250,8 +271,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.warp_shape[1] % mma_shape_n == 0
             assert self.warp_shape[2] % mma_shape_k == 0
             scale_vec, sf_dtype = get_mxmma_scale_config(self)
-            use_native_weight = self.use_raw_weight or self.mxmma_native_mixed
-            self.mma_b_dtype = self.b_dtype if use_native_weight else self.a_dtype
             return MmaOpClass.from_config(
                 self.mma_type,
                 mma_shape_m,
@@ -297,17 +316,6 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert self.warp_shape[0] % mma_shape_m == 0
             assert self.warp_shape[1] % mma_shape_n == 0
         assert self.warp_shape[2] % mma_shape_k == 0
-
-        mma_native_mixed = (
-            self.mma_type == MmaType.MMA
-            and not self.use_fused_e8m0_scale
-            and self.sm_version // 10 == 12
-            and mma_shape_m == 16
-            and self.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4)
-            and self.b_dtype in (dtypes.float4e2m1, dtypes.float6e3m2, dtypes.float6e2m3)
-        )
-        use_native_weight = self.use_raw_weight or mma_native_mixed
-        self.mma_b_dtype = self.b_dtype if use_native_weight else self.a_dtype
 
         scale_dtype = dtypes.float8e8m0
         if self.is_group_input_scale:
@@ -405,7 +413,13 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         }
         assert self.a_dtype in dtype_map
         assert self.sm_version >= dtype_map[self.a_dtype]
-        if uses_undocumented_fp_operand(self.a_dtype, self.b_dtype):
+        operand_dtype_map = dtype_map | {
+            dtypes.float6e3m2: 100 if self.mma_type == MmaType.UMMA else 120,
+            dtypes.float6e2m3: 100 if self.mma_type == MmaType.UMMA else 120,
+        }
+        assert self.mma_b_dtype in operand_dtype_map
+        assert self.sm_version >= operand_dtype_map[self.mma_b_dtype]
+        if uses_undocumented_fp_operand(self.mma_a_dtype, self.mma_b_dtype):
             err_msg = f"SM{self.sm_version} does not support E3M4/E0M3 operands"
             assert supports_undocumented_fp_dtypes(self.sm_version), err_msg
         assert self.b_dtype.num_bits <= 8
@@ -419,20 +433,17 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             assert not self.b_dtype.is_signed
             assert self.b_dtype.num_bits < self.a_dtype.num_bits
             if self.has_zero_point:
-                assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 1
+                assert self.b_dtype.num_bits <= self.mma_b_dtype.mantissa_bits + 1
             else:
-                assert self.b_dtype.num_bits <= self.a_dtype.mantissa_bits + 2
+                assert self.b_dtype.num_bits <= self.mma_b_dtype.mantissa_bits + 2
         elif self.b_dtype.is_floating_point_type and self.a_dtype.is_floating_point_type:
             assert self.b_dtype.is_signed
-            uses_native_umma = (
-                self.mma_type == MmaType.UMMA and self.a_dtype.num_bits <= 8 and self.use_raw_weight
-            )
-            is_native_e0m3 = self.b_dtype == dtypes.float4e0m3 and self.a_dtype.num_bits == 4
-            if self.b_dtype.exponent_bits == 0 and not is_native_e0m3:
-                assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits + 1
-            elif not self.use_block_scaled_mma and not uses_native_umma:
-                assert self.b_dtype.exponent_bits <= self.a_dtype.exponent_bits
-                assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits
+            is_native_weight = self.b_dtype == self.mma_b_dtype
+            if self.b_dtype.exponent_bits == 0 and not is_native_weight:
+                assert self.b_dtype.mantissa_bits <= self.mma_b_dtype.mantissa_bits + 1
+            elif not is_native_weight:
+                assert self.b_dtype.exponent_bits <= self.mma_b_dtype.exponent_bits
+                assert self.b_dtype.mantissa_bits <= self.mma_b_dtype.mantissa_bits
         elif self.b_dtype.is_floating_point_type and self.a_dtype.is_integer_type:
             if self.b_dtype.exponent_bits == 0:
                 assert self.a_dtype == dtypes.int8

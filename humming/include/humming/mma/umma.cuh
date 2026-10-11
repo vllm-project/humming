@@ -335,9 +335,7 @@ struct UMMA : WMMA<Ctx, ArithClass> {
           return base + buffer * kOperandBufferColumns + k * 8;
         }
       }();
-      // The TMEM path has already dequantized weights to the activation format.
-      using ElementB = std::conditional_t<Ctx::kUseUmmaSs, typename Ctx::ElementB, typename Ctx::ElementA>;
-      // f8f6f4 descriptor format 2 selects the undocumented E3M4 format.
+      using ElementB = typename Ctx::ElementB;
       constexpr uint32_t kWeightFormat = std::is_same<ElementB, Float4E2M1>::value   ? 5
                                          : std::is_same<ElementB, Float6E3M2>::value ? 4
                                          : std::is_same<ElementB, Float6E2M3>::value ? 3

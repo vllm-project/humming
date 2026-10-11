@@ -118,7 +118,7 @@
 template <
     class MmaOpClass,
     class BlockShape, class WarpShape,
-    class ElementA, class ElementB, class ElementBS,
+    class ElementA, class ElementQB, class ElementBS,
     class LayerConfig, class ComputeConfig, class TuningConfig>
 struct SharedStorage {
 private:
@@ -158,10 +158,10 @@ public:
   static constexpr bool kUseDynamicOutputMap = TuningConfig::kUseTmaC && (kIsGroupedGemm || BlockShape::M % kOutputRows != 0);
   static constexpr uint32_t kOutputBuffers = TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 2 : 1;
   static constexpr uint32_t kBlockOutputSize = kOutputBuffers * kOutputRows * BlockShape::N / 8;
-  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementQB::kBits));
 
   static constexpr uint32_t kSmemStrideA = BlockShape::K * ElementA::kBits / 32 / 4;
-  static constexpr uint32_t kSmemStrideB = BlockShape::N * kPartMmaShapeK * ElementB::kBits / 32 / 4;
+  static constexpr uint32_t kSmemStrideB = BlockShape::N * kPartMmaShapeK * ElementQB::kBits / 32 / 4;
   static constexpr uint32_t kSmemStrideBS = BlockShape::N * ElementBS::kBits / 32 / 4;
   static constexpr uint32_t kSmemStrideBZP = BlockShape::N * kNumZPBits / 32 / 4;
   static constexpr uint32_t kSmemStrideBias = BlockShape::N * 16 / 32 / 4;
@@ -174,8 +174,8 @@ public:
   static constexpr uint32_t kScaleBlockM = BlockShape::M + (kIsGroupedGemm ? kScaleMAlignment : 0);
 
   static constexpr uint32_t kStageSizeA = BlockShape::M / TuningConfig::kUmmaCtaGroupSize * kSmemStrideA;
-  static constexpr bool kExpandUmmaWeight = TuningConfig::kUseUmmaSs && ElementA::kBits == 8 && ElementB::kBits < 8;
-  static constexpr uint32_t kWeightSmemBits = kExpandUmmaWeight ? 8 : ElementB::kBits;
+  static constexpr bool kExpandUmmaWeight = TuningConfig::kUseUmmaSs && ElementA::kBits == 8 && ElementQB::kBits < 8;
+  static constexpr uint32_t kWeightSmemBits = kExpandUmmaWeight ? 8 : ElementQB::kBits;
   // Expanded TMA coordinates are 128-element aligned; cover the leading K offset.
   static constexpr uint32_t kWeightKAlignment = BlockShape::K % 128 == 0 ? 128 : (BlockShape::K % 64 == 0 ? 64 : 32);
   static constexpr uint32_t kWeightStageK = kExpandUmmaWeight
@@ -218,7 +218,7 @@ public:
   static constexpr uint32_t kStageBytesA = kStageSizeA * sizeof(int4);
   static constexpr uint32_t kStageBytesB = kStageSizeB * sizeof(int4);
   // TMA expansion reports the packed source bytes, not the padded SMEM bytes.
-  static constexpr uint32_t kStageLoadBytesB = kWeightStageK * kWeightStageN * ElementB::kBits / 8;
+  static constexpr uint32_t kStageLoadBytesB = kWeightStageK * kWeightStageN * ElementQB::kBits / 8;
   static constexpr uint32_t kStageBytesAS = kStageSizeAS * sizeof(int4);
   // A row-major TMA box holds exactly the tile's rows, without the grouped padding rows.
   static constexpr uint32_t kStageTmaBytesAS = kUseUmmaRowMajorSmemInputScale ? kStageBytesAS / kScaleBlockM * BlockShape::M : kStageBytesAS;

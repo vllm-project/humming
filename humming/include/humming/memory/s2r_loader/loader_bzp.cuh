@@ -9,7 +9,7 @@ private:
   using BlockShape = typename Ctx::BlockShape;
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
-  using ElementB = typename Ctx::ElementB;
+  using ElementQB = typename Ctx::ElementQB;
 
   static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kIsChannelScale = Ctx::kIsChannelWeightScale;
@@ -21,7 +21,7 @@ private:
   static constexpr uint32_t N_WARPS = Ctx::N_WARPS;
   static constexpr uint32_t K_WARPS = Ctx::K_WARPS;
 
-  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementQB::kBits));
   static constexpr uint32_t kNumGroupsPerMma = Ctx::kUseBlockScaledMma && ElementA::kBits == 4 && kIsGroupScale ? kPartMmaShapeK / kGroupSize : 1;
   static constexpr uint32_t kLoadBytes = WarpShape::N / 8 * kNumZPBits / 8 * kNumGroupsPerMma;
   using LoadType = typename LoadTypeChooser<kLoadBytes>::Type;

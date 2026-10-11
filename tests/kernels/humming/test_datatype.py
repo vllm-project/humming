@@ -2,7 +2,8 @@ import pytest
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig
-from humming.config.mma import get_default_mma_type
+from humming.config.mma import get_default_mma_type, get_mma_b_dtype
+from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -64,6 +65,7 @@ C_DTYPES = ("float16", "bfloat16")
 
 
 def _is_compatible(a_dtype, b_dtype) -> bool:
+    mma_b_dtype = get_mma_b_dtype(a_dtype, b_dtype, False, current_device.sm_version)
     if b_dtype.num_bits > a_dtype.num_bits:
         return False
 
@@ -76,21 +78,22 @@ def _is_compatible(a_dtype, b_dtype) -> bool:
         return (
             not b_dtype.is_signed
             and b_dtype.num_bits < a_dtype.num_bits
-            and b_dtype.num_bits <= a_dtype.mantissa_bits + 2
+            and b_dtype.num_bits <= mma_b_dtype.mantissa_bits + 2
         )
 
     if b_dtype.is_floating_point_type and a_dtype.is_integer_type:
         return a_dtype == dtypes.int8 and b_dtype.exponent_bits == 0 and b_dtype.num_bits < 8
 
     if b_dtype.is_floating_point_type and a_dtype.is_floating_point_type:
+        if b_dtype == mma_b_dtype:
+            return True
         if b_dtype.exponent_bits == 0:
-            is_native_fp4 = b_dtype == dtypes.float4e0m3 and a_dtype.num_bits == 4
-            return is_native_fp4 or b_dtype.mantissa_bits <= a_dtype.mantissa_bits + 1
+            return b_dtype.mantissa_bits <= mma_b_dtype.mantissa_bits + 1
         return (
             b_dtype.is_signed
-            and b_dtype.exponent_bits <= a_dtype.exponent_bits
-            and b_dtype.mantissa_bits <= a_dtype.mantissa_bits
-            and (a_dtype.exponent_bits == 0 or b_dtype.exponent_bits >= 1)
+            and b_dtype.exponent_bits <= mma_b_dtype.exponent_bits
+            and b_dtype.mantissa_bits <= mma_b_dtype.mantissa_bits
+            and (mma_b_dtype.exponent_bits == 0 or b_dtype.exponent_bits >= 1)
         )
 
     return False
@@ -153,6 +156,12 @@ DATATYPE_CASES = _make_cases()
 def test_datatype(test_case):
     skip_if_unsupported(
         a_dtype=test_case.layer_config.a_dtype,
+        b_dtype=get_mma_b_dtype(
+            test_case.layer_config.a_dtype,
+            test_case.layer_config.b_dtype,
+            False,
+            current_device.sm_version,
+        ),
         mma_type=get_default_mma_type(test_case.layer_config).value,
     )
     results = KernelTestRunner(test_case).run()

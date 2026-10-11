@@ -10,7 +10,7 @@ private:
   using SharedStorage = typename Ctx::SharedStorage;
   using BlockShape = typename Ctx::BlockShape;
   using ElementA = typename Ctx::ElementA;
-  using ElementB = typename Ctx::ElementB;
+  using ElementQB = typename Ctx::ElementQB;
 
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
   static constexpr bool kUseTma = Ctx::kUseTmaB;
@@ -27,9 +27,9 @@ private:
   static constexpr uint32_t kSwizzleBytes = MIN(128u, SharedStorage::kWeightStageK *kWeightSmemBits / 8);
   static constexpr uint32_t kSwizzleK = kSwizzleBytes * 8 / kWeightSmemBits;
   static constexpr uint32_t kPackSizeK = Ctx::kUsePackedKLayout ? 64 : (256 / ElementA::kBits);
-  static constexpr uint32_t kSmemStride = BlockShape::N * kPackSizeK * ElementB::kBits / 32 / 4;
-  static constexpr uint32_t kGmemStride = ProblemShape::N * kPackSizeK * ElementB::kBits / 32 / 4;
-  static constexpr uint32_t kGmemExpertStride = ProblemShape::N * ProblemShape::K * ElementB::kBits / 32 / 4;
+  static constexpr uint32_t kSmemStride = BlockShape::N * kPackSizeK * ElementQB::kBits / 32 / 4;
+  static constexpr uint32_t kGmemStride = ProblemShape::N * kPackSizeK * ElementQB::kBits / 32 / 4;
+  static constexpr uint32_t kGmemExpertStride = ProblemShape::N * ProblemShape::K * ElementQB::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::K / kPackSizeK;
 
 public:
@@ -67,9 +67,9 @@ public:
     if (warp_id == 0) {
       aiu_load_gmem_linear_3d(
           gmem_ptr, smem_ptr,
-          ProblemShape::K / kPackSizeK, ProblemShape::N / 32, kPackSizeK * ElementB::kBits,
+          ProblemShape::K / kPackSizeK, ProblemShape::N / 32, kPackSizeK * ElementQB::kBits,
           row_offset, col_offset, 0,
-          BlockShape::K / kPackSizeK, BlockShape::N / 32, kPackSizeK * ElementB::kBits);
+          BlockShape::K / kPackSizeK, BlockShape::N / 32, kPackSizeK * ElementQB::kBits);
     }
   }
 
@@ -77,7 +77,7 @@ public:
   void load_tma(int4 *smem_ptr, void *mbar_ptr) {
     if (ctx.load_thread_id() == 0) {
       if constexpr (Ctx::kUseRawWeight) {
-        constexpr uint32_t kCoordinateBits = SharedStorage::kExpandUmmaWeight ? 1 : 32 / ElementB::kBits;
+        constexpr uint32_t kCoordinateBits = SharedStorage::kExpandUmmaWeight ? 1 : 32 / ElementQB::kBits;
         uint32_t start_k = kCoordinateBits == 1 ? row_offset / 128 * 128 : row_offset;
         if constexpr (Ctx::kUseWgmmaTmaKPack) {
           if (cluster_rank == 0)
@@ -122,9 +122,9 @@ public:
   CUDA_INLINE
   void load_raw(int4 *smem_ptr) {
     if constexpr (kUseAiu) return load_raw_aiu(smem_ptr);
-    static_assert(ElementA::kBits == ElementB::kBits);
-    constexpr uint32_t kRowInt4s = BlockShape::K * ElementB::kBits / 128;
-    constexpr uint32_t kGlobalRowInt4s = ProblemShape::K * ElementB::kBits / 128;
+    static_assert(ElementA::kBits == ElementQB::kBits);
+    constexpr uint32_t kRowInt4s = BlockShape::K * ElementQB::kBits / 128;
+    constexpr uint32_t kGlobalRowInt4s = ProblemShape::K * ElementQB::kBits / 128;
     constexpr uint32_t kSwizzleInt4s = kSwizzleBytes / sizeof(int4);
     uint32_t smem_base = cast_smem_ptr_to_uint(smem_ptr) / 128;
     constexpr uint32_t kRowsPerIteration = kNumLoadThreads / kRowInt4s;
@@ -162,7 +162,7 @@ public:
     const uint32_t warp_id = ctx.load_thread_id() / 32;
     PRAGMA_UNROLL
     for (uint32_t slab = warp_id; slab < CEIL_DIV(BlockShape::K, kSwizzleK); slab += kNumLoadThreads / 32) {
-      aiu_load_gmem<ElementB::kBits>(
+      aiu_load_gmem<ElementQB::kBits>(
           gmem_ptr_raw, smem_ptr + slab * BlockShape::N * kSwizzleBytes / sizeof(int4),
           ProblemShape::N * MAX(1u, Ctx::kNumExperts), ProblemShape::K,
           col_offset, row_offset + slab * kSwizzleK,
@@ -181,7 +181,7 @@ public:
   void advance() {
     if constexpr (Ctx::kUseRawWeight) {
       row_offset += BlockShape::K;
-      if constexpr (!kUseTma) gmem_ptr += BlockShape::K * ElementB::kBits / 128;
+      if constexpr (!kUseTma) gmem_ptr += BlockShape::K * ElementQB::kBits / 128;
       return;
     }
     row_offset += BlockShape::K / kPackSizeK;
@@ -195,13 +195,13 @@ public:
       col_offset = expert_id * ProblemShape::N + n_block_id * BlockShape::N;
       if constexpr (!kUseTma) {
         uint64_t offset = uint64_t(col_offset) * ProblemShape::K + row_offset;
-        gmem_ptr = gmem_ptr_raw + offset * ElementB::kBits / 128;
+        gmem_ptr = gmem_ptr_raw + offset * ElementQB::kBits / 128;
       }
       return;
     }
     row_offset = k_block_id * (BlockShape::K / kPackSizeK);
     if constexpr (kUseTma) row_offset += expert_id * (ProblemShape::K / kPackSizeK);
-    col_offset = n_block_id * (kUseAiu ? BlockShape::N / 32 : BlockShape::N * ElementB::kBits / 32);
+    col_offset = n_block_id * (kUseAiu ? BlockShape::N / 32 : BlockShape::N * ElementQB::kBits / 32);
 
     uint64_t gmem_offset = expert_id * kGmemExpertStride;
     if constexpr (!kUseAiu) gmem_offset += n_block_id * kSmemStride + k_block_id * (kGmemStride * BlockShape::K / kPackSizeK);

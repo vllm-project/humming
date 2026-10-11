@@ -6,7 +6,7 @@ import torch
 from humming import dtypes, ops
 from humming.config import InputQuantizationMode
 from humming.config.enum import WeightScale2Type, WeightScaleType
-from humming.config.mma import supports_undocumented_fp_dtypes, uses_undocumented_fp_operand
+from humming.config.mma import get_mma_b_dtype, supports_undocumented_fp_dtypes, uses_undocumented_fp_operand
 from humming.device import current_device
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.utils.weight import decode_e5m3_scale, dequantize_weight, quantize_weight
@@ -476,6 +476,7 @@ def is_humming_schema_compatible(
     b_dtype = weight_schema.b_dtype
     bs_dtype = weight_schema.bs_dtype or dtypes.DataType.from_torch_dtype(param_dtype)
     has_zero_point = weight_schema.has_zero_point
+    mma_b_dtype = get_mma_b_dtype(a_dtype, b_dtype, has_zero_point, sm_version)
 
     dtype_min_sm_version_map = {
         dtypes.float16: 75,
@@ -492,7 +493,7 @@ def is_humming_schema_compatible(
     if sm_version < dtype_min_sm_version_map.get(a_dtype, 9999):
         return False
 
-    if uses_undocumented_fp_operand(a_dtype, b_dtype) and not supports_undocumented_fp_dtypes(sm_version):
+    if uses_undocumented_fp_operand(a_dtype, mma_b_dtype) and not supports_undocumented_fp_dtypes(sm_version):
         return False
 
     if b_dtype.num_bits > min(8, a_dtype.num_bits):
@@ -516,20 +517,19 @@ def is_humming_schema_compatible(
         if b_dtype in [dtypes.int8, dtypes.uint8] and has_zero_point:
             return False
     elif b_dtype.is_integer_type:
-        if b_dtype.num_bits >= a_dtype.num_bits or b_dtype.num_bits > a_dtype.mantissa_bits + 2:
+        if b_dtype.num_bits >= mma_b_dtype.num_bits or b_dtype.num_bits > mma_b_dtype.mantissa_bits + 2:
             return False
-        elif has_zero_point and b_dtype.num_bits > a_dtype.mantissa_bits + 1:
+        elif has_zero_point and b_dtype.num_bits > mma_b_dtype.mantissa_bits + 1:
             return False
     elif b_dtype.is_floating_point_type:
         assert b_dtype.is_floating_point_type and a_dtype.is_floating_point_type
         if b_dtype.exponent_bits == 0:
-            is_native_fp4 = b_dtype == dtypes.float4e0m3 and a_dtype.num_bits == 4
-            if not is_native_fp4 and b_dtype.mantissa_bits > a_dtype.mantissa_bits + 1:
+            if b_dtype != mma_b_dtype and b_dtype.mantissa_bits > mma_b_dtype.mantissa_bits + 1:
                 return False
         else:
-            if b_dtype.mantissa_bits > a_dtype.mantissa_bits:
+            if b_dtype.mantissa_bits > mma_b_dtype.mantissa_bits:
                 return False
-            if b_dtype.exponent_bits > a_dtype.exponent_bits:
+            if b_dtype.exponent_bits > mma_b_dtype.exponent_bits:
                 return False
 
     input_group_size = input_schema.input_scale_group_size
