@@ -6,7 +6,7 @@ import numpy as np
 
 from humming import dtypes
 from humming.config import GemmType, LayerConfig, MmaType, TuningConfig
-from humming.config.mma import get_default_mma_type, get_register_budget_error
+from humming.config.mma import get_default_mma_type
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
 from humming.tune.candidate import (
@@ -21,60 +21,6 @@ from humming.tune.candidate import (
 from humming.utils.smem import estimate_smem_size_layer
 
 
-def get_sm90_max_warp_m(layer_config: LayerConfig, config: dict, use_f16_accum: bool = False) -> int:
-    """Bound RS tiles using their operand and accumulator lifetimes."""
-    mma_type = MmaType(config.get("mma_type") or get_default_mma_type(layer_config))
-    if mma_type != MmaType.WGMMA or layer_config.use_raw_weight or layer_config.use_packed_k_layout:
-        return 256
-
-    _, warp_n, _ = config["warp_shape"]
-    math_threads = math.prod(config["block_shape"]) // math.prod(config["warp_shape"]) * 32
-    use_warp_spec = config.get("use_warp_spec", False)
-    num_threads = math_threads + (128 if use_warp_spec else 0)
-    launch_budget = 65536 // (num_threads * config.get("num_ctas_per_sm", 1)) // 8 * 8
-    math_budget = min(255, launch_budget)
-    if use_warp_spec:
-        producer_registers = (
-            40
-            if math_threads > 256
-            or (config.get("num_ctas_per_sm", 1) == 1 and layer_config.a_dtype.num_bits != 16)
-            else 24
-        )
-        math_budget = (launch_budget * num_threads - producer_registers * 128) // math_threads // 8 * 8
-        math_budget = min(96 if math_threads > 256 else 232, math_budget)
-
-    has_group_accumulator = layer_config.a_dtype.num_bits < 16 and (
-        layer_config.is_group_input_scale
-        or (
-            not layer_config.use_fused_e8m0_scale
-            and (layer_config.is_group_weight_scale or layer_config.is_block_weight_scale)
-        )
-    )
-    if has_group_accumulator and not use_warp_spec and warp_n < 32:
-        return 8
-
-    registers_per_row = warp_n / (64 if use_f16_accum else 32)
-    if has_group_accumulator:
-        registers_per_row *= 2 if layer_config.is_group_input_scale or math_threads > 256 else 1.25
-    overhead = 24 if use_warp_spec else 32
-    operand_registers = warp_n / 2
-    accumulator_budget = math_budget - overhead - operand_registers
-    if layer_config.is_group_input_scale:
-        # Group promotion and row-scale addressing stay live with RS operands.
-        promotion_budget = 160 if use_warp_spec else 128
-        if not config.get("wgmma_split_issue_wait", False):
-            promotion_budget -= 8
-        accumulator_budget = min(accumulator_budget, promotion_budget)
-        max_rows = int(accumulator_budget / registers_per_row)
-        while max_rows > 0:
-            scale_registers = math.ceil(max_rows / 16) * 4
-            if max_rows * registers_per_row + scale_registers <= math_budget - overhead - operand_registers:
-                break
-            max_rows -= 1
-        return max_rows
-    return max(0, int(accumulator_budget / registers_per_row))
-
-
 def fit_sm90_tile(
     layer_config: LayerConfig,
     config: dict,
@@ -83,7 +29,6 @@ def fit_sm90_tile(
     gemm_type: GemmType = GemmType.DENSE,
     use_m_major_input_scale: bool = False,
 ) -> dict:
-    """Preserve the tile before trading its register space for CTA residency."""
     config = config.copy()
     requested_ctas = config.get("num_ctas_per_sm", 1)
     block_m, block_n, block_k = config["block_shape"]
@@ -91,24 +36,66 @@ def fit_sm90_tile(
     has_small_group_reduction = layer_config.is_group_input_scale and warp_m <= 16
     if has_small_group_reduction and config.get("use_warp_spec", False) and block_k > warp_k:
         config["block_shape"] = (block_m, block_n, warp_k)
-    max_warp_m = get_sm90_max_warp_m(layer_config, config, use_f16_accum)
-    can_widen_rs = not config.get("use_warp_spec", False) and layer_config.shape_n % 128 == 0
-    if warp_m > max_warp_m and warp_n < 32 and can_widen_rs:
+    mma_type = MmaType(config.get("mma_type") or get_default_mma_type(layer_config))
+    use_warp_spec = config.get("use_warp_spec", False)
+    has_group_weight_scale = layer_config.is_group_weight_scale or layer_config.is_block_weight_scale
+    has_weight_scale_accumulator = has_group_weight_scale and not layer_config.use_fused_e8m0_scale
+    has_scaled_accumulator = layer_config.is_group_input_scale or has_weight_scale_accumulator
+    has_group_accumulator = layer_config.a_dtype.num_bits < 16 and has_scaled_accumulator
+    has_unpacked_rs = not layer_config.use_raw_weight and not layer_config.use_packed_k_layout
+    should_widen_rs = has_unpacked_rs and has_group_accumulator and not use_warp_spec and warp_n < 32
+    if mma_type == MmaType.WGMMA and should_widen_rs and layer_config.shape_n % 128 == 0:
         config["block_shape"] = (block_m, max(128, block_n), block_k)
         config["warp_shape"] = (warp_m, 32, warp_k)
 
     tuning_fields = TuningConfig.get_field_names()
     while True:
+        block_m, block_n, block_k = config["block_shape"]
+        warp_m, warp_n, warp_k = config["warp_shape"]
+        math_threads = math.prod(config["block_shape"]) // math.prod(config["warp_shape"]) * 32
+        if mma_type == MmaType.WGMMA:
+            if layer_config.use_packed_k_layout and layer_config.is_group_input_scale and math_threads >= 256:
+                requested_ctas = min(requested_ctas, 2)
+            has_wide_a16_tile = layer_config.a_dtype.num_bits == 16 and warp_n >= 64 and warp_m > 32
+            if has_wide_a16_tile and math_threads >= 256:
+                requested_ctas = 1
+            if "num_ctas_per_sm" in config:
+                config["num_ctas_per_sm"] = requested_ctas
+            max_warp_m = 192 if warp_n <= 16 else 128 if warp_n <= 32 else 64
+            if layer_config.a_dtype.num_bits == 16 and use_warp_spec and warp_n <= 32:
+                max_warp_m = 192
+            if has_group_accumulator:
+                max_warp_m = 160 if warp_n <= 16 else 96 if warp_n <= 32 else 48
+                if has_unpacked_rs:
+                    max_warp_m = 128 if warp_n <= 16 else 80 if warp_n <= 32 else 48
+                    if layer_config.a_dtype.is_integer_type:
+                        max_warp_m = min(max_warp_m, 64)
+                    if layer_config.is_group_input_scale and warp_n >= 32:
+                        max_warp_m = min(max_warp_m, 64)
+                    if not use_warp_spec:
+                        max_warp_m = min(max_warp_m, 8 if warp_n < 32 else 64)
+                elif layer_config.use_packed_k_layout and requested_ctas > 1:
+                    max_warp_m = min(max_warp_m, 128)
+            if math_threads > 256:
+                max_warp_m = min(max_warp_m, 32 if has_group_accumulator else 64)
+            if requested_ctas >= 3:
+                max_warp_m = min(max_warp_m, 32 if use_warp_spec and has_group_accumulator else 64)
+            if layer_config.use_packed_k_layout and warp_k > 128:
+                max_warp_m = min(max_warp_m, 96)
+        else:
+            max_warp_m = 64 if warp_n <= 32 else 32
+            if has_group_accumulator:
+                max_warp_m = min(max_warp_m, 32)
+        if warp_m > max_warp_m:
+            alignment = 16 if layer_config.a_dtype.is_integer_type and warp_m > 32 else 8
+            smaller_m = max_warp_m // alignment * alignment
+            config["block_shape"] = (block_m // warp_m * smaller_m, block_n, block_k)
+            config["warp_shape"] = (smaller_m, warp_n, warp_k)
+            continue
+
         tuning_values = {key: value for key, value in config.items() if key in tuning_fields}
         for num_ctas in range(requested_ctas, 0, -1):
-            candidate = config | {"num_ctas_per_sm": num_ctas}
-            max_warp_m = get_sm90_max_warp_m(layer_config, candidate, use_f16_accum)
-            if candidate["warp_shape"][0] > max_warp_m:
-                continue
             tuning = TuningConfig(**(tuning_values | {"num_ctas_per_sm": num_ctas}))
-            error = get_register_budget_error(layer_config, tuning, use_f16_accum, registers_per_sm=65536)
-            if error is not None:
-                continue
             stages = config.get("num_stages", 2)
             has_packed_group_input = (
                 layer_config.use_packed_k_layout
@@ -160,7 +147,7 @@ def fit_sm90_tile(
         alignment = 16 if layer_config.a_dtype.is_integer_type and warp_m > 32 else 8
         smaller_m = min(warp_m - 1, max_warp_m) // alignment * alignment
         if smaller_m < 8:
-            raise ValueError(f"no SM90 tile fits the register allocation: {config}")
+            raise ValueError(f"no SM90 tile fits shared memory: {config}")
         config["block_shape"] = (block_m // warp_m * smaller_m, block_n, block_k)
         config["warp_shape"] = (smaller_m, warp_n, warp_k)
 
@@ -454,7 +441,13 @@ def get_overlap_config(
                 "wgmma_use_late_as": layer.is_group_input_scale and block_m > 96,
                 "raster_group_m": 1,
             }
-            if block_m > get_sm90_max_warp_m(layer, config):
+            fitted = fit_sm90_tile(
+                layer,
+                config,
+                gemm_type=gemm_type,
+                use_m_major_input_scale=use_m_major_input_scale,
+            )
+            if fitted != config:
                 continue
             smem_size = estimate_smem_size_layer(
                 layer,
@@ -543,9 +536,12 @@ def get_short_k_config(
         "smem_reuse_mode": "all_stages",
         "raster_group_m": 1,
     }
-    tuning = TuningConfig(**config)
-    if get_register_budget_error(layer_config, tuning, registers_per_sm=65536):
-        return None
+    config = fit_sm90_tile(
+        layer_config,
+        config,
+        gemm_type=gemm_type,
+        use_m_major_input_scale=use_m_major_input_scale,
+    )
     smem_size = estimate_smem_size_layer(
         layer_config,
         config["block_shape"],
@@ -1015,10 +1011,13 @@ def get_scaled_a8_config(
         }
 
     def fits_resources(config):
-        if config["warp_shape"][0] > get_sm90_max_warp_m(layer_config, config):
-            return False
-        tuning = TuningConfig(**config)
-        if get_register_budget_error(layer_config, tuning, registers_per_sm=65536):
+        fitted = fit_sm90_tile(
+            layer_config,
+            config,
+            gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        if fitted != config:
             return False
         smem_size = estimate_smem_size_layer(
             layer_config,
@@ -1195,8 +1194,13 @@ def get_packed_wna8_config(
         }
         if use_warp_spec:
             config["producer_stage_unroll"] = 2
-        tuning = TuningConfig(**config)
-        if get_register_budget_error(layer_config, tuning, registers_per_sm=65536):
+        fitted = fit_sm90_tile(
+            layer_config,
+            config,
+            gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        if fitted != config:
             continue
         smem_size = estimate_smem_size_layer(
             layer_config,
@@ -1300,22 +1304,15 @@ def _analyze_moe_candidate(
             policy,
         )
     )
-    while True:
-        analysis = analyze_candidate(problem, candidate)
-        max_warp_m = get_sm90_max_warp_m(problem.layer_config, candidate.to_config(), problem.use_f16_accum)
-        if analysis.legal and candidate.warp_shape[0] <= max_warp_m:
-            return analysis
-        if candidate.num_ctas_per_sm == 1:
-            fitted = fit_sm90_tile(
-                problem.layer_config,
-                candidate.to_config(),
-                problem.use_f16_accum,
-                gemm_type=problem.gemm_type,
-                use_m_major_input_scale=problem.use_m_major_input_scale,
-            )
-            candidate = ScheduleCandidate.from_config(candidate.candidate_id, fitted)
-            return analyze_candidate(problem, candidate)
-        candidate = candidate.with_updates(num_ctas_per_sm=candidate.num_ctas_per_sm - 1)
+    fitted = fit_sm90_tile(
+        problem.layer_config,
+        candidate.to_config(),
+        problem.use_f16_accum,
+        gemm_type=problem.gemm_type,
+        use_m_major_input_scale=problem.use_m_major_input_scale,
+    )
+    candidate = ScheduleCandidate.from_config(candidate.candidate_id, fitted)
+    return analyze_candidate(problem, candidate)
 
 
 def _half_k_candidate(
