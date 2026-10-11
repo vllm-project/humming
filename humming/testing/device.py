@@ -4,7 +4,7 @@ from humming import dtypes
 from humming.config.mma import supports_undocumented_fp_dtypes, uses_undocumented_fp_operand
 from humming.device import current_device
 
-_A_DTYPE_MIN_SM = {
+_OPERAND_DTYPE_MIN_SM = {
     dtypes.int4: 80,
     dtypes.int8: 75,
     dtypes.float4e0m3: 120,
@@ -41,14 +41,19 @@ def skip_if_unsupported(
     if mma_type == "wgmma" and a_dtype == dtypes.int4:
         pytest.skip("wgmma does not support int4 activation")
 
-    if a_dtype is not None and a_dtype in _A_DTYPE_MIN_SM:
-        min_sm = _A_DTYPE_MIN_SM[a_dtype]
-        if mma_type == "umma" and a_dtype in (dtypes.float4e2m1, dtypes.float4e0m3, dtypes.float8e3m4):
+    b_dtype = b_dtype and dtypes.DataType.from_any(b_dtype)
+    mma_b_dtype = None
+    if a_dtype is not None and b_dtype is not None and b_dtype.num_bits == a_dtype.num_bits:
+        mma_b_dtype = b_dtype
+    for operand_name, operand_dtype in (("a_dtype", a_dtype), ("mma_b_dtype", mma_b_dtype)):
+        if operand_dtype not in _OPERAND_DTYPE_MIN_SM:
+            continue
+        min_sm = _OPERAND_DTYPE_MIN_SM[operand_dtype]
+        if mma_type == "umma" and operand_dtype in (dtypes.float4e2m1, dtypes.float4e0m3, dtypes.float8e3m4):
             min_sm = 100
         if sm < min_sm:
-            pytest.skip(f"a_dtype {a_dtype} requires SM>={min_sm}, current SM is {sm}")
+            pytest.skip(f"{operand_name} {operand_dtype} requires SM>={min_sm}, current SM is {sm}")
 
-    b_dtype = b_dtype and dtypes.DataType.from_any(b_dtype)
     if a_dtype is not None and uses_undocumented_fp_operand(a_dtype, b_dtype):
         if not supports_undocumented_fp_dtypes(sm):
             pytest.skip(f"SM{sm} does not support E3M4/E0M3 operands")

@@ -108,6 +108,12 @@ ZERO_POINT_CASES += [
 def test_zero_point(test_case):
     skip_if_unsupported(
         a_dtype=test_case.layer_config.a_dtype,
+        b_dtype=get_mma_b_dtype(
+            test_case.layer_config.a_dtype,
+            test_case.layer_config.b_dtype,
+            test_case.layer_config.has_zero_point,
+            current_device.sm_version,
+        ),
         mma_type=get_default_mma_type(test_case.layer_config).value,
     )
     results = KernelTestRunner(test_case).run()
