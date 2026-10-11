@@ -13,9 +13,14 @@ CUDA_INLINE constexpr uint32_t get_dtype_dequant_exp_offset() {
   if constexpr (ElementA::kIsFloatingPointType) {
     if constexpr (ElementA::kExponentBits >= 1 && ElementA::kBits > ElementB::kBits) {
       if constexpr (ElementB::kIsFloatingPointType) {
-        constexpr uint32_t source_exp_offset = 1 << (ElementB::kExponentBits - 1);
-        constexpr uint32_t target_exp_offset = 1 << (ElementA::kExponentBits - 1);
-        return target_exp_offset - source_exp_offset;
+        if constexpr (ElementB::kExponentBits == 0) {
+          if constexpr (ElementA::kBits == 16) return 0;
+          return (1 << (ElementA::kExponentBits - 1)) - 2 + ElementA::kMantissaBits;
+        } else {
+          constexpr uint32_t source_exp_offset = 1 << (ElementB::kExponentBits - 1);
+          constexpr uint32_t target_exp_offset = 1 << (ElementA::kExponentBits - 1);
+          return target_exp_offset - source_exp_offset;
+        }
       }
 
       if constexpr (ElementA::kBits != 16 && ElementB::kIsIntegerType) {

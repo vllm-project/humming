@@ -191,11 +191,15 @@ public:
 
       if constexpr (kIsFpZeroPoint) {
         static_assert(kHasZeroPoint);
-        static_assert(!ElementB::kIsSigned && ElementB::kIsIntegerType);
+        if constexpr (ElementB::kIsFloatingPointType) {
+          static_assert(ElementB::kExponentBits == 0);
+        } else {
+          static_assert(!ElementB::kIsSigned);
+        }
         uint32_t zp_buffer_id = kIsChannelWeightScale ? 0 : buffer_id;
         scalar_t2 bzp2_ptr = *reinterpret_cast<scalar_t2 *>(&zp[zp_buffer_id][j]);
 
-        if constexpr (std::is_same<ElementA, BFloat16>::value && ElementB::kNumBits >= 7) {
+        if constexpr (std::is_same<ElementA, BFloat16>::value && ElementB::kIsIntegerType && ElementB::kNumBits >= 7) {
           uint32_t exp_val = ((int32_t)kExpOffset.x - 133) + ((1 << (ElementA::kExponentBits - 1)) - 1);
           uint32_t scale_factor_uint = 0x00010001 * (exp_val << ElementA::kMantissaBits);
           scalar_t2 scale_factor = *reinterpret_cast<scalar_t2 *>(&scale_factor_uint);

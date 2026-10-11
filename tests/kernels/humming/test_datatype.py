@@ -18,6 +18,8 @@ A_DTYPES = (
     "float8e4m3",
     "float8e5m2",
     "float8e3m4",
+    "float4e2m1",
+    "float4e0m3",
     "int8",
     "int4",
 )
@@ -40,8 +42,10 @@ B_DTYPES = (
     "float4e0m3",
     "float4e2m1",
     "float4e3m0",
+    "float5e0m4",
     "float5e2m2",
     "float5e4m0",
+    "float6e0m5",
     "float6e2m3",
     "float6e3m2",
     "float6e4m1",
@@ -49,6 +53,7 @@ B_DTYPES = (
     "float7e2m4",
     "float7e4m2",
     "float7e6m0",
+    "float8e0m7",
     "float8e1m6",
     "float8e4m3",
     "float8e5m2",
@@ -68,9 +73,19 @@ def _is_compatible(a_dtype, b_dtype) -> bool:
         return not b_dtype.is_signed
 
     if b_dtype.is_integer_type and a_dtype.is_floating_point_type:
-        return not b_dtype.is_signed and b_dtype.num_bits <= a_dtype.mantissa_bits + 2
+        return (
+            not b_dtype.is_signed
+            and b_dtype.num_bits < a_dtype.num_bits
+            and b_dtype.num_bits <= a_dtype.mantissa_bits + 2
+        )
+
+    if b_dtype.is_floating_point_type and a_dtype.is_integer_type:
+        return a_dtype == dtypes.int8 and b_dtype.exponent_bits == 0 and b_dtype.num_bits < 8
 
     if b_dtype.is_floating_point_type and a_dtype.is_floating_point_type:
+        if b_dtype.exponent_bits == 0:
+            is_native_fp4 = b_dtype == dtypes.float4e0m3 and a_dtype.num_bits == 4
+            return is_native_fp4 or b_dtype.mantissa_bits <= a_dtype.mantissa_bits + 1
         return (
             b_dtype.is_signed
             and b_dtype.exponent_bits <= a_dtype.exponent_bits
@@ -95,20 +110,20 @@ def _make_cases() -> list[KernelTestCase]:
                     continue
                 if a_dtype == dtypes.float8e5m2 and c_dtype == dtypes.float16:
                     continue
+                b_dtype = dtypes.DataType.from_str(b_dtype_str)
+                if not _is_compatible(a_dtype, b_dtype):
+                    continue
 
                 layer_config = LayerConfig(
                     shape_n=SHAPE_N,
                     shape_k=SHAPE_K,
                     a_dtype=a_dtype,
-                    b_dtype=dtypes.DataType.from_str(b_dtype_str),
+                    b_dtype=b_dtype,
                     c_dtype=c_dtype,
                     bs_dtype=c_dtype,
                     input_scale_group_size=0,
                     weight_scale_group_size=0,
                 )
-                if not _is_compatible(layer_config.a_dtype, layer_config.b_dtype):
-                    continue
-
                 signature = (
                     str(layer_config.a_dtype),
                     str(layer_config.b_dtype),

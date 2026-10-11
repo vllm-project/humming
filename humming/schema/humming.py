@@ -3,7 +3,7 @@ from typing import Any, ClassVar
 
 import torch
 
-from humming import dtypes
+from humming import dtypes, ops
 from humming.config import InputQuantizationMode
 from humming.config.enum import WeightScale2Type, WeightScaleType
 from humming.config.mma import supports_undocumented_fp_dtypes, uses_undocumented_fp_operand
@@ -287,6 +287,36 @@ class HummingWeightSchema(BaseWeightSchema):
         dequanted_weight = self.dequant_tensors(tensors)
         return self.quant_tensor(dequanted_weight, target_weight_schema, param_dtype)
 
+    def convert_symmetric_integer_weight(
+        self, tensors: dict[str, torch.Tensor]
+    ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
+        num_bits = self.b_dtype.num_bits
+        has_integer_zero_point = self.has_zero_point and not self.is_fp_zero_point
+        if not self.b_dtype.is_integer_type or not 2 <= num_bits <= 8 or has_integer_zero_point:
+            return self, tensors
+
+        # Humming integer weights use offset-binary codes, even for signed source formats.
+        weight = ops.unpack_weight(tensors["weight"], num_bits)
+        if torch.any(weight == 0):
+            return self, tensors
+
+        midpoint = 1 << (num_bits - 1)
+        output_tensors = tensors.copy()
+        if self.has_zero_point:
+            zero_point = tensors["zero_point"]
+            centered_zero_point = zero_point - midpoint
+            if not torch.equal(centered_zero_point.float() + midpoint, zero_point.float()):
+                return self, tensors
+            output_tensors["zero_point"] = centered_zero_point
+
+        weight = weight - midpoint
+        weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
+        output_tensors["weight"] = ops.pack_weight(weight, num_bits)
+        weight_dtype = dtypes.FloatingPointType(
+            num_bits=num_bits, exponent_bits=0, mantissa_bits=num_bits - 1
+        )
+        return dataclasses.replace(self, b_dtype=weight_dtype), output_tensors
+
     def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
@@ -471,7 +501,11 @@ def is_humming_schema_compatible(
     is_mxfp4_weight = b_dtype == dtypes.float4e2m1 and bs_dtype == dtypes.float8e8m0
     is_mxfp4_weight = is_mxfp4_weight and weight_schema.weight_scale_group_size == 32
 
-    if a_dtype == dtypes.int4:
+    is_e0m_weight = b_dtype.is_floating_point_type and b_dtype.exponent_bits == 0
+    if a_dtype.is_integer_type and is_e0m_weight:
+        if a_dtype != dtypes.int8 or b_dtype.num_bits >= 8 or has_zero_point:
+            return False
+    elif a_dtype == dtypes.int4:
         if not b_dtype.is_integer_type or b_dtype.num_bits > 4:
             return False
         if b_dtype in [dtypes.int4, dtypes.uint4] and has_zero_point:
@@ -482,18 +516,21 @@ def is_humming_schema_compatible(
         if b_dtype in [dtypes.int8, dtypes.uint8] and has_zero_point:
             return False
     elif b_dtype.is_integer_type:
-        if b_dtype.num_bits > a_dtype.mantissa_bits + 2:
+        if b_dtype.num_bits >= a_dtype.num_bits or b_dtype.num_bits > a_dtype.mantissa_bits + 2:
             return False
         elif has_zero_point and b_dtype.num_bits > a_dtype.mantissa_bits + 1:
             return False
     elif b_dtype.is_floating_point_type:
         assert b_dtype.is_floating_point_type and a_dtype.is_floating_point_type
-        if b_dtype.mantissa_bits > a_dtype.mantissa_bits:
-            return False
-        if b_dtype.exponent_bits > a_dtype.exponent_bits:
-            return False
-        if a_dtype.exponent_bits != 0 and b_dtype.exponent_bits == 0:
-            return False
+        if b_dtype.exponent_bits == 0:
+            is_native_fp4 = b_dtype == dtypes.float4e0m3 and a_dtype.num_bits == 4
+            if not is_native_fp4 and b_dtype.mantissa_bits > a_dtype.mantissa_bits + 1:
+                return False
+        else:
+            if b_dtype.mantissa_bits > a_dtype.mantissa_bits:
+                return False
+            if b_dtype.exponent_bits > a_dtype.exponent_bits:
+                return False
 
     input_group_size = input_schema.input_scale_group_size
     weight_group_size = weight_schema.weight_scale_group_size

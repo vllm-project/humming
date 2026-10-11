@@ -632,6 +632,8 @@ def test_device_register_budget(registers_per_sm, expected, monkeypatch):
         ("float4e0m3", "float4e0m3", 16, 0, "float8e8m0", True),
         ("float4e0m3", "float4e0m3", 0, 16, "float8e4m3", False),
         ("float4e2m1", "float4e2m1", 0, 0, "float8e8m0", False),
+        ("float4e0m3", "float4e0m3", 0, 0, "float8e8m0", True),
+        ("float4e2m1", "float4e0m3", 0, 0, "float8e8m0", True),
     ),
 )
 def test_mxmma_compiler_version_matches_scale_format(

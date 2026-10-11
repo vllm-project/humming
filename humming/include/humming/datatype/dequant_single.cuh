@@ -90,7 +90,7 @@ CUDA_INLINE uint32_t fp_to_fp(uint32_t val) {
   static_assert(!SourceType::kIsSigned || TargetType::kIsSigned);
   static_assert(TargetType::kBits == 16 || TargetType::kBits == 8 || TargetType::kBits == 4);
   static_assert(SourceType::kExponentBits <= TargetType::kExponentBits);
-  static_assert(SourceType::kMantissaBits <= TargetType::kMantissaBits);
+  static_assert(SourceType::kMantissaBits <= TargetType::kMantissaBits + (SourceType::kExponentBits == 0));
   static_assert(SourceType::kIsSigned || std::is_same<SourceType, Float8E8M0>::value || std::is_same<SourceType, Float8E5M3>::value);
 
   constexpr uint32_t repeated_one = 0xFFFFFFFFu / ((1ull << TargetType::kBits) - 1);
@@ -100,12 +100,18 @@ CUDA_INLINE uint32_t fp_to_fp(uint32_t val) {
   constexpr uint32_t shifted_mask = (repeated_one << nonsign_bits) - repeated_one;
   constexpr uint32_t mask = shifted_mask << (TargetType::kBits - SourceType::kBits);
 
-  constexpr uint32_t diff_exp_bits =
-      SourceType::kExponentBits == 0
-          ? (TargetType::kMantissaBits - SourceType::kMantissaBits)
-          : (TargetType::kExponentBits - SourceType::kExponentBits + TargetType::kIsSigned - SourceType::kIsSigned);
-
-  return lop3_and_or(val, signbit_mask, (val & mask) >> diff_exp_bits);
+  if constexpr (SourceType::kExponentBits == 0) {
+    constexpr uint32_t shift = TargetType::kBits - SourceType::kBits;
+    uint32_t magnitude = (val & mask) >> shift;
+    if constexpr (TargetType::kBits == 16) {
+      using MagnitudeType = IntegerType<false, SourceType::kMantissaBits>;
+      magnitude = uint_to_f16<MagnitudeType, TargetType, false, true>(magnitude, 0);
+    }
+    return lop3_and_or(val, signbit_mask, magnitude);
+  } else {
+    constexpr uint32_t diff_exp_bits = TargetType::kExponentBits - SourceType::kExponentBits + TargetType::kIsSigned - SourceType::kIsSigned;
+    return lop3_and_or(val, signbit_mask, (val & mask) >> diff_exp_bits);
+  }
 };
 
 
@@ -123,7 +129,7 @@ CUDA_INLINE uint32_t dequant_single(uint32_t val, const uint32_t &zp_val) {
     static_assert(!kHasZeroPoint);
     return val;
   } else if constexpr (SourceType::kIsFloatingPointType && TargetType::kIsFloatingPointType) {
-    static_assert(!kHasZeroPoint);
+    static_assert(!kHasZeroPoint || (kIsFpZeroPoint && SourceType::kExponentBits == 0));
     return fp_to_fp<SourceType, TargetType>(val);
   } else if constexpr (TargetType::kIsFloatingPointType) {
     static_assert(SourceType::kIsIntegerType && !SourceType::kIsSigned);
@@ -135,8 +141,20 @@ CUDA_INLINE uint32_t dequant_single(uint32_t val, const uint32_t &zp_val) {
       return normalized_uint_to_fp<SourceType, TargetType, kHasZeroPoint, kIsFpZeroPoint>(val, zp_val);
     }
   } else if constexpr (TargetType::kIsIntegerType) {
-    static_assert(SourceType::kIsIntegerType);
-    return uint_to_int<SourceType, TargetType, kHasZeroPoint>(val, zp_val);
+    if constexpr (SourceType::kIsFloatingPointType) {
+      static_assert(SourceType::kExponentBits == 0 && !kHasZeroPoint);
+      static_assert(SourceType::kBits < TargetType::kBits);
+      static_assert(std::is_same<TargetType, Int8>::value);
+      constexpr uint32_t one = 0x01010101u;
+      constexpr uint32_t sign_mask = one << (TargetType::kBits - 1);
+      constexpr uint32_t magnitude_mask = (one << SourceType::kMantissaBits) - one;
+      uint32_t magnitude = val & magnitude_mask;
+      uint32_t has_magnitude = ((magnitude | sign_mask) - one) & sign_mask;
+      uint32_t negative = (val >> SourceType::kMantissaBits) & (has_magnitude >> (TargetType::kBits - 1));
+      return (magnitude - negative) ^ (negative * ((1u << TargetType::kBits) - 1));
+    } else {
+      return uint_to_int<SourceType, TargetType, kHasZeroPoint>(val, zp_val);
+    }
   };
 };
 

@@ -77,7 +77,7 @@ def get_mxmma_scale_config(layer_config):
     group_size = (
         layer_config.weight_scale_group_size
         or layer_config.input_scale_group_size
-        or (32 if layer_config.a_dtype.num_bits == 4 else mma_shape_k)
+        or (layer_config.mma_scale_group_size if layer_config.a_dtype.num_bits == 4 else mma_shape_k)
     )
     assert mma_shape_k % group_size == 0
     scale_dtype = (

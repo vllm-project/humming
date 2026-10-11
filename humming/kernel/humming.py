@@ -427,14 +427,19 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             uses_native_umma = (
                 self.mma_type == MmaType.UMMA and self.a_dtype.num_bits <= 8 and self.use_raw_weight
             )
-            if not self.use_block_scaled_mma and not uses_native_umma:
+            is_native_e0m3 = self.b_dtype == dtypes.float4e0m3 and self.a_dtype.num_bits == 4
+            if self.b_dtype.exponent_bits == 0 and not is_native_e0m3:
+                assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits + 1
+            elif not self.use_block_scaled_mma and not uses_native_umma:
                 assert self.b_dtype.exponent_bits <= self.a_dtype.exponent_bits
                 assert self.b_dtype.mantissa_bits <= self.a_dtype.mantissa_bits
-            uses_native_mxmma = self.mma_type == MmaType.MXMMA and self.use_raw_weight
-            if not (uses_native_umma or uses_native_mxmma):
-                assert self.a_dtype.exponent_bits == 0 or self.b_dtype.exponent_bits >= 1
         elif self.b_dtype.is_floating_point_type and self.a_dtype.is_integer_type:
-            assert self.use_fused_e8m0_scale
+            if self.b_dtype.exponent_bits == 0:
+                assert self.a_dtype == dtypes.int8
+                assert self.b_dtype.num_bits < self.a_dtype.num_bits
+                assert not self.has_zero_point
+            else:
+                assert self.use_fused_e8m0_scale
 
         if self.use_f16_accum:
             allowed_f16_dtypes = [dtypes.float16]

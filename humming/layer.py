@@ -570,11 +570,14 @@ class HummingLayer(torch.nn.Module):
         return layer
 
     def transform(self):
+        assert self.torch_dtype is not None
         device = next((param.device for param in self.parameters() if param.is_cuda), None)
+        input_schema = self.input_schema.to_humming_schema(self.torch_dtype)
+        input_dtype = input_schema.a_dtype
+        convert_symmetric_integer = input_dtype is None or input_dtype.is_floating_point_type
         convert_weight = not isinstance(self.weight_schema, HummingWeightSchema)
         convert_input = not isinstance(self.input_schema, HummingInputSchema)
         if convert_weight or convert_input:
-            assert self.torch_dtype is not None
             state_dict = self.state_dict()
             if convert_weight:
                 self.weight_schema, weight_tensors = self.weight_schema.convert_humming(
@@ -584,6 +587,7 @@ class HummingLayer(torch.nn.Module):
                     param_dtype=self.torch_dtype,
                     num_experts=self.num_experts,
                     device=device,
+                    convert_symmetric_integer=convert_symmetric_integer,
                 )
             else:
                 weight_attrs = self.weight_schema.get_tensors_attrs(
@@ -624,6 +628,13 @@ class HummingLayer(torch.nn.Module):
 
         assert isinstance(self.input_schema, HummingInputSchema)
         assert isinstance(self.weight_schema, HummingWeightSchema)
+        if convert_symmetric_integer:
+            self.weight_schema, weight_tensors = self.weight_schema.convert_symmetric_integer_weight(
+                self.state_dict()
+            )
+            for name in ("weight", "zero_point"):
+                if name in weight_tensors:
+                    setattr(self, name, torch.nn.Parameter(weight_tensors[name], requires_grad=False))
         self.humming_config = prepare_layer_config(
             shape_n=self.shape_n,
             shape_k=self.shape_k,
