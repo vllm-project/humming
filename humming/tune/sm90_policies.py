@@ -6,7 +6,7 @@ import numpy as np
 
 from humming import dtypes
 from humming.config import GemmType, LayerConfig, MmaType, TuningConfig
-from humming.config.mma import get_register_budget_error
+from humming.config.mma import get_default_mma_type, get_register_budget_error
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
 from humming.tune.candidate import (
@@ -19,6 +19,138 @@ from humming.tune.candidate import (
     get_problem_rejection_reasons,
 )
 from humming.utils.smem import estimate_smem_size_layer
+
+
+def get_sm90_max_warp_m(layer_config: LayerConfig, config: dict, use_f16_accum: bool = False) -> int:
+    """Bound RS tiles using their operand and accumulator lifetimes."""
+    mma_type = MmaType(config.get("mma_type") or get_default_mma_type(layer_config))
+    if mma_type != MmaType.WGMMA or layer_config.use_raw_weight or layer_config.use_packed_k_layout:
+        return 256
+
+    _, warp_n, _ = config["warp_shape"]
+    math_threads = math.prod(config["block_shape"]) // math.prod(config["warp_shape"]) * 32
+    use_warp_spec = config.get("use_warp_spec", False)
+    num_threads = math_threads + (128 if use_warp_spec else 0)
+    launch_budget = 65536 // (num_threads * config.get("num_ctas_per_sm", 1)) // 8 * 8
+    math_budget = min(255, launch_budget)
+    if use_warp_spec:
+        producer_registers = (
+            40
+            if math_threads > 256
+            or (config.get("num_ctas_per_sm", 1) == 1 and layer_config.a_dtype.num_bits != 16)
+            else 24
+        )
+        math_budget = (launch_budget * num_threads - producer_registers * 128) // math_threads // 8 * 8
+        math_budget = min(96 if math_threads > 256 else 232, math_budget)
+
+    has_group_accumulator = layer_config.a_dtype.num_bits < 16 and (
+        layer_config.is_group_input_scale
+        or (
+            not layer_config.use_fused_e8m0_scale
+            and (layer_config.is_group_weight_scale or layer_config.is_block_weight_scale)
+        )
+    )
+    if has_group_accumulator and not use_warp_spec and warp_n < 32:
+        return 8
+
+    registers_per_row = warp_n / (64 if use_f16_accum else 32)
+    if has_group_accumulator:
+        registers_per_row *= 2 if layer_config.is_group_input_scale or math_threads > 256 else 1.25
+    overhead = 24 if use_warp_spec else 32
+    operand_registers = warp_n / 2
+    accumulator_budget = math_budget - overhead - operand_registers
+    if layer_config.is_group_input_scale:
+        # Group promotion and row-scale addressing stay live with RS operands.
+        promotion_budget = 160 if use_warp_spec else 128
+        if not config.get("wgmma_split_issue_wait", False):
+            promotion_budget -= 8
+        accumulator_budget = min(accumulator_budget, promotion_budget)
+        max_rows = int(accumulator_budget / registers_per_row)
+        while max_rows > 0:
+            scale_registers = math.ceil(max_rows / 16) * 4
+            if max_rows * registers_per_row + scale_registers <= math_budget - overhead - operand_registers:
+                break
+            max_rows -= 1
+        return max_rows
+    return max(0, int(accumulator_budget / registers_per_row))
+
+
+def fit_sm90_tile(
+    layer_config: LayerConfig,
+    config: dict,
+    use_f16_accum: bool = False,
+    *,
+    gemm_type: GemmType = GemmType.DENSE,
+    use_m_major_input_scale: bool = False,
+) -> dict:
+    """Preserve the tile before trading its register space for CTA residency."""
+    config = config.copy()
+    requested_ctas = config.get("num_ctas_per_sm", 1)
+    block_m, block_n, block_k = config["block_shape"]
+    warp_m, warp_n, warp_k = config["warp_shape"]
+    has_small_group_reduction = layer_config.is_group_input_scale and warp_m <= 16
+    if has_small_group_reduction and config.get("use_warp_spec", False) and block_k > warp_k:
+        config["block_shape"] = (block_m, block_n, warp_k)
+    max_warp_m = get_sm90_max_warp_m(layer_config, config, use_f16_accum)
+    can_widen_rs = not config.get("use_warp_spec", False) and layer_config.shape_n % 128 == 0
+    if warp_m > max_warp_m and warp_n < 32 and can_widen_rs:
+        config["block_shape"] = (block_m, max(128, block_n), block_k)
+        config["warp_shape"] = (warp_m, 32, warp_k)
+
+    tuning_fields = TuningConfig.get_field_names()
+    while True:
+        tuning_values = {key: value for key, value in config.items() if key in tuning_fields}
+        for num_ctas in range(requested_ctas, 0, -1):
+            candidate = config | {"num_ctas_per_sm": num_ctas}
+            max_warp_m = get_sm90_max_warp_m(layer_config, candidate, use_f16_accum)
+            if candidate["warp_shape"][0] > max_warp_m:
+                continue
+            tuning = TuningConfig(**(tuning_values | {"num_ctas_per_sm": num_ctas}))
+            error = get_register_budget_error(layer_config, tuning, use_f16_accum, registers_per_sm=65536)
+            if error is not None:
+                continue
+            stages = config.get("num_stages", 2)
+            use_tma_c = tuning.use_tma_c and gemm_type != GemmType.INDEXED
+            while True:
+                smem_size = estimate_smem_size_layer(
+                    layer_config,
+                    config["block_shape"],
+                    gemm_type,
+                    stages,
+                    warp_shape=config["warp_shape"],
+                    smem_reuse_mode=config.get("smem_reuse_mode", "all_stages"),
+                    use_tma=config.get("use_tma", False),
+                    use_tma_c=use_tma_c,
+                    raster_group_m=config.get("raster_group_m", 1),
+                    output_chunk_rows=config.get("output_chunk_rows", 0),
+                    use_warp_spec=config.get("use_warp_spec", False),
+                    mma_type=tuning.mma_type or get_default_mma_type(layer_config),
+                    mma_accum_bits=16 if use_f16_accum else 32,
+                    use_m_major_input_scale=use_m_major_input_scale,
+                )
+                if smem_size * num_ctas <= 227 * 1024 or stages <= 3:
+                    break
+                stages -= 1
+            if smem_size * num_ctas > 227 * 1024:
+                continue
+            if num_ctas != requested_ctas:
+                config["num_ctas_per_sm"] = num_ctas
+            if stages != config.get("num_stages", 2):
+                config["num_stages"] = stages
+            return config
+
+        block_m, block_n, block_k = config["block_shape"]
+        warp_m, warp_n, warp_k = config["warp_shape"]
+        math_threads = math.prod(config["block_shape"]) // math.prod(config["warp_shape"]) * 32
+        if math_threads > 256 and block_k > warp_k:
+            config["block_shape"] = (block_m, block_n, block_k // 2)
+            continue
+        alignment = 16 if layer_config.a_dtype.is_integer_type and warp_m > 32 else 8
+        smaller_m = min(warp_m - 1, max_warp_m) // alignment * alignment
+        if smaller_m < 8:
+            raise ValueError(f"no SM90 tile fits the register allocation: {config}")
+        config["block_shape"] = (block_m // warp_m * smaller_m, block_n, block_k)
+        config["warp_shape"] = (smaller_m, warp_n, warp_k)
 
 
 def get_sm90_specialized_config(
@@ -43,6 +175,29 @@ def get_sm90_specialized_config(
     )
     if short_config is not None:
         return short_config
+    block_scaled_config = get_block_scaled_moe_config(
+        layer_config,
+        shape_m,
+        gemm_type,
+        use_f16_accum,
+        use_batch_invariant,
+        is_h20=is_h20,
+        expert_probability_cv=expert_probability_cv,
+    )
+    if block_scaled_config is not None:
+        return block_scaled_config
+    overlap_config = get_overlap_config(
+        layer_config,
+        shape_m,
+        gemm_type,
+        use_f16_accum,
+        use_batch_invariant,
+        is_h20=is_h20,
+        use_m_major_input_scale=use_m_major_input_scale,
+        expert_probability_cv=expert_probability_cv,
+    )
+    if overlap_config is not None:
+        return overlap_config
     packed_config = get_packed_wna8_config(
         layer_config,
         shape_m,
@@ -55,17 +210,6 @@ def get_sm90_specialized_config(
     )
     if packed_config is not None:
         return packed_config
-    block_scaled_config = get_block_scaled_moe_config(
-        layer_config,
-        shape_m,
-        gemm_type,
-        use_f16_accum,
-        use_batch_invariant,
-        is_h20=is_h20,
-        expert_probability_cv=expert_probability_cv,
-    )
-    if block_scaled_config is not None:
-        return block_scaled_config
     return get_scaled_a8_config(
         layer_config,
         shape_m,
@@ -76,6 +220,141 @@ def get_sm90_specialized_config(
         use_m_major_input_scale=use_m_major_input_scale,
         expert_probability_cv=expert_probability_cv,
     )
+
+
+def get_overlap_config(
+    layer_config: LayerConfig,
+    shape_m: int,
+    gemm_type: GemmType,
+    use_f16_accum: bool,
+    use_batch_invariant: bool,
+    *,
+    is_h20: bool = False,
+    use_m_major_input_scale: bool = False,
+    expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
+) -> dict | None:
+    layer = layer_config
+    is_dense = gemm_type == GemmType.DENSE
+    is_masked = gemm_type == GemmType.GROUPED_MASKED
+    is_a16 = layer.a_dtype.num_bits == 16
+    is_unpacked_a8 = (
+        layer.a_dtype.num_bits == 8 and not layer.use_raw_weight and not layer.use_packed_k_layout
+    )
+    can_overlap_a16 = is_a16 and not is_dense and (not is_h20 or is_masked) and layer.b_dtype.num_bits < 16
+    can_overlap_packed = layer.use_packed_k_layout and not is_h20 and (not is_dense or shape_m <= 64)
+    can_overlap_block = layer.use_raw_weight and layer.is_block_weight_scale and not is_dense and not is_h20
+    can_overlap_small_raw = layer.use_raw_weight and is_dense and not is_h20 and shape_m <= 64
+    has_a8_schedule = is_unpacked_a8 or can_overlap_packed or can_overlap_block or can_overlap_small_raw
+    if not (can_overlap_a16 or (layer.a_dtype.num_bits == 8 and has_a8_schedule)):
+        return None
+    if use_f16_accum or use_batch_invariant or layer.shape_k <= 512:
+        return None
+    block_k = 64 if is_a16 else 128
+    if layer.shape_n % 128 or layer.shape_k % block_k:
+        return None
+    if get_problem_rejection_reasons(layer, MmaType.WGMMA):
+        return None
+    if is_dense and shape_m <= (64 if is_h20 else 32):
+        return None
+    if is_dense and shape_m <= 64 and layer.shape_k > 1024:
+        return None
+
+    has_separate_group_scales = layer.is_group_input_scale and not layer.use_fused_e8m0_scale
+    has_long_narrow_reduction = layer.shape_k > 4096 and layer.shape_n <= 1024
+    if not is_h20 and has_separate_group_scales and has_long_narrow_reduction:
+        return None
+
+    num_sms = current_device.sm_count
+    if is_dense:
+        distributions = [np.asarray([[shape_m]])]
+    else:
+        distributions = [
+            DeviceHeuristics.get_expert_rows(layer, shape_m, gemm_type, cv)
+            for cv in (0.0, expert_probability_cv, max(1.0, expert_probability_cv))
+        ]
+        full_tiles = (distributions[1] // 16).sum(axis=1) * (layer.shape_n // 128)
+        if full_tiles.mean() < num_sms:
+            return None
+
+    configs = []
+    costs = []
+    for block_n in (128, 256):
+        if layer.shape_n % block_n:
+            continue
+        if has_separate_group_scales and has_long_narrow_reduction and block_n == 256:
+            continue
+        warp_n = max(32 if is_a16 or (is_dense and shape_m <= 64) else 16, block_n // 8)
+        if is_dense:
+            max_m = 96 if is_h20 else 176
+            if layer.is_group_input_scale:
+                max_m = min(max_m, 96 if layer.input_scale_group_size < block_k else 128)
+            if block_n == 256:
+                max_m = min(max_m, 64 if layer.is_group_input_scale else 96)
+        else:
+            max_m = 64 if is_h20 or layer.is_group_input_scale else 96
+            if can_overlap_packed:
+                max_m = 160 if block_n == 128 else 48
+            if is_h20 and gemm_type == GemmType.INDEXED and layer.a_dtype.is_integer_type:
+                max_m = 32
+        for block_m in range(16, max_m + 1, 8):
+            if layer.a_dtype.is_integer_type and block_m > 32 and block_m % 16:
+                continue
+            config = {
+                "mma_type": MmaType.WGMMA.value,
+                "block_shape": (block_m, block_n, block_k),
+                "warp_shape": (block_m, warp_n, block_k),
+                "num_stages": 4,
+                "num_ctas_per_sm": 1,
+                "use_warp_spec": True,
+                "use_tma": True,
+                "use_stream_k": False,
+                "smem_reuse_mode": "none",
+                "producer_stage_unroll": 1,
+                "wgmma_split_issue_wait": True,
+                "wgmma_use_late_as": layer.is_group_input_scale and block_m > 96,
+                "raster_group_m": 1,
+            }
+            if block_m > get_sm90_max_warp_m(layer, config):
+                continue
+            smem_size = estimate_smem_size_layer(
+                layer,
+                config["block_shape"],
+                gemm_type,
+                4,
+                warp_shape=config["warp_shape"],
+                smem_reuse_mode="none",
+                use_tma=True,
+                use_warp_spec=True,
+                mma_type=MmaType.WGMMA,
+                use_m_major_input_scale=use_m_major_input_scale,
+            )
+            if smem_size > 227 * 1024:
+                continue
+            tiles = [
+                ((rows + block_m - 1) // block_m).sum(axis=1) * (layer.shape_n // block_n)
+                for rows in distributions
+            ]
+            has_short_grid = is_dense and tiles[0].mean() < num_sms * 2 / 3
+            config["use_stream_k"] = bool(has_short_grid and layer.shape_k >= 2048)
+            wide_efficiency = 1.1 if block_n == 256 else 1.0
+            weight_cost = 64 if layer.shape_k > 4096 and not is_h20 else 32
+            tile_cost = (block_m + weight_cost) * block_n / 128 / wide_efficiency
+            waves = [np.ceil(count / num_sms).mean() for count in tiles]
+            if config["use_stream_k"]:
+                waves = [max(0.65, count.mean() / num_sms) for count in tiles]
+                tile_cost *= 1.15
+            configs.append(config)
+            costs.append([wave * tile_cost for wave in waves])
+    if not configs:
+        return None
+    work = np.asarray(costs)
+    relative_work = work / work.min(axis=0)
+    scores = relative_work.mean(axis=1)
+    config = configs[int(np.argmin(scores))]
+    block_m, block_n, _ = config["block_shape"]
+    if not is_dense and block_m >= 48 and block_n == 256:
+        config["raster_group_m"] = 4
+    return config
 
 
 def get_short_k_config(
@@ -141,18 +420,6 @@ def get_short_k_config(
     return config if smem_size * config["num_ctas_per_sm"] <= 227 * 1024 else None
 
 
-def _get_sm90_expert_rows(
-    layer_config: LayerConfig,
-    shape_m: int,
-    gemm_type: GemmType,
-    expert_probability_cv: float,
-) -> np.ndarray:
-    if gemm_type == GemmType.GROUPED_MASKED:
-        # Masked M describes allocated expert capacity rather than routed rows.
-        return np.full((1, layer_config.num_experts), math.ceil(shape_m / layer_config.num_experts))
-    return DeviceHeuristics._sample_expert_rows(shape_m, layer_config.num_experts, expert_probability_cv)
-
-
 def get_block_scaled_moe_config(
     layer_config: LayerConfig,
     shape_m: int,
@@ -204,7 +471,7 @@ def get_block_scaled_moe_config(
         use_warp_spec = False
 
     # Account for per-expert padding and incomplete waves before using larger tiles.
-    counts = _get_sm90_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
+    counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
     resident_blocks = current_device.sm_count * resident_ctas
     block_m_candidates = (80, 96) if block_m == 96 else (block_m,)
     best = None
@@ -263,28 +530,30 @@ class Sm90CandidatePolicy:
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
-class _IndexedOption:
+class _MoeA16Option:
     candidate: ScheduleCandidate
-    transform: Literal["base", "half_k", "split_n_widen_k"]
+    transform: Literal["base", "half_k", "split_n_widen_k", "mma"]
     priority: int
-    parent: "_IndexedOption | None" = None
+    parent: "_MoeA16Option | None" = None
 
 
 def calc_sm90_num_block_list(
     layer_config: LayerConfig,
     shape_m: int,
     max_block_m: int,
-) -> list[int]:
-    num_blocks_list = []
-    if not layer_config.num_experts:
+    gemm_type: GemmType | None = None,
+    expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
+) -> list[float]:
+    num_blocks_list: list[float] = []
+    if gemm_type == GemmType.DENSE or not layer_config.num_experts:
         for block_m in range(8, max_block_m + 1, 8):
             num_blocks_list.append(math.ceil(shape_m / block_m))
     else:
-        random_state = np.random.RandomState(seed=0)
-        samples = random_state.randint(0, layer_config.num_experts, size=shape_m)
-        counts = np.bincount(samples)
+        counts = DeviceHeuristics.get_expert_rows(
+            layer_config, shape_m, gemm_type or GemmType.GROUPED_CONTIGUOUS, expert_probability_cv
+        )
         for block_m in range(8, max_block_m + 1, 8):
-            num_blocks = int(np.ceil(counts * 1.1 / block_m).sum().item())
+            num_blocks = float(((counts + block_m - 1) // block_m).sum(axis=1).mean())
             num_blocks_list.append(num_blocks)
 
     for index, block_m in enumerate(range(8, max_block_m + 1, 8)):
@@ -294,24 +563,33 @@ def calc_sm90_num_block_list(
     return num_blocks_list
 
 
-def _select_sm90_block_m(
+def select_sm90_block_m(
     layer_config: LayerConfig,
     shape_m: int,
     max_block_m: int,
+    gemm_type: GemmType,
+    expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
 ) -> int:
     num_blocks_list = calc_sm90_num_block_list(
         layer_config,
         shape_m,
         max_block_m,
+        gemm_type,
+        expert_probability_cv,
     )
+    if gemm_type != GemmType.DENSE and layer_config.num_experts:
+        num_blocks_list = [
+            tiles * (block_m + 32)
+            for block_m, tiles in zip(range(8, max_block_m + 1, 8), num_blocks_list, strict=True)
+        ]
     return np.argmin(num_blocks_list).item() * 8 + 8
 
 
 def build_sm90_seed_config(problem: TuningProblem) -> dict:
-    """Build the sparse seed config shared by legacy and indexed-A16 paths."""
+    """Build the sparse seed config shared by legacy and MoE A16 paths."""
     layer_config = problem.layer_config
-    tune_indexed_a16 = (
-        problem.gemm_type == GemmType.INDEXED
+    tune_moe_a16 = (
+        problem.gemm_type != GemmType.DENSE
         and layer_config.a_dtype.num_bits == 16
         and not problem.use_batch_invariant
     )
@@ -322,36 +600,18 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
     else:
         max_block_m = 176
 
-    if tune_indexed_a16:
-        # Bound padding when only a few routed rows land on each expert.
-        tokens_per_expert = problem.shape_m / layer_config.num_experts
-        first_threshold = 1.01 if layer_config.b_dtype.num_bits == 4 else 0.7
-        moe_block_size_configs = (
-            (8, first_threshold),
-            (16, 0.7),
-            (24, 0.8),
-            (32, 0.9),
-            (48, 0.9),
-            (64, 0.9),
-        )
-        for block_shape_m, threshold in moe_block_size_configs:
-            if tokens_per_expert / block_shape_m < threshold:
-                break
-    else:
-        block_shape_m = _select_sm90_block_m(
-            layer_config,
-            problem.shape_m,
-            max_block_m,
-        )
+    if tune_moe_a16:
+        max_block_m = 64
+    block_shape_m = select_sm90_block_m(
+        layer_config, problem.shape_m, max_block_m, problem.gemm_type, problem.expert_probability_cv
+    )
     warp_shape_n = 32
     warp_shape_k = 1024 // layer_config.a_dtype.num_bits
 
     # Long-K layers need more routed rows before wider N tiles pay off.
     wide_tile_min_shape_m = 64 if layer_config.shape_k > 4096 else 16
-    use_wide_indexed_tile = (
-        tune_indexed_a16 and block_shape_m <= 64 and problem.shape_m >= wide_tile_min_shape_m
-    )
-    if use_wide_indexed_tile:
+    use_wide_moe_tile = tune_moe_a16 and block_shape_m <= 64 and problem.shape_m >= wide_tile_min_shape_m
+    if use_wide_moe_tile:
         warp_shape_n = 64
         # N=512 spills its accumulator at two-CTA residency from M=48 onward.
         if layer_config.shape_k <= 512 and layer_config.shape_n >= 2048 and block_shape_m < 48:
@@ -460,10 +720,12 @@ def select_grouped_scale(
         max_block_m = 192
     else:
         max_block_m = 200
-    block_shape_m = _select_sm90_block_m(
+    block_shape_m = select_sm90_block_m(
         layer_config,
         problem.shape_m,
         max_block_m,
+        problem.gemm_type,
+        problem.expert_probability_cv,
     )
     if problem.use_batch_invariant:
         block_ks = (min(128, layer_config.shape_k & -layer_config.shape_k),)
@@ -504,23 +766,52 @@ def select_grouped_scale(
                     f"{'multicast' if multicast else 'direct'}",
                     config,
                 )
+                candidate = ScheduleCandidate.from_config(
+                    candidate.candidate_id,
+                    fit_sm90_tile(
+                        layer_config,
+                        candidate.to_config(),
+                        problem.use_f16_accum,
+                        gemm_type=problem.gemm_type,
+                        use_m_major_input_scale=problem.use_m_major_input_scale,
+                    ),
+                )
                 candidates.append(fit_pipeline_stages(problem, candidate))
 
-    analyses = tuple(analyze_candidate(problem, candidate) for candidate in candidates)
-    selected = next(
-        (analysis for analysis in analyses if analysis.legal),
-        None,
-    )
+    has_routing_grid = problem.gemm_type != GemmType.DENSE and problem.device.num_sms is not None
+    if has_routing_grid:
+        policy = Sm90CandidatePolicy()
+        analyses = tuple(_analyze_moe_candidate(problem, candidate, policy) for candidate in candidates)
+    else:
+        analyses = tuple(analyze_candidate(problem, candidate) for candidate in candidates)
+    legal = [analysis for analysis in analyses if analysis.legal]
+    selected = legal[0] if legal else None
     if selected is None:
         rejected = {analysis.candidate.candidate_id: analysis.rejection_reasons for analysis in analyses}
         raise AssertionError(f"no legal grouped-scale SM90 schedule: {rejected}")
+
+    reason = "selected the first legal measured-priority candidate"
+    if has_routing_grid:
+        assert problem.device.num_sms is not None
+        selected = min(
+            legal,
+            key=lambda analysis: (analysis.waves or math.inf) * math.prod(analysis.candidate.block_shape[:2]),
+        )
+        candidate = selected.candidate.with_updates(
+            use_stream_k=selected.candidate.use_stream_k
+            and selected.num_output_tiles < problem.device.num_sms
+        )
+        final_analysis = analyze_candidate(problem, candidate)
+        analyses = tuple(final_analysis if analysis is selected else analysis for analysis in analyses)
+        selected = final_analysis
+        reason = "selected a legal MoE schedule using routed tiles, residency and padded work per wave"
 
     return TuningDecision(
         problem=problem,
         family="grouped_scale",
         selected=selected.candidate,
         considered=analyses,
-        reason="selected the first legal measured-priority candidate",
+        reason=reason,
     )
 
 
@@ -536,14 +827,14 @@ def get_scaled_a8_config(
     expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
 ) -> dict | None:
     has_raw_w8a8 = layer_config.a_dtype.num_bits == 8 and layer_config.a_dtype == layer_config.b_dtype
-    has_unpacked_fused_weights = (
+    has_unpacked_weights = (
         layer_config.a_dtype.num_bits == 8
-        and layer_config.use_fused_e8m0_scale
+        and not layer_config.use_raw_weight
         and not layer_config.use_packed_k_layout
         and not layer_config.is_group_input_scale
         and layer_config.shape_k > 512
     )
-    if not (has_raw_w8a8 or has_unpacked_fused_weights):
+    if not (has_raw_w8a8 or has_unpacked_weights):
         return None
     if use_f16_accum or use_batch_invariant:
         return None
@@ -563,7 +854,7 @@ def get_scaled_a8_config(
 
     def make_config(block_m, block_n, warp_n, use_warp_spec, use_stream_k, stages=4, ctas=1, ring=True):
         use_ring = use_warp_spec and ring
-        if has_unpacked_fused_weights:
+        if has_unpacked_weights:
             warp_n = max(32, warp_n)
         return {
             "mma_type": MmaType.WGMMA.value,
@@ -580,6 +871,8 @@ def get_scaled_a8_config(
         }
 
     def fits_resources(config):
+        if config["warp_shape"][0] > get_sm90_max_warp_m(layer_config, config):
+            return False
         tuning = TuningConfig(**config)
         if get_register_budget_error(layer_config, tuning, registers_per_sm=65536):
             return False
@@ -630,7 +923,7 @@ def get_scaled_a8_config(
                 config = make_config(64, 128, 32, True, True, ring=False)
         return config if fits_resources(config) else None
 
-    counts = _get_sm90_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
+    counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
     is_indexed = gemm_type == GemmType.INDEXED
     if is_h20 and is_indexed and layer_config.shape_k < 4096:
         full_tiles = (counts // 32).sum(axis=1) * (layer_config.shape_n // 256)
@@ -685,16 +978,6 @@ def get_packed_wna8_config(
     if layer_config.shape_n % 128 or layer_config.shape_k % 128:
         return None
 
-    # Match the M sampling grid in DeviceHeuristics.get_configs so that direct
-    # queries and precomputed ranges use the same routing sample at boundaries.
-    if shape_m <= 8:
-        shape_m = 1 << (max(shape_m, 1) - 1).bit_length()
-    else:
-        step = 8 if shape_m <= 1024 else 16 if shape_m <= 2048 else 32 if shape_m <= 4096 else 64
-        if shape_m > 16384:
-            step = 128
-        shape_m = math.ceil(shape_m / step) * step
-
     if gemm_type == GemmType.DENSE:
         # Use one K warp to limit register pressure on small grids,
         # and fit M to the rows to reduce padding.
@@ -721,7 +1004,7 @@ def get_packed_wna8_config(
     if gemm_type == GemmType.DENSE:
         counts = np.asarray([[shape_m]])
     else:
-        counts = _get_sm90_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
+        counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
 
     has_indexed_weight_groups = (
         gemm_type == GemmType.INDEXED
@@ -829,7 +1112,7 @@ def get_packed_wna8_config(
     return best_config
 
 
-def _indexed_a16_ctas_per_sm(
+def _moe_ctas_per_sm(
     problem: TuningProblem,
     analysis: CandidateAnalysis,
     policy: Sm90CandidatePolicy,
@@ -853,12 +1136,12 @@ def _indexed_a16_ctas_per_sm(
 
     resource_limit = min(resource_limit, analysis.thread_smem_cta_limit)
     if problem.device.num_sms is None:
-        raise ValueError("indexed-A16 selection requires a device SM count")
+        raise ValueError("MoE selection requires a device SM count")
     grid_limit = math.ceil(analysis.num_output_tiles / problem.device.num_sms)
     return max(1, min(resource_limit, grid_limit))
 
 
-def _analyze_indexed_a16_candidate(
+def _analyze_moe_candidate(
     problem: TuningProblem,
     candidate: ScheduleCandidate,
     policy: Sm90CandidatePolicy,
@@ -867,13 +1150,28 @@ def _analyze_indexed_a16_candidate(
     if not analysis.legal:
         return analysis
     candidate = candidate.with_updates(
-        num_ctas_per_sm=_indexed_a16_ctas_per_sm(
+        num_ctas_per_sm=_moe_ctas_per_sm(
             problem,
             analysis,
             policy,
         )
     )
-    return analyze_candidate(problem, candidate)
+    while True:
+        analysis = analyze_candidate(problem, candidate)
+        max_warp_m = get_sm90_max_warp_m(problem.layer_config, candidate.to_config(), problem.use_f16_accum)
+        if analysis.legal and candidate.warp_shape[0] <= max_warp_m:
+            return analysis
+        if candidate.num_ctas_per_sm == 1:
+            fitted = fit_sm90_tile(
+                problem.layer_config,
+                candidate.to_config(),
+                problem.use_f16_accum,
+                gemm_type=problem.gemm_type,
+                use_m_major_input_scale=problem.use_m_major_input_scale,
+            )
+            candidate = ScheduleCandidate.from_config(candidate.candidate_id, fitted)
+            return analyze_candidate(problem, candidate)
+        candidate = candidate.with_updates(num_ctas_per_sm=candidate.num_ctas_per_sm - 1)
 
 
 def _half_k_candidate(
@@ -933,12 +1231,12 @@ def _split_n_widen_k_candidate(
     )
 
 
-def select_indexed_a16(
+def select_moe_a16(
     problem: TuningProblem,
     policy: Sm90CandidatePolicy,
 ) -> TuningDecision:
     if problem.device.num_sms is None:
-        raise ValueError("indexed-A16 selection requires a device SM count")
+        raise ValueError("MoE selection requires a device SM count")
     base = fit_pipeline_stages(
         problem,
         ScheduleCandidate.from_config(
@@ -946,12 +1244,32 @@ def select_indexed_a16(
             build_sm90_seed_config(problem),
         ),
     )
-    base_option = _IndexedOption(base, "base", 0)
+    base_option = _MoeA16Option(base, "base", 0)
     options = [base_option]
+    mma_option = None
+    layer = problem.layer_config
+    can_use_mma = layer.b_dtype.num_bits < 16 and not problem.use_f16_accum
+    has_short_aligned_k = layer.shape_k <= 1024 and layer.shape_k % 64 == 0
+    if can_use_mma and has_short_aligned_k and layer.shape_n % 128 == 0:
+        mma = ScheduleCandidate.from_config(
+            "moe_a16_mma",
+            {
+                "mma_type": MmaType.MMA.value,
+                "block_shape": (16, 128, 64),
+                "warp_shape": (16, 32, 32),
+                "num_stages": 4,
+                "num_ctas_per_sm": 1,
+                "use_stream_k": False,
+                "use_warp_spec": False,
+                "use_tma": False,
+            },
+        )
+        mma_option = _MoeA16Option(mma, "mma", 3)
+        options.append(mma_option)
     half_k = _half_k_candidate(problem, base)
     half_option = None
     if half_k is not None:
-        half_option = _IndexedOption(half_k, "half_k", 1, base_option)
+        half_option = _MoeA16Option(half_k, "half_k", 1, base_option)
         options.append(half_option)
     for source, candidate_id in (
         (base_option, "indexed_a16_split_n_widen_k_from_base"),
@@ -965,10 +1283,10 @@ def select_indexed_a16(
             candidate_id=candidate_id,
         )
         if split is not None:
-            options.append(_IndexedOption(split, "split_n_widen_k", 2, source))
+            options.append(_MoeA16Option(split, "split_n_widen_k", 2, source))
 
     analyses = {
-        option: _analyze_indexed_a16_candidate(
+        option: _analyze_moe_candidate(
             problem,
             option.candidate,
             policy,
@@ -979,7 +1297,7 @@ def select_indexed_a16(
     if not base_analysis.legal:
         raise AssertionError(base_analysis.rejection_reasons)
     eligible_reasons = {
-        base_option: "selected the base indexed-A16 schedule",
+        base_option: "selected the base MoE A16 schedule",
     }
 
     if half_option is not None:
@@ -1012,6 +1330,22 @@ def select_indexed_a16(
         key=lambda option: option.priority,
     )
 
+    if mma_option is not None:
+        mma_analysis = analyses[mma_option]
+        selected_analysis = analyses[selected]
+        mma_block_m = mma_analysis.candidate.block_shape[0]
+        selected_block_m = selected_analysis.candidate.block_shape[0]
+        mma_rows = problem.estimate_num_blocks_m(mma_block_m) * mma_block_m
+        selected_rows = problem.estimate_num_blocks_m(selected_block_m) * selected_block_m
+        has_fewer_waves = (
+            mma_analysis.waves is not None
+            and selected_analysis.waves is not None
+            and mma_analysis.waves < selected_analysis.waves
+        )
+        if mma_analysis.legal and has_fewer_waves and mma_rows <= selected_rows:
+            selected = mma_option
+            eligible_reasons[selected] = "selected short-K MMA with fewer waves and no extra row padding"
+
     final_candidate = analyses[selected].candidate.with_updates(
         use_stream_k=(
             bool(analyses[selected].candidate.get("use_stream_k", True))
@@ -1023,7 +1357,7 @@ def select_indexed_a16(
         raise AssertionError(final_analysis.rejection_reasons)
     return TuningDecision(
         problem=problem,
-        family="indexed_a16",
+        family="indexed_a16" if problem.gemm_type == GemmType.INDEXED else "grouped_a16",
         selected=final_candidate,
         considered=tuple(final_analysis if option is selected else analyses[option] for option in options),
         reason=eligible_reasons[selected],

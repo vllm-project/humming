@@ -9,6 +9,7 @@ from humming.config.mma import (
     get_default_mma_type,
     get_register_budget_error,
 )
+from humming.tune.base import DeviceHeuristics
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -46,6 +47,8 @@ class TuningProblem:
     device: DeviceProfile
     use_f16_accum: bool = False
     use_batch_invariant: bool = False
+    use_m_major_input_scale: bool = False
+    expert_probability_cv: float = DeviceHeuristics.expert_probability_cv
 
     def __post_init__(self) -> None:
         if self.shape_m <= 0:
@@ -56,7 +59,11 @@ class TuningProblem:
     def estimate_num_blocks_m(self, block_shape_m: int) -> int:
         if self.gemm_type == GemmType.DENSE or not self.layer_config.num_experts:
             return math.ceil(self.shape_m / block_shape_m)
-        return min(self.shape_m, self.layer_config.num_experts)
+        rows = DeviceHeuristics.get_expert_rows(
+            self.layer_config, self.shape_m, self.gemm_type, self.expert_probability_cv
+        )
+        tiles = ((rows + block_shape_m - 1) // block_shape_m).sum(axis=1)
+        return math.ceil(float(tiles.mean()))
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -73,9 +80,11 @@ class ScheduleCandidate:
     producer_stage_unroll: int | None = None
     consumer_stage_unroll: int | None = None
     num_ctas_per_sm: int = 1
+    raster_group_m: int = 1
     multi_cast_size_a: int = 1
     use_warp_spec: bool = False
     use_tma: bool = False
+    use_tma_c: bool | None = None
     smem_reuse_mode: SmemReuseMode = SmemReuseMode.ALL_STAGES
     _explicit_fields: frozenset[str] = dataclasses.field(default_factory=frozenset, repr=False)
 
@@ -128,9 +137,11 @@ class ScheduleCandidate:
             producer_stage_unroll=config.get("producer_stage_unroll"),
             consumer_stage_unroll=config.get("consumer_stage_unroll"),
             num_ctas_per_sm=_config_positive_int(config, "num_ctas_per_sm", 1),
+            raster_group_m=_config_positive_int(config, "raster_group_m", 1),
             multi_cast_size_a=_config_positive_int(config, "multi_cast_size_a", 1),
             use_warp_spec=use_warp_spec,
             use_tma=use_tma,
+            use_tma_c=config.get("use_tma_c"),
             smem_reuse_mode=SmemReuseMode(config.get("smem_reuse_mode", SmemReuseMode.ALL_STAGES)),
             _explicit_fields=frozenset(config),
         )
@@ -474,6 +485,8 @@ def _analyze_resources(
 ) -> _ResourceAnalysis:
     hard_violations: list[str] = []
     residency_violations: list[str] = []
+    use_tma_c = schedule.use_tma if schedule.use_tma_c is None else schedule.use_tma_c
+    use_tma_c = use_tma_c and problem.gemm_type != GemmType.INDEXED
     smem_size = estimate_smem_size_layer(
         problem.layer_config,
         schedule.block_shape,
@@ -484,6 +497,9 @@ def _analyze_resources(
         smem_reuse_mode=schedule.smem_reuse_mode,
         use_tma=schedule.use_tma,
         use_warp_spec=schedule.use_warp_spec,
+        use_tma_c=use_tma_c,
+        raster_group_m=schedule.raster_group_m,
+        use_m_major_input_scale=problem.use_m_major_input_scale,
         output_chunk_rows=0,
         mma_accum_bits=16 if problem.use_f16_accum else 32,
     )
@@ -571,7 +587,9 @@ def fit_pipeline_stages(
 ) -> ScheduleCandidate:
     while candidate.num_stages > 3:
         analysis = analyze_candidate(problem, candidate)
-        if analysis.smem_size <= problem.device.max_smem_size:
+        fits_block = analysis.smem_size <= problem.device.max_smem_size
+        fits_residency = analysis.smem_size * candidate.num_ctas_per_sm <= problem.device.resident_smem_size
+        if fits_block and fits_residency:
             break
         candidate = candidate.with_updates(num_stages=candidate.num_stages - 1)
     return candidate

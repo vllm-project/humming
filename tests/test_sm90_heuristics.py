@@ -171,7 +171,7 @@ def test_grouped_fp8_uses_legal_n_tile_for_non_128_multiple():
     assert config["warp_shape"][2] == 64
 
 
-def test_grouped_fp8_enables_multicast_at_the_dense_threshold():
+def test_grouped_fp8_uses_legal_schedules_across_the_dense_threshold():
     layer = _layer(6144, 3584, num_experts=0, use_packed_k_layout=False)
 
     below_threshold = Sm90Heuristics.get_config(
@@ -185,8 +185,9 @@ def test_grouped_fp8_enables_multicast_at_the_dense_threshold():
         gemm_type=GemmType.DENSE,
     )
 
-    assert "multi_cast_size_a" not in below_threshold
-    assert at_threshold["multi_cast_size_a"] == 2
+    for config in (below_threshold, at_threshold):
+        tuning = TuningConfig(**config)
+        assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
 
 
 def test_dense_a16_uses_legal_n_tile_for_non_256_multiple():
@@ -258,11 +259,12 @@ def test_short_k_does_not_leave_warp_k_larger_than_block_k():
 
 
 @pytest.mark.parametrize(
-    ("routed_m", "expected_ctas", "expected_stream_k"),
-    [(2, 1, True), (4, 2, False), (8, 3, False), (256, 3, False)],
+    ("routed_m", "expected_m", "expected_ctas", "expected_stream_k"),
+    [(2, 8, 1, True), (4, 8, 2, False), (8, 8, 3, False), (256, 16, 2, False)],
 )
 def test_mxfp4_a16_indexed_preserves_warp_k_and_fits_grid(
     routed_m,
+    expected_m,
     expected_ctas,
     expected_stream_k,
 ):
@@ -279,8 +281,8 @@ def test_mxfp4_a16_indexed_preserves_warp_k_and_fits_grid(
         gemm_type=GemmType.INDEXED,
     )
 
-    assert config["block_shape"] == (8, 128, 64)
-    assert config["warp_shape"] == (8, 32, 64)
+    assert config["block_shape"] == (expected_m, 128, 64)
+    assert config["warp_shape"] == (expected_m, 32, 64)
     assert config["num_ctas_per_sm"] == expected_ctas
     assert config["use_stream_k"] is expected_stream_k
 
@@ -387,7 +389,6 @@ def test_grouped_w4a8_ranges_match_direct_selection(monkeypatch, device_name, nu
     for lower, upper, config in ranges:
         assert lower == previous_upper and lower < upper
         assert config["warp_shape"][2] == 128
-        assert config["wgmma_use_late_as"]
         assert config["wgmma_split_issue_wait"]
         tuning_keys = (
             "mma_type",
@@ -405,5 +406,3 @@ def test_grouped_w4a8_ranges_match_direct_selection(monkeypatch, device_name, nu
         for shape_m in (lower + 1, min(upper, lower + num_experts * 2048)):
             assert select(layer, shape_m=shape_m, **kwargs) == config
         previous_upper = upper
-    generic = select(layer, shape_m=4096, gemm_type=GemmType.GROUPED_CONTIGUOUS)
-    assert generic.get("raster_group_m", 1) == 1

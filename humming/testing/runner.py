@@ -146,7 +146,8 @@ class KernelTestRunner:
 
         groups = []
         compile_configs = []
-        effective_shape_ms = [self.test_case.effective_shape_m(shape_m) for shape_m in shape_ms]
+        routed_top_k = self.test_case.top_k if self.compute_config.gemm_type != GemmType.DENSE else 1
+        effective_shape_ms = [shape_m * routed_top_k for shape_m in shape_ms]
         for tuning_source in tuning_sources:
             compute_config = self.test_case.compute_config
             if tuning_source == "batch_invariant":

@@ -373,14 +373,45 @@ class DeviceHeuristics:
         return result
 
     @classmethod
-    def estimate_num_blocks_m(cls, layer_config: LayerConfig, shape_m: int, block_shape_m: int):
-        if not layer_config.num_experts:
+    def get_expert_rows(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        gemm_type: GemmType,
+        probability_cv: float | None = None,
+    ) -> np.ndarray:
+        if probability_cv is None:
+            probability_cv = cls.expert_probability_cv
+        return cls._sample_expert_rows(shape_m, layer_config.num_experts, probability_cv)
+
+    @classmethod
+    def estimate_num_blocks_m(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        block_shape_m: int,
+        gemm_type: GemmType | None = None,
+    ):
+        if gemm_type == GemmType.DENSE or not layer_config.num_experts:
             return math.ceil(shape_m / block_shape_m)
 
         # Round each expert separately to account for empty experts and uneven padding.
-        counts = cls._sample_expert_rows(shape_m, layer_config.num_experts, cls.expert_probability_cv)
+        counts = cls.get_expert_rows(layer_config, shape_m, gemm_type or GemmType.GROUPED_CONTIGUOUS)
         m_tiles = ((counts + block_shape_m - 1) // block_shape_m).sum(axis=1)
         return math.ceil(float(m_tiles.mean()))
+
+    @classmethod
+    def get_shape_m_sample(cls, layer_config: LayerConfig, shape_m: int) -> int:
+        max_shape_m = 65536 if layer_config.num_experts else 8192
+        last_step = 128 if layer_config.num_experts else 64
+        shape_m = min(shape_m, (max_shape_m - 1) // last_step * last_step)
+        if shape_m <= 8:
+            return 1 << (max(shape_m, 1) - 1).bit_length()
+        step = 8 if cls.sm_version == 90 else 16
+        for boundary, next_step in ((1024, 16), (2048, 32), (4096, 64), (16384, 128)):
+            if shape_m > boundary:
+                step = next_step
+        return round_up(shape_m, step)
 
     @classmethod
     def _fit_dense_block_m_to_grid(
