@@ -110,6 +110,18 @@ def fit_sm90_tile(
             if error is not None:
                 continue
             stages = config.get("num_stages", 2)
+            has_packed_group_input = (
+                layer_config.use_packed_k_layout
+                and layer_config.is_group_input_scale
+                and layer_config.shape_k <= 512
+            )
+            should_limit_stages = has_packed_group_input or (
+                tuning.use_stream_k and layer_config.use_raw_weight
+            )
+            mma_type = tuning.mma_type or get_default_mma_type(layer_config)
+            if should_limit_stages and mma_type == MmaType.WGMMA:
+                k_iters = layer_config.shape_k // config["block_shape"][2]
+                stages = min(stages, max(3, k_iters))
             use_tma_c = tuning.use_tma_c and gemm_type != GemmType.INDEXED
             while True:
                 smem_size = estimate_smem_size_layer(
@@ -164,6 +176,18 @@ def get_sm90_specialized_config(
     use_m_major_input_scale: bool = False,
     expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
 ) -> dict | None:
+    compact_config = get_compact_scaled_moe_config(
+        layer_config,
+        shape_m,
+        gemm_type,
+        use_f16_accum,
+        use_batch_invariant,
+        is_h20=is_h20,
+        use_m_major_input_scale=use_m_major_input_scale,
+        expert_probability_cv=expert_probability_cv,
+    )
+    if compact_config is not None:
+        return compact_config
     short_config = get_short_k_config(
         layer_config,
         shape_m,
@@ -219,6 +243,79 @@ def get_sm90_specialized_config(
         is_h20=is_h20,
         use_m_major_input_scale=use_m_major_input_scale,
         expert_probability_cv=expert_probability_cv,
+    )
+
+
+def get_compact_scaled_moe_config(
+    layer_config: LayerConfig,
+    shape_m: int,
+    gemm_type: GemmType,
+    use_f16_accum: bool,
+    use_batch_invariant: bool,
+    *,
+    is_h20: bool = False,
+    use_m_major_input_scale: bool = False,
+    expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
+) -> dict | None:
+    if gemm_type == GemmType.DENSE or use_f16_accum or use_batch_invariant:
+        return None
+    if layer_config.a_dtype.num_bits != 8 or layer_config.use_packed_k_layout:
+        return None
+    if layer_config.use_raw_weight or layer_config.shape_n % 64 or layer_config.shape_k % 64:
+        return None
+    has_short_k = layer_config.shape_k <= 512
+    has_narrow_n = layer_config.shape_n % 128 != 0
+    if not (has_short_k or has_narrow_n):
+        return None
+    if has_narrow_n and layer_config.shape_n // 64 >= current_device.sm_count / 4:
+        return None
+    if get_problem_rejection_reasons(layer_config, MmaType.WGMMA):
+        return None
+
+    has_group_accumulator = layer_config.is_group_input_scale or (
+        not layer_config.use_fused_e8m0_scale and layer_config.is_group_weight_scale
+    )
+    if not has_group_accumulator or (is_h20 and not has_narrow_n):
+        return None
+    if not has_narrow_n and layer_config.input_scale_group_size >= 128:
+        return None
+    has_grouped_token_scale = gemm_type != GemmType.INDEXED and not layer_config.is_group_input_scale
+    if not is_h20 and has_grouped_token_scale and (has_narrow_n or layer_config.shape_k >= 512):
+        return None
+    nominal_block_m = select_sm90_block_m(layer_config, shape_m, 160, gemm_type, expert_probability_cv)
+    if not has_narrow_n and gemm_type == GemmType.INDEXED and nominal_block_m <= 32:
+        return None
+    if not has_narrow_n and layer_config.shape_k >= 512 and nominal_block_m <= 80:
+        return None
+    has_indexed_token_scale = gemm_type == GemmType.INDEXED and not layer_config.is_group_input_scale
+    min_narrow_m = 16 if is_h20 and has_indexed_token_scale else 32
+    if has_narrow_n and nominal_block_m < min_narrow_m:
+        return None
+    max_block_m = 64 if layer_config.a_dtype.is_integer_type else 80
+    if is_h20 or layer_config.is_group_input_scale or has_narrow_n:
+        max_block_m = 32 if has_narrow_n else 64
+    block_m = select_sm90_block_m(layer_config, shape_m, max_block_m, gemm_type, expert_probability_cv)
+    block_n = 64 if has_narrow_n else 128
+    block_k = 64
+    use_warp_spec = block_m <= 64 and (block_m > 32 or has_narrow_n)
+    config = {
+        "mma_type": MmaType.WGMMA.value,
+        "block_shape": (block_m, block_n, block_k),
+        "warp_shape": (block_m, block_n // 4, block_k),
+        "num_stages": 3,
+        "num_ctas_per_sm": 3 if is_h20 and has_narrow_n else 2,
+        "use_tma": use_warp_spec,
+        "use_warp_spec": use_warp_spec,
+        "use_stream_k": has_narrow_n,
+        "smem_reuse_mode": "none" if use_warp_spec else "all_stages",
+        "producer_stage_unroll": 2 if use_warp_spec else 3,
+        "wgmma_split_issue_wait": use_warp_spec,
+    }
+    return fit_sm90_tile(
+        layer_config,
+        config,
+        gemm_type=gemm_type,
+        use_m_major_input_scale=use_m_major_input_scale,
     )
 
 
@@ -734,6 +831,10 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
         "use_f16_accum": problem.use_f16_accum,
         "num_stages": 4,
     }
+
+    can_increase_residency = problem.gemm_type == GemmType.INDEXED and not layer_config.use_packed_k_layout
+    if can_increase_residency and block_shape_n == 64 and block_shape_m <= 32:
+        config["num_ctas_per_sm"] = 2
 
     if problem.gemm_type != GemmType.INDEXED:
         config["use_warp_spec"] = True
