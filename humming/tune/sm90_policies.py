@@ -222,6 +222,49 @@ def get_sm90_specialized_config(
     )
 
 
+def get_compact_moe_config(
+    layer_config: LayerConfig,
+    config: dict,
+    gemm_type: GemmType,
+    use_f16_accum: bool = False,
+    use_batch_invariant: bool = False,
+    *,
+    use_m_major_input_scale: bool = False,
+) -> dict:
+    is_wna16 = layer_config.a_dtype.num_bits == 16 and layer_config.b_dtype.num_bits < 16
+    if not is_wna16 or gemm_type == GemmType.DENSE or use_f16_accum or use_batch_invariant:
+        return config
+    mma_type = MmaType(config.get("mma_type") or get_default_mma_type(layer_config))
+    if not config.get("use_warp_spec", False) or mma_type != MmaType.WGMMA:
+        return config
+
+    block_m, block_n, block_k = config["block_shape"]
+    has_single_warpgroup = tuple(config["warp_shape"]) == (block_m, block_n // 4, block_k)
+    if block_m > 32 or block_k != 64 or not has_single_warpgroup:
+        return config
+
+    num_ctas = max(2, config.get("num_ctas_per_sm", 1))
+    candidate = config | {
+        "num_ctas_per_sm": num_ctas,
+        "use_warp_spec": False,
+        "use_tma": False,
+        "use_tma_c": False,
+        "smem_reuse_mode": "all_stages",
+        "producer_stage_unroll": config["num_stages"],
+        "wgmma_split_issue_wait": False,
+    }
+    candidate = fit_sm90_tile(
+        layer_config,
+        candidate,
+        gemm_type=gemm_type,
+        use_m_major_input_scale=use_m_major_input_scale,
+    )
+    keeps_tile = tuple(candidate["block_shape"]) == tuple(config["block_shape"])
+    keeps_warp = tuple(candidate["warp_shape"]) == tuple(config["warp_shape"])
+    keeps_residency = candidate["num_ctas_per_sm"] == num_ctas
+    return candidate if keeps_tile and keeps_warp and keeps_residency else config
+
+
 def get_overlap_config(
     layer_config: LayerConfig,
     shape_m: int,

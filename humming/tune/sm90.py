@@ -16,6 +16,7 @@ from humming.tune.sm90_policies import (
     build_sm90_seed_config,
     calc_sm90_num_block_list,
     fit_sm90_tile,
+    get_compact_moe_config,
     get_sm90_specialized_config,
     select_grouped_scale,
     select_moe_a16,
@@ -274,6 +275,14 @@ class Sm90Heuristics(Sm80Heuristics):
             gemm_type=gemm_type,
             use_m_major_input_scale=use_m_major_input_scale,
         )
+        config = get_compact_moe_config(
+            layer_config,
+            config,
+            gemm_type,
+            use_f16_accum,
+            use_batch_invariant,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
         return {key: value.value if isinstance(value, Enum) else value for key, value in config.items()}
 
     @classmethod
@@ -296,6 +305,14 @@ class Sm90Heuristics(Sm80Heuristics):
             config,
             use_f16_accum,
             gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        fitted = get_compact_moe_config(
+            layer_config,
+            fitted,
+            gemm_type,
+            use_f16_accum,
+            use_batch_invariant,
             use_m_major_input_scale=use_m_major_input_scale,
         )
         if decision is not None and fitted == config:
