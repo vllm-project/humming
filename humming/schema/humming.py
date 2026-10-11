@@ -534,6 +534,23 @@ def is_humming_schema_compatible(
 
     input_group_size = input_schema.input_scale_group_size
     weight_group_size = weight_schema.weight_scale_group_size
+    if sm_version // 10 in (10, 11):
+        has_e3m4_operand = dtypes.float8e3m4 in (a_dtype, mma_b_dtype)
+        if has_e3m4_operand:
+            has_mx_input_scale = input_group_size == 0 or (
+                input_group_size == 32 and input_schema.input_scale_dtype in (None, dtypes.float8e8m0)
+            )
+            has_mx_weight_scale = weight_group_size == 0 or (
+                weight_group_size == 32 and bs_dtype == dtypes.float8e8m0
+            )
+            if not has_mx_input_scale or not has_mx_weight_scale:
+                return False
+            if weight_schema.weight_scale_type == WeightScaleType.BLOCK:
+                return False
+        has_e0m3_operand = dtypes.float4e0m3 in (a_dtype, mma_b_dtype)
+        if has_e0m3_operand and (input_group_size or weight_group_size or 16) != 16:
+            return False
+
     is_fp8_gs128_mxfp4_gs32 = (
         sm_version == 90
         and a_dtype == dtypes.float8e4m3
@@ -560,7 +577,7 @@ def is_humming_schema_compatible(
     elif a_dtype == dtypes.int4 and (0 < weight_group_size < 64 or 0 < input_group_size < 64):
         return False
     elif a_dtype.num_bits == 4 and weight_group_size > 0 and uses_fp4_weights:
-        as_dtype = input_schema.input_scale_dtype
+        as_dtype = input_schema.input_scale_dtype or bs_dtype
         if bs_dtype not in [dtypes.float8e8m0, dtypes.float8e4m3]:
             return False
         if input_group_size > 0 and as_dtype not in [dtypes.float8e8m0, dtypes.float8e4m3]:

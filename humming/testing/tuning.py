@@ -83,12 +83,16 @@ def _is_legal_mma_type(layer_config, compute_config, mma_type):
         dtypes.float4e2m1: 120,
         dtypes.float4e0m3: 120,
     }
-    if sm_version < min_sm.get(layer_config.a_dtype, 999):
+    mma_b_dtype = get_mma_b_dtype(
+        layer_config.a_dtype,
+        layer_config.b_dtype,
+        layer_config.has_zero_point,
+        sm_version,
+    )
+    min_operand_sm = max(min_sm.get(layer_config.a_dtype, 999), min_sm.get(mma_b_dtype, 999))
+    if sm_version < min_operand_sm:
         return False
     if layer_config.a_dtype.is_floating_point_type and layer_config.b_dtype.is_floating_point_type:
-        mma_b_dtype = get_mma_b_dtype(
-            layer_config.a_dtype, layer_config.b_dtype, layer_config.has_zero_point, sm_version
-        )
         if layer_config.b_dtype.exponent_bits > mma_b_dtype.exponent_bits:
             return False
         required_mantissa = layer_config.b_dtype.mantissa_bits - (layer_config.b_dtype.exponent_bits == 0)

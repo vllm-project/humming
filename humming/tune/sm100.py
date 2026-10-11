@@ -6,7 +6,7 @@ import numpy as np
 
 from humming import dtypes
 from humming.config import GemmType, LayerConfig, MmaType, SmemReuseMode
-from humming.config.mma import get_default_mma_type
+from humming.config.mma import get_default_mma_type, get_mma_b_dtype
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
 from humming.tune.sm8x import Sm80Heuristics
@@ -744,11 +744,14 @@ class Sm100Heuristics(Sm100MmaHeuristics):
         prefer_umma &= layer_config.shape_n % 128 == 0
         prefer_umma &= layer_config.shape_k % (512 // layer_config.a_dtype.num_bits) == 0
         if prefer_umma or get_default_mma_type(layer_config) == MmaType.UMMA:
-            has_native_mixed_operands = layer_config.a_dtype.num_bits == 8
-            has_native_mixed_operands &= layer_config.b_dtype.is_floating_point_type
-            has_native_mixed_operands &= layer_config.b_dtype != layer_config.a_dtype
-            has_hidden_fp8 = dtypes.float8e3m4 in (layer_config.a_dtype, layer_config.b_dtype)
-            requires_umma = layer_config.use_block_scaled_mma or has_native_mixed_operands or has_hidden_fp8
+            mma_b_dtype = get_mma_b_dtype(
+                layer_config.a_dtype,
+                layer_config.b_dtype,
+                layer_config.has_zero_point,
+                layer_config.sm_version,
+            )
+            has_hidden_fp8 = dtypes.float8e3m4 in (layer_config.a_dtype, mma_b_dtype)
+            requires_umma = layer_config.use_block_scaled_mma or has_hidden_fp8
             has_mixed_raw_weights = layer_config.use_raw_weight and (
                 layer_config.a_dtype.num_bits != layer_config.b_dtype.num_bits
             )
