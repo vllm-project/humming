@@ -66,7 +66,7 @@ def get_sm90_specialized_config(
     )
     if block_scaled_config is not None:
         return block_scaled_config
-    return get_scaled_w8a8_config(
+    return get_scaled_a8_config(
         layer_config,
         shape_m,
         gemm_type,
@@ -141,6 +141,18 @@ def get_short_k_config(
     return config if smem_size * config["num_ctas_per_sm"] <= 227 * 1024 else None
 
 
+def _get_sm90_expert_rows(
+    layer_config: LayerConfig,
+    shape_m: int,
+    gemm_type: GemmType,
+    expert_probability_cv: float,
+) -> np.ndarray:
+    if gemm_type == GemmType.GROUPED_MASKED:
+        # Masked M describes allocated expert capacity rather than routed rows.
+        return np.full((1, layer_config.num_experts), math.ceil(shape_m / layer_config.num_experts))
+    return DeviceHeuristics._sample_expert_rows(shape_m, layer_config.num_experts, expert_probability_cv)
+
+
 def get_block_scaled_moe_config(
     layer_config: LayerConfig,
     shape_m: int,
@@ -191,10 +203,8 @@ def get_block_scaled_moe_config(
         stages, resident_ctas = 3, 2
         use_warp_spec = False
 
-    # Use the same routing samples as the SM100 MoE policy. Round each expert
-    # independently: empty experts, padding and incomplete waves all affect
-    # whether these larger tiles can amortize their pipeline and output storage.
-    counts = DeviceHeuristics._sample_expert_rows(shape_m, layer_config.num_experts, expert_probability_cv)
+    # Account for per-expert padding and incomplete waves before using larger tiles.
+    counts = _get_sm90_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
     resident_blocks = current_device.sm_count * resident_ctas
     block_m_candidates = (80, 96) if block_m == 96 else (block_m,)
     best = None
@@ -514,7 +524,7 @@ def select_grouped_scale(
     )
 
 
-def get_scaled_w8a8_config(
+def get_scaled_a8_config(
     layer_config: LayerConfig,
     shape_m: int,
     gemm_type: GemmType,
@@ -526,11 +536,21 @@ def get_scaled_w8a8_config(
     expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
 ) -> dict | None:
     has_raw_w8a8 = layer_config.a_dtype.num_bits == 8 and layer_config.a_dtype == layer_config.b_dtype
-    has_group_scales = layer_config.is_group_input_scale or layer_config.is_group_weight_scale
-    has_group_scales |= layer_config.is_block_weight_scale
-    if not has_raw_w8a8 or not has_group_scales:
+    has_unpacked_fused_weights = (
+        layer_config.a_dtype.num_bits == 8
+        and layer_config.use_fused_e8m0_scale
+        and not layer_config.use_packed_k_layout
+        and not layer_config.is_group_input_scale
+        and layer_config.shape_k > 512
+    )
+    if not (has_raw_w8a8 or has_unpacked_fused_weights):
         return None
-    if gemm_type not in (GemmType.DENSE, GemmType.INDEXED) or use_f16_accum or use_batch_invariant:
+    if use_f16_accum or use_batch_invariant:
+        return None
+    if gemm_type != GemmType.DENSE and not layer_config.num_experts:
+        return None
+    is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
+    if is_grouped and layer_config.is_block_weight_scale:
         return None
     if layer_config.shape_n % 128 or layer_config.shape_k % 128:
         return None
@@ -543,6 +563,8 @@ def get_scaled_w8a8_config(
 
     def make_config(block_m, block_n, warp_n, use_warp_spec, use_stream_k, stages=4, ctas=1, ring=True):
         use_ring = use_warp_spec and ring
+        if has_unpacked_fused_weights:
+            warp_n = max(32, warp_n)
         return {
             "mma_type": MmaType.WGMMA.value,
             "block_shape": (block_m, block_n, 128),
@@ -608,15 +630,17 @@ def get_scaled_w8a8_config(
                 config = make_config(64, 128, 32, True, True, ring=False)
         return config if fits_resources(config) else None
 
-    counts = DeviceHeuristics._sample_expert_rows(shape_m, layer_config.num_experts, expert_probability_cv)
-    if is_h20 and layer_config.shape_k < 4096:
+    counts = _get_sm90_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
+    is_indexed = gemm_type == GemmType.INDEXED
+    if is_h20 and is_indexed and layer_config.shape_k < 4096:
         full_tiles = (counts // 32).sum(axis=1) * (layer_config.shape_n // 256)
         if short_k or full_tiles.mean() < num_sms:
             return None
     candidates = []
-    for block_m in (8, 16, 24, 32, 48, 64, 80):
-        if is_h20 and block_m > 32:
-            continue
+    max_block_m = 64 if is_h20 else 80
+    if is_h20 and is_indexed:
+        max_block_m = 32
+    for block_m in range(8, max_block_m + 1, 8):
         if layer_config.a_dtype.is_integer_type and block_m > 32 and block_m % 16:
             continue
         m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
@@ -633,7 +657,7 @@ def get_scaled_w8a8_config(
         return None
     config = min(candidates, key=lambda item: item[0])[1]
     block_m, block_n, _ = config["block_shape"]
-    if is_h20 and block_n == 256 and block_m <= 16:
+    if is_h20 and is_indexed and block_n == 256 and block_m <= 16:
         full_tiles = (counts // block_m).sum(axis=1) * (layer_config.shape_n // block_n)
         if full_tiles.mean() < num_sms:
             return None
@@ -696,13 +720,8 @@ def get_packed_wna8_config(
 
     if gemm_type == GemmType.DENSE:
         counts = np.asarray([[shape_m]])
-    elif gemm_type == GemmType.GROUPED_MASKED:
-        # Here M describes allocated expert capacity, not a routed token count.
-        counts = np.full((1, layer_config.num_experts), math.ceil(shape_m / layer_config.num_experts))
     else:
-        counts = DeviceHeuristics._sample_expert_rows(
-            shape_m, layer_config.num_experts, expert_probability_cv
-        )
+        counts = _get_sm90_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
 
     has_indexed_weight_groups = (
         gemm_type == GemmType.INDEXED
