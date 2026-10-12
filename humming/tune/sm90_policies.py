@@ -42,6 +42,10 @@ def fit_sm90_tile(
     has_weight_scale_accumulator = has_group_weight_scale and not layer_config.use_fused_e8m0_scale
     has_scaled_accumulator = layer_config.is_group_input_scale or has_weight_scale_accumulator
     has_group_accumulator = layer_config.a_dtype.num_bits < 16 and has_scaled_accumulator
+    has_packed_input_scales = layer_config.use_packed_k_layout and layer_config.is_group_input_scale
+    has_full_group_accumulator = layer_config.a_dtype.is_integer_type
+    has_full_group_accumulator |= config.get("wgmma_split_issue_wait", False)
+    max_group_warp_m = 80 if has_packed_input_scales and has_full_group_accumulator else 96
     has_unpacked_rs = not layer_config.use_raw_weight and not layer_config.use_packed_k_layout
     should_widen_rs = has_unpacked_rs and has_group_accumulator and not use_warp_spec and warp_n < 32
     if mma_type == MmaType.WGMMA and should_widen_rs and layer_config.shape_n % 128 == 0:
@@ -65,7 +69,7 @@ def fit_sm90_tile(
             if layer_config.a_dtype.num_bits == 16 and use_warp_spec and warp_n <= 32:
                 max_warp_m = 192
             if has_group_accumulator:
-                max_warp_m = 160 if warp_n <= 16 else 96 if warp_n <= 32 else 48
+                max_warp_m = 160 if warp_n <= 16 else max_group_warp_m if warp_n <= 32 else 48
                 if has_unpacked_rs:
                     max_warp_m = 128 if warp_n <= 16 else 80 if warp_n <= 32 else 48
                     if layer_config.a_dtype.is_integer_type:

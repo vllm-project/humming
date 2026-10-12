@@ -191,13 +191,6 @@ def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False, 
                 f"{instruction_registers} registers per thread; launch budget {launch_budget:g}"
             )
 
-    accumulator_registers = warp_m * warp_n / (64 if use_f16_accum else 32)
-    has_group_accumulator = False
-    if mma_type != MmaType.MXMMA and layer_config.a_dtype.num_bits < 16:
-        has_group_scale = layer_config.input_scale_group_size > 0
-        if not has_group_scale and not layer_config.use_fused_e8m0_scale:
-            has_group_scale = layer_config.is_group_weight_scale or layer_config.is_block_weight_scale
-        has_group_accumulator = has_group_scale
     math_budget = min(255, launch_budget)
     if tuning_config.use_warp_spec:
         try:
@@ -211,33 +204,24 @@ def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False, 
             f"launch budget {launch_budget:g}, math-thread budget {math_budget:g}"
         )
 
-    # Each ordinary MMA buffer spans K=256/activation_bits, hence M/4 and N/4
-    # 32-bit registers per thread. Count dequantized operands, not both copies.
-    buffer_registers = (warp_m + warp_n) / 4
     if mma_type == MmaType.WGMMA:
-        # A is always in smem; raw-weight SS also keeps B in smem.
-        buffer_registers = 0 if layer_config.use_raw_weight else warp_n / 4
-        if not layer_config.use_raw_weight and layer_config.use_packed_k_layout:
-            # The packed B buffer holds one N=64 WGMMA fragment across all K slabs.
-            buffer_registers = warp_k * layer_config.a_dtype.num_bits / 64
+        return None
+
+    accumulator_registers = warp_m * warp_n / (64 if use_f16_accum else 32)
+    has_group_accumulator = False
+    if mma_type != MmaType.MXMMA and layer_config.a_dtype.num_bits < 16:
+        has_group_scale = layer_config.input_scale_group_size > 0
+        if not has_group_scale and not layer_config.use_fused_e8m0_scale:
+            has_group_scale = layer_config.is_group_weight_scale or layer_config.is_block_weight_scale
+        has_group_accumulator = has_group_scale
+    buffer_registers = (warp_m + warp_n) / 4
     if has_group_accumulator:
-        partial_accumulator_registers = accumulator_registers * 0.5
-        if mma_type == MmaType.WGMMA:
-            partial_accumulator_registers = max(partial_accumulator_registers, instruction_accumulators)
-            if layer_config.a_dtype.is_integer_type or tuning_config.wgmma_split_issue_wait:
-                partial_accumulator_registers = accumulator_registers
-        accumulator_registers += partial_accumulator_registers
-        if mma_type == MmaType.WGMMA and tuning_config.wgmma_split_issue_wait:
-            accumulator_registers = max(accumulator_registers, 2 * instruction_accumulators)
-    input_scale_registers = 0
-    if mma_type == MmaType.WGMMA and layer_config.input_scale_group_size > 0:
-        input_scale_registers = math.ceil(warp_m / 16) * 4
-    demand = accumulator_registers + buffer_registers + input_scale_registers
+        accumulator_registers *= 1.5
+    demand = accumulator_registers + buffer_registers
     if demand >= math_budget - 8:
         return (
             f"register budget exceeded: accumulator {accumulator_registers:g} + "
-            f"single-buffer {buffer_registers:g} + input scales {input_scale_registers:g} "
-            f"= {demand:g} must be < "
+            f"single-buffer {buffer_registers:g} = {demand:g} must be < "
             f"math-thread budget {math_budget:g} - 8 ({math_budget - 8:g})"
         )
     return None
