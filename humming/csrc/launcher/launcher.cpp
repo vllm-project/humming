@@ -288,6 +288,8 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getUint32("BS_DTYPE_ID"),
       reader.getUint32("PROBLEM_SHAPE_N"),
       reader.getUint32("PROBLEM_SHAPE_K"),
+      reader.getUint32("WEIGHT_SHAPE_N"),
+      reader.getUint32("WEIGHT_SHAPE_K"),
       reader.getUint32("BLOCK_SHAPE_M"),
       reader.getUint32("BLOCK_SHAPE_N"),
       reader.getUint32("BLOCK_SHAPE_K"),

@@ -61,6 +61,15 @@ def _case(
 
 
 MOE_CASES = (
+    _case("indexed-pad-nk", GemmType.INDEXED, pad_shape_n=96, pad_shape_k=352),
+    _case(
+        "grouped-contiguous-fp8-pad-nk",
+        GemmType.GROUPED_CONTIGUOUS,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float8e4m3,
+        pad_shape_n=96,
+        pad_shape_k=352,
+    ),
     _case(
         "m-major-raw-fp8-group128",
         GemmType.GROUPED_CONTIGUOUS,

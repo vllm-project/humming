@@ -86,7 +86,24 @@ class LayerConfig(BaseHummingConfig):
         "use_native_dequant",
         "use_block_scaled_mma",
         "mma_scale_group_size",
+        "weight_shape_n",
+        "weight_shape_k",
     )
+
+    @property
+    def weight_shape_n(self):
+        alignment = 8 if self.use_raw_weight else 64
+        return round_up(self.shape_n - self.pad_shape_n, alignment)
+
+    @property
+    def weight_shape_k(self):
+        if self.use_raw_weight or self.use_flat_weight:
+            alignment = 128 // self.b_dtype.num_bits
+            if self.use_raw_weight and self.a_dtype.num_bits == 8 and self.b_dtype.num_bits < 8:
+                alignment = 128
+        else:
+            alignment = 64 if self.use_packed_k_layout else 512 // self.a_dtype.num_bits
+        return round_up(self.shape_k - self.pad_shape_k, alignment)
 
     @property
     def is_umma_supported(self):
@@ -455,7 +472,7 @@ class LayerConfig(BaseHummingConfig):
 
     @property
     def weight_nbytes(self):
-        nbytes1 = self.shape_n * self.shape_k * self.b_dtype.num_bits // 8
+        nbytes1 = self.weight_shape_n * self.weight_shape_k * self.b_dtype.num_bits // 8
         num_groups = self.shape_k / (self.weight_scale_group_size or self.shape_k)
         assert self.bs_dtype is not None
         nbytes2 = self.shape_n * num_groups * self.bs_dtype.num_bits // 8

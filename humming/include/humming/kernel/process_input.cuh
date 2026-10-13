@@ -26,6 +26,23 @@ CUDA_INLINE uint64_t group_scale_index(uint64_t output_row, uint32_t group, uint
 }
 
 
+template <class Config, class ScaleType>
+CUDA_INLINE void store_group_scale(void *scales, uint64_t row, uint32_t group, uint64_t stride, ScaleStorage<ScaleType> value) {
+  uint64_t index = group_scale_index<Config, ScaleType>(row, group, stride);
+  store_scale<ScaleType>(scales, index, value);
+  constexpr uint32_t kGroups = Config::kHiddenSize / Config::kQuantGroupSize;
+  if constexpr (sizeof(ScaleStorage<ScaleType>) == 1 && kGroups % 4 != 0) {
+    if (group == kGroups - 1) {
+      PRAGMA_UNROLL
+      for (uint32_t tail = kGroups; tail < CEIL_DIV(kGroups, 4) * 4; ++tail) {
+        uint64_t tail_index = group_scale_index<Config, ScaleType>(row, tail, stride);
+        store_scale<ScaleType>(scales, tail_index, 0);
+      }
+    }
+  }
+}
+
+
 template <class BaseConfig, class TuningConfig, ProcessInputQuantizationPhase Phase>
 __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kTokensPerBlock) void process_input_kernel(
     const void *input,
@@ -172,12 +189,12 @@ __global__ __launch_bounds__(TuningConfig::kThreadsPerTask * TuningConfig::kToke
         if (!write.skip_output) {
           if constexpr (Config::kReduce) {
             if (scale_leader) {
-              uint64_t scale_index = write.output_row;
-              if constexpr (Config::kDynamicGroupScale) {
-                scale_index = group_scale_index<Config, OutputScaleType>(write.output_row, group, group_scale_stride);
-              }
               ScaleStorage<OutputScaleType> stored_scale = write.zero_output() ? ScaleStorage<OutputScaleType>{} : group_output_scale;
-              store_scale<OutputScaleType>(output_scales, scale_index, stored_scale);
+              if constexpr (Config::kDynamicGroupScale) {
+                store_group_scale<Config, OutputScaleType>(output_scales, write.output_row, group, group_scale_stride, stored_scale);
+              } else {
+                store_scale<OutputScaleType>(output_scales, write.output_row, stored_scale);
+              }
             }
             if constexpr (Config::kFusedGroupToken)
               if (thread.input_col == 0) token_scales[write.output_row] = write.zero_output() ? 0.f : token_scale;
@@ -261,8 +278,7 @@ __global__ __launch_bounds__(kTokensPerBlock * 32) void finalize_group_token_sca
       if (lane == 0) token_scales[task.output_row] = task.zero_output() ? 0.f : token_scale;
       for (uint32_t group = lane; group < kGroupsPerToken; group += 32) {
         float scale = !task.zero_output() && token_scale > 0.f ? decode_scale<M3BFloat16>(input[source_row * kGroupsPerToken + group]) / token_scale : 0.f;
-        uint64_t index = group_scale_index<Config, OutputScaleType>(task.output_row, group, group_scale_stride);
-        store_scale<OutputScaleType>(output_scales, index, encode_scale<OutputScaleType>(scale));
+        store_group_scale<Config, OutputScaleType>(output_scales, task.output_row, group, group_scale_stride, encode_scale<OutputScaleType>(scale));
       }
     }
   }

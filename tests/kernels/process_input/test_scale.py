@@ -69,7 +69,11 @@ def test_quantization_scales(
     )
 
     expected = process_input_ref(inputs, static_tensor_scale=static_tensor_scale, **options)
-    actual = process_input(inputs, token_scales=static_tensor_scale, use_pdl=use_pdl, **options)
+    has_scale_tail = quant_mode.has_group_scale and group_scale_dtype != "float32" and num_groups % 4 != 0
+    group_scales = torch.full_like(expected[1], -1) if has_scale_tail else None
+    actual = process_input(
+        inputs, group_scales=group_scales, token_scales=static_tensor_scale, use_pdl=use_pdl, **options
+    )
 
     assert_process_input_close(
         actual,
@@ -80,6 +84,13 @@ def test_quantization_scales(
         quant_group_size=quant_group_size,
         use_m_major_input_scale=use_m_major_input_scale,
     )
+    if has_scale_tail:
+        scale_bytes = actual[1].view(torch.uint8)
+        if use_m_major_input_scale:
+            scale_tail = scale_bytes[-1].reshape(-1, 4)[:shape_m, num_groups % 4 :]
+        else:
+            scale_tail = scale_bytes[:, num_groups:]
+        assert torch.count_nonzero(scale_tail) == 0
 
 
 def test_group_token_scales_with_cold_inputs():

@@ -100,7 +100,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     __syncthreads();
 
     uint32_t &slice_iters = scheduler.slice_iters;
-    constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
+    constexpr uint32_t kStaticSliceIters = Ctx::kNumKBlocks;
     const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
     producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
     s2r_pipe.seek(scheduler.m_offset);

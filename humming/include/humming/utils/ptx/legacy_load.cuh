@@ -80,7 +80,18 @@ CUDA_INLINE void legacy_load_pred(const T *gmem_ptr, T *smem_ptr, bool pred) {
 template <bool use_cp_async, typename T, uint32_t cache_type = 0>
 CUDA_INLINE void legacy_load_zfill(const T *gmem_ptr, T *smem_ptr, bool pred) {
   if constexpr (!use_cp_async) {
-    smem_ptr[0] = pred ? gmem_ptr[0] : T();
+    if constexpr (sizeof(T) == sizeof(int4) && alignof(T) >= alignof(int4)) {
+      int4 value;
+      asm volatile("{ .reg .pred p; setp.ne.u32 p, %5, 0; "
+                   "mov.u32 %0, 0; mov.u32 %1, 0; mov.u32 %2, 0; mov.u32 %3, 0; "
+                   "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4]; }"
+          : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+          : "l"(gmem_ptr), "r"(uint32_t(pred))
+          : "memory");
+      reinterpret_cast<int4 *>(smem_ptr)[0] = value;
+    } else {
+      smem_ptr[0] = pred ? gmem_ptr[0] : T();
+    }
     return;
   }
 
@@ -98,8 +109,7 @@ CUDA_INLINE void legacy_load_zfill(const T *gmem_ptr, T *smem_ptr, bool pred) {
 template <bool use_cp_async, typename T, uint32_t cache_type = 0>
 CUDA_INLINE void legacy_load_zfill_pred(const T *gmem_ptr, T *smem_ptr, bool pred1, bool pred2) {
   if constexpr (!use_cp_async) {
-    const T val = {0, 0, 0, 0};
-    if (pred2) { smem_ptr[0] = pred1 ? gmem_ptr[0] : val; }
+    if (pred2) legacy_load_zfill<false, T, cache_type>(gmem_ptr, smem_ptr, pred1);
     return;
   }
 

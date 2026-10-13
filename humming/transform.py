@@ -143,6 +143,12 @@ def check_and_pad_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor])
     for key, attrs in tensors_attrs.items():
         shape = attrs["shape"]
         tensor = tensors[key]
+        if key == "weight":
+            shape = (
+                *shape[:-2],
+                config.weight_shape_n,
+                config.weight_shape_k * config.b_dtype.num_bits // 32,
+            )
         if (
             key == "weight_scale"
             and config.use_fused_e8m0_scale
@@ -221,7 +227,13 @@ def process_fused_e8m0_scale(
     scale_range = scale_range.minimum(max_range)
     scale_min_new = scale_max - scale_range
     delta_scale_offsets = weight_scale.maximum(scale_min_new) - weight_scale
-    delta_scale_offsets = delta_scale_offsets.view(num_experts, -1)
+    weight_n = weight.size(-2)
+    weight_k = weight.size(-1) * 32 // config.b_dtype.num_bits
+    num_weight_groups = weight_k // config.weight_scale_group_size
+    delta_scale_offsets = delta_scale_offsets.reshape(num_experts, config.shape_n, -1)
+    delta_scale_offsets = (
+        delta_scale_offsets[:, :weight_n, :num_weight_groups].contiguous().view(num_experts, -1)
+    )
     weight_scale = weight_scale.maximum(scale_min_new) - scale_min_new
     if config.a_dtype == dtypes.float8e4m3:
         weight_scale = weight_scale + 1
@@ -274,8 +286,14 @@ def transform_humming_weight(
     padded_shape_k = shape_k if padded_shape_k is None else padded_shape_k
     packed_block_size_k = 256 // a_dtype.num_bits
 
-    assert padded_shape_n % 64 == 0
-    assert padded_shape_k % (2 * packed_block_size_k) == 0
+    if use_raw_weight:
+        assert padded_shape_n % 8 == 0
+    else:
+        assert padded_shape_n % 64 == 0
+    if use_raw_weight or use_flat_weight:
+        assert padded_shape_k * b_dtype.num_bits % 128 == 0
+    else:
+        assert padded_shape_k % (2 * packed_block_size_k) == 0
 
     if a_dtype == dtypes.int8 and b_dtype in [dtypes.int8, dtypes.uint8]:
         if not packed:
@@ -537,6 +555,8 @@ def transform_humming_tensors(
         tensors = tensors.copy()
 
     weight = tensors["weight"]
+    weight_words = config.weight_shape_k * config.b_dtype.num_bits // 32
+    weight = weight[..., : config.weight_shape_n, :weight_words].contiguous()
     zero_point = tensors["zero_point"] if config.has_zero_point else None
     bias = tensors["bias"] if config.has_bias else None
     weight_scale = None
@@ -562,11 +582,20 @@ def transform_humming_tensors(
     if config.use_fused_e8m0_scale and config.a_dtype == dtypes.float8e4m3:
         interleave_mode = 2
 
+    repack_zero_point = zero_point
+    if zero_point is not None:
+        zero_point_rows = config.weight_shape_n
+        if not config.is_fp_zero_point:
+            zero_point_rows = zero_point_rows * config.b_dtype.num_bits // 32
+        group_size = config.weight_scale_group_size or config.weight_shape_k
+        num_groups = (config.weight_shape_k + group_size - 1) // group_size
+        repack_zero_point = zero_point[..., :zero_point_rows, :num_groups].contiguous()
+
     weight = transform_humming_weight(
         weight=weight,
         b_dtype=config.b_dtype,
         a_dtype=config.a_dtype,
-        zero_point=zero_point,
+        zero_point=repack_zero_point,
         use_fused_e8m0_scale=config.use_fused_e8m0_scale,
         packed=True,
         interleave_mode=interleave_mode,
