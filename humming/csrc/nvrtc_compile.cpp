@@ -1,4 +1,13 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <filesystem>
+#include <system_error>
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <nvrtc.h>
 
 #include <cstdio>
@@ -40,16 +49,41 @@ void die(const std::string &msg) {
   std::exit(2);
 }
 
+#ifdef _WIN32
+using LibraryHandle = HMODULE;
+#else
+using LibraryHandle = void *;
+#endif
+
 template <typename T>
-void load_symbol(void *library, T &symbol, const char *name) {
+void load_symbol(LibraryHandle library, T &symbol, const char *name) {
+#ifdef _WIN32
+  symbol = reinterpret_cast<T>(GetProcAddress(library, name));
+  if (symbol == nullptr)
+    die(std::string("cannot load ") + name + ": " + std::system_category().message(GetLastError()));
+#else
   symbol = reinterpret_cast<T>(dlsym(library, name));
   if (symbol == nullptr) die(std::string("cannot load ") + name + ": " + dlerror());
+#endif
 }
 
 void load_nvrtc(const std::string &configured_path) {
+#ifdef _WIN32
+  auto wide_path = std::filesystem::absolute(std::filesystem::u8path(configured_path));
+  // NVRTC loads its builtins later, so keep this directory available for the process lifetime.
+  if (!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS))
+    die("cannot configure DLL search: " + std::system_category().message(GetLastError()));
+  if (AddDllDirectory(wide_path.parent_path().c_str()) == nullptr)
+    die("cannot add NVRTC DLL directory: " + std::system_category().message(GetLastError()));
+  LibraryHandle library = LoadLibraryExW(
+      wide_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  if (library == nullptr)
+    die("cannot load NVRTC from " + configured_path + ": " + std::system_category().message(GetLastError()));
+#else
   void *library = dlopen(configured_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (library == nullptr)
     die("cannot load NVRTC from " + configured_path + ": " + dlerror());
+#endif
   load_symbol(library, p_nvrtcAddNameExpression, "nvrtcAddNameExpression");
   load_symbol(library, p_nvrtcCompileProgram, "nvrtcCompileProgram");
   load_symbol(library, p_nvrtcCreateProgram, "nvrtcCreateProgram");
@@ -122,7 +156,7 @@ Args parse_args(int argc, char **argv) {
     } else if (s == "-h" || s == "--help") {
       std::printf(
           "Usage: nvrtc_compile --input X.cu --output Y.cubin "
-          "[--nvrtc-path libnvrtc.so] [--ptx] [--log path] "
+          "[--nvrtc-path PATH] [--ptx] [--log path] "
           "[--name-expression EXPR ...] [--header NAME=PATH ...] "
           "-- <nvrtc flag> ...\n");
       std::exit(0);

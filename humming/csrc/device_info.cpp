@@ -238,6 +238,19 @@ bool query_device_data(int64_t device_index, DeviceData *info) {
   if (std::strstr(info->name, "ZW810E") != nullptr) info->sm_count = 20;
 
   int64_t sm_version = info->sm_major * 10 + info->sm_minor;
+#if defined(_WIN32) && defined(_M_ARM64)
+  if (sm_version == 121 && info->memory_bus_width == 0) {
+    // Some Windows ARM64 drivers report zero bus width and invalid clocks for SM121.
+    if (PyErr_WarnEx(
+            PyExc_RuntimeWarning,
+            "CUDA reports zero memory bus width for Windows ARM64 SM121; "
+            "using GB10-reference clocks and bus width for performance estimates.",
+            1) < 0) return false;
+    info->memory_clock_khz = 8533000;
+    info->memory_bus_width = 256;
+    info->sm_clock_khz = 3003000;
+  }
+#endif
   info->l1_cache_size = get_l1_cache_size(info->sm_major, info->sm_minor);
   // GB10 reports the effective LPDDR5X data rate; discrete GPUs report the
   // memory clock and require the usual DDR factor of two.

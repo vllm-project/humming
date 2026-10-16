@@ -94,10 +94,13 @@ def _load_lib(path):
     return lib
 
 
-def build_cubin_patcher(output_path, compiler="g++"):
+def build_cubin_patcher(output_path, compiler=None):
     src_path = Path(__file__).parents[1] / "csrc" / "patch_cubin.cpp"
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    compiler = compiler or jit_utils.get_cpp_compiler()
+    if jit_utils.IS_WINDOWS:
+        return jit_utils.build_msvc_native(src_path, output_path, compiler, include_paths=[])
     tmp_path = output_path.with_suffix(".tmp")
     cmd = [
         compiler,
@@ -112,7 +115,7 @@ def build_cubin_patcher(output_path, compiler="g++"):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError(
-            f"Failed to build libcubinpatch.so:\nCMD: {' '.join(cmd)}\n"
+            f"Failed to build {output_path.name}:\nCMD: {' '.join(cmd)}\n"
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
     os.replace(tmp_path, output_path)
@@ -126,18 +129,18 @@ def may_build_cubin_patcher():
 
     src_path = os.path.join(os.path.dirname(__file__), "..", "csrc", "patch_cubin.cpp")
     src_path = os.path.abspath(src_path)
-    native_path = jit_utils.get_precompiled_artifact_path(src_path, "libcubinpatch.so")
+    library_name = jit_utils.get_native_artifact_name("cubin_patcher")
+    native_path = jit_utils.get_precompiled_artifact_path(src_path, library_name)
     if native_path is not None:
         _cached_lib = _load_lib(native_path.as_posix())
         return _cached_lib
 
-    compiler = os.environ.get("CXX") or "g++"
     full_hash = jit_utils.hash_path_content(src_path, releative=True)
     full_hash = jit_utils.hash_to_hex(full_hash + jit_utils.get_native_platform_signature())
 
     build_dir = Path(jit_utils.get_humming_cache_dir()) / "cubin_patcher" / full_hash
     build_dir.mkdir(parents=True, exist_ok=True)
-    lib_path = build_dir / "libcubinpatch.so"
+    lib_path = build_dir / library_name
 
     if lib_path.exists():
         _cached_lib = _load_lib(lib_path.as_posix())
@@ -146,7 +149,7 @@ def may_build_cubin_patcher():
     lock_filename = jit_utils.get_humming_lock_filename("cubin_patcher_" + full_hash)
     with FileLock(lock_filename):
         if not lib_path.exists():
-            build_cubin_patcher(lib_path, compiler=compiler)
+            build_cubin_patcher(lib_path)
 
     _cached_lib = _load_lib(lib_path.as_posix())
     return _cached_lib

@@ -6,14 +6,82 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
 from filelock import FileLock
 
 import humming.utils.jit as jit_utils
+
+IS_WINDOWS = sys.platform == "win32"
+
+
+def get_native_artifact_name(component: str) -> str:
+    return {
+        "launcher": "humming_launcher.dll" if IS_WINDOWS else "libhumming_launcher.so",
+        "cubin_patcher": "cubinpatch.dll" if IS_WINDOWS else "libcubinpatch.so",
+        "device_info": "_device_info.pyd" if IS_WINDOWS else "_device_info.abi3.so",
+        "nvrtc_compile": "nvrtc_compile.exe" if IS_WINDOWS else "nvrtc_compile",
+    }[component]
+
+
+def get_cpp_compiler() -> str:
+    compiler = os.environ.get("CXX") or shutil.which("cl" if IS_WINDOWS else "g++")
+    if compiler is None and not IS_WINDOWS:
+        compiler = shutil.which("c++")
+    if compiler is None:
+        raise RuntimeError(
+            "A C++ compiler is required; on Windows, use a Visual Studio developer shell "
+            "targeting the Python architecture"
+        )
+    return compiler
+
+
+def build_msvc_native(
+    source_path: Path,
+    output_path: Path,
+    compiler: str,
+    include_paths: list[str],
+    defines: list[str] | None = None,
+    link_args: list[str] | None = None,
+    shared: bool = True,
+) -> str:
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="humming-msvc-") as temporary_dir:
+        temporary_path = Path(temporary_dir) / output_path.name
+        command = [
+            compiler,
+            "/nologo",
+            "/O2",
+            "/std:c++17",
+            "/EHsc",
+            "/MD",
+            "/DNOMINMAX",
+            *(["/LD"] if shared else []),
+            *[f"/I{path}" for path in include_paths],
+            *[f"/D{define}" for define in defines or []],
+            str(source_path.resolve()),
+            "/link",
+            f"/OUT:{temporary_path}",
+            *(link_args or []),
+        ]
+        result = subprocess.run(
+            command, cwd=temporary_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to build {output_path.name}:\nCMD: {' '.join(command)}\n"
+                f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            )
+        shutil.copyfile(temporary_path, output_path.with_suffix(".tmp"))
+    os.replace(output_path.with_suffix(".tmp"), output_path)
+    print(f"Built {output_path}", flush=True)
+    return str(output_path)
 
 
 def get_native_arch() -> str | None:
@@ -71,7 +139,7 @@ def get_cuda_include_path():
     cuda_include_path = os.getenv("CUDA_INCLUDE_PATH")
     if cuda_include_path is not None:
         return cuda_include_path
-    cuda_home_path = os.getenv("CUDA_HOME")
+    cuda_home_path = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH")
     if cuda_home_path is not None:
         return os.path.join(cuda_home_path, "include")
     return "/usr/local/cuda/include/"
@@ -79,14 +147,16 @@ def get_cuda_include_path():
 
 @functools.lru_cache(maxsize=8)
 def get_cuda_command_path(name):
-    if "/" in name:
+    if "/" in name or "\\" in name:
         return name
     cuda_command_path = os.getenv(f"CUDA_{name.upper()}_PATH")
     if cuda_command_path is not None:
         return cuda_command_path
-    cuda_home_path = os.getenv("CUDA_HOME")
+    cuda_home_path = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH")
     if cuda_home_path is not None:
-        return os.path.join(cuda_home_path, "bin/" + name)
+        needs_executable_suffix = IS_WINDOWS and not name.lower().endswith(".exe")
+        executable_name = name + ".exe" if needs_executable_suffix else name
+        return os.path.join(cuda_home_path, "bin", executable_name)
 
     cuda_command_path = f"/usr/local/cuda/bin/{name}"
     if os.path.exists(cuda_command_path):
@@ -143,13 +213,13 @@ def hash_path_content(path: str, releative: bool = False, text_only: bool = True
 
     assert os.path.exists(path)
     if os.path.isfile(path):
-        filename = path.split("/")[-1] if releative else path
+        filename = Path(path).name if releative else path
         with open(path, "rb") as f:
             data[filename] = str(f.read())
     else:
         pattern = os.path.join(path, "**/*")
         for fullname in sorted(glob.glob(pattern, recursive=True)):
-            filename = os.path.relpath(fullname, path) if releative else fullname
+            filename = Path(fullname).relative_to(path).as_posix() if releative else fullname
             if not os.path.isfile(fullname):
                 continue
             try:

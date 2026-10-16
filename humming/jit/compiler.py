@@ -268,6 +268,8 @@ class NVCCCompiler(Compiler):
             "-fopenmp",
             "-lgomp",
         ]
+        if jit_utils.IS_WINDOWS:
+            cxx_flags = ["/O2"]
 
         flags = [
             "-std=c++17",

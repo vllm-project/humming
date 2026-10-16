@@ -36,6 +36,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define HUMMING_EXPORT __declspec(dllexport)
+#else
+#define HUMMING_EXPORT
+#endif
+
 static int getbit(const std::vector<uint8_t> &d, size_t base, int bit) {
   return (d[base + bit / 8] >> (bit % 8)) & 1;
 }
@@ -395,7 +401,7 @@ static PatchStats run_patch(const std::string &path, const std::string &mode_nam
 //   g++ -O2 -std=c++17 -fPIC -shared patch_cubin.cpp -o libcubinpatch.so
 // Returns the number of patched instructions (>=0), or -rc on error
 // (2 bad mode/read, 3 not sm_12xa, 4 I/O, 5 unsupported instruction config).
-extern "C" int cubin_patch(const char *path, const char *mode, int dry, int backup) {
+extern "C" HUMMING_EXPORT int cubin_patch(const char *path, const char *mode, int dry, int backup) {
   PatchStats st = run_patch(path, mode, dry != 0, backup != 0, /*verbose=*/false);
   return st.rc ? -st.rc : st.patched;
 }
@@ -407,7 +413,7 @@ extern "C" int cubin_patch(const char *path, const char *mode, int dry, int back
 // Returns the number of patched instructions (>=0), or -rc on error
 // (2 bad mode, 3 not sm_12xa, 5 unsupported instruction config). Nothing is
 // written back when dry != 0.
-extern "C" int cubin_patch_buffer(uint8_t *data, size_t n, const char *mode, int dry) {
+extern "C" HUMMING_EXPORT int cubin_patch_buffer(uint8_t *data, size_t n, const char *mode, int dry) {
   if (!data || n == 0 || !mode) return -2;
   const Mode *mode_p = nullptr;
   for (auto &M : MODES)

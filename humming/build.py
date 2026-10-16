@@ -1,7 +1,6 @@
 """Build native artifacts shipped in Humming wheels."""
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -10,9 +9,10 @@ from pathlib import Path
 import torch
 from torch.utils.cpp_extension import include_paths
 
+import humming.utils.jit as jit_utils
 from humming.utils.cubin import build_cubin_patcher
+from humming.utils.cuda import get_cuda_library_path
 from humming.utils.device import build_device_info_extension
-from humming.utils.jit import get_native_arch, write_precompiled_artifact_manifest
 from humming.utils.nvrtc import build_nvrtc_compile_binary
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +20,7 @@ TARGET_TORCH_VERSION = "0x020B000000000000"
 
 
 def _architecture() -> str:
-    arch = get_native_arch()
+    arch = jit_utils.get_native_arch()
     if arch is None:
         raise RuntimeError("Unsupported architecture")
     return arch
@@ -60,6 +60,22 @@ def _build_cuda_stub(output_dir: Path) -> None:
 
 def build_launcher(output: Path, compiler: str, cuda_library_dir: Path) -> None:
     cuda_include = _find_cuda_include()
+    if jit_utils.IS_WINDOWS:
+        jit_utils.build_msvc_native(
+            ROOT / "humming/csrc/launcher/launcher.cpp",
+            output,
+            compiler,
+            include_paths=[*include_paths(), str(cuda_include)],
+            defines=["USE_TORCH_STABLE_API=1", f"TORCH_TARGET_VERSION={TARGET_TORCH_VERSION}"],
+            link_args=[
+                str(cuda_library_dir / "cuda.lib"),
+                str(_torch_library("torch_cpu.lib")),
+                str(_torch_library("torch_cuda.lib")),
+                "delayimp.lib",
+                "/DELAYLOAD:nvcuda.dll",
+            ],
+        )
+        return
     torch_cpu = _torch_library("libtorch_cpu.so")
     torch_cuda = _torch_library("libtorch_cuda.so")
 
@@ -93,29 +109,34 @@ def build_launcher(output: Path, compiler: str, cuda_library_dir: Path) -> None:
 
 
 def build_native(output_dir: str | Path | None = None) -> Path:
-    compiler = os.environ.get("CXX") or shutil.which("g++") or shutil.which("c++")
-    if compiler is None:
-        raise RuntimeError("A C++ compiler is required")
+    compiler = jit_utils.get_cpp_compiler()
     native_dir = (
         Path(output_dir).resolve()
         if output_dir is not None
         else ROOT / "humming" / "_native" / _architecture()
     )
     native_dir.mkdir(parents=True, exist_ok=True)
+    launcher_name = jit_utils.get_native_artifact_name("launcher")
+    device_info_name = jit_utils.get_native_artifact_name("device_info")
+    cubin_patcher_name = jit_utils.get_native_artifact_name("cubin_patcher")
+    nvrtc_compile_name = jit_utils.get_native_artifact_name("nvrtc_compile")
     with tempfile.TemporaryDirectory(prefix="humming-link-") as temporary_dir:
-        cuda_library_dir = Path(temporary_dir)
-        _build_cuda_stub(cuda_library_dir)
-        build_launcher(native_dir / "libhumming_launcher.so", compiler, cuda_library_dir)
-        build_device_info_extension(native_dir / "_device_info.abi3.so", compiler, cuda_library_dir)
-    build_cubin_patcher(native_dir / "libcubinpatch.so", compiler=compiler)
-    build_nvrtc_compile_binary(native_dir / "nvrtc_compile", compiler=compiler)
-    write_precompiled_artifact_manifest(
+        if jit_utils.IS_WINDOWS:
+            cuda_library_dir = get_cuda_library_path("cuda.lib").parent
+        else:
+            cuda_library_dir = Path(temporary_dir)
+            _build_cuda_stub(cuda_library_dir)
+        build_launcher(native_dir / launcher_name, compiler, cuda_library_dir)
+        build_device_info_extension(native_dir / device_info_name, compiler, cuda_library_dir)
+    build_cubin_patcher(native_dir / cubin_patcher_name, compiler=compiler)
+    build_nvrtc_compile_binary(native_dir / nvrtc_compile_name, compiler=compiler)
+    jit_utils.write_precompiled_artifact_manifest(
         native_dir,
         {
-            "libhumming_launcher.so": ROOT / "humming/csrc/launcher",
-            "libcubinpatch.so": ROOT / "humming/csrc/patch_cubin.cpp",
-            "nvrtc_compile": ROOT / "humming/csrc/nvrtc_compile.cpp",
-            "_device_info.abi3.so": ROOT / "humming/csrc/device_info.cpp",
+            launcher_name: ROOT / "humming/csrc/launcher",
+            cubin_patcher_name: ROOT / "humming/csrc/patch_cubin.cpp",
+            nvrtc_compile_name: ROOT / "humming/csrc/nvrtc_compile.cpp",
+            device_info_name: ROOT / "humming/csrc/device_info.cpp",
         },
     )
     return native_dir
