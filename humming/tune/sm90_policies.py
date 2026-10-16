@@ -852,15 +852,30 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
     return config
 
 
+def _grouped_scale_indexed_ctas_per_sm(analysis: CandidateAnalysis) -> int:
+    # Thread and block-M caps stand in for the measured register launch-bound cliffs.
+    num_threads = analysis.num_threads
+    block_shape_m = analysis.candidate.block_shape[0]
+    if num_threads <= 128:
+        thread_limit = 3 if block_shape_m <= 16 else 2
+    elif num_threads <= 256 and block_shape_m <= 24:
+        thread_limit = 2
+    else:
+        thread_limit = 1
+    return max(1, min(thread_limit, analysis.thread_smem_cta_limit))
+
+
 def select_grouped_scale(
     problem: TuningProblem,
 ) -> TuningDecision:
     layer_config = problem.layer_config
+    tune_indexed_residency = problem.gemm_type == GemmType.INDEXED and not problem.use_batch_invariant
     use_wgmma_ss = layer_config.a_dtype.num_bits == layer_config.b_dtype.num_bits
     if problem.use_f16_accum:
         max_block_m = 256
     elif layer_config.input_scale_group_size > 0:
-        max_block_m = 160
+        # Limit the grouped-scale accumulator footprint for indexed prefill.
+        max_block_m = 64 if tune_indexed_residency else 160
     elif layer_config.weight_scale_group_size < 128:
         max_block_m = 192
     else:
@@ -1288,9 +1303,20 @@ def _moe_ctas_per_sm(
     ):
         resource_limit = 3
 
+    is_grouped_indexed = problem.gemm_type == GemmType.INDEXED and problem.layer_config.a_dtype.num_bits < 16
+    if is_grouped_indexed and not problem.use_batch_invariant:
+        resource_limit = _grouped_scale_indexed_ctas_per_sm(analysis)
+
     resource_limit = min(resource_limit, analysis.thread_smem_cta_limit)
     if problem.device.num_sms is None:
         raise ValueError("MoE selection requires a device SM count")
+    if is_grouped_indexed and not problem.use_batch_invariant and resource_limit == 3:
+        has_full_waves = analysis.num_output_tiles >= 2 * resource_limit * problem.device.num_sms
+        has_long_reduction = problem.layer_config.shape_k > 2 * block_shape[2] * analysis.candidate.num_stages
+        padded_work = analysis.num_output_tiles * math.prod(block_shape[:2])
+        has_sparse_tiles = 4 * problem.shape_m * problem.layer_config.shape_n < padded_work
+        if not has_full_waves or (has_long_reduction and has_sparse_tiles):
+            resource_limit = 2
     grid_limit = math.ceil(analysis.num_output_tiles / problem.device.num_sms)
     return max(1, min(resource_limit, grid_limit))
 
