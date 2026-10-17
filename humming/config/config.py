@@ -560,7 +560,7 @@ class TuningConfig(BaseHummingConfig):
 
     use_pdl: bool = False
     raster_group_m: int = 1
-    # L2 evict-first hint on weight TMA loads, for kernels that read each weight tile once.
+    # L2 evict-first hint on weight loads, for kernels that read each weight tile once.
     evict_weights_first: bool = False
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (

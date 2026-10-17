@@ -134,8 +134,8 @@ public:
       uint32_t col = index % kRowInt4s;
       uint32_t offset = (col / kSwizzleInt4s * BlockShape::N + row) * kSwizzleInt4s + col % kSwizzleInt4s;
       uint32_t swizzled_offset = offset ^ ((smem_base + offset / 8) % kSwizzleInt4s);
-      legacy_load_pred<kUseCpAsync>(gmem_ptr + row * kGlobalRowInt4s + col,
-                                    smem_ptr + swizzled_offset, row < BlockShape::N);
+      legacy_load_pred<kUseCpAsync, int4, 0, kEvictWeightsFirst>(gmem_ptr + row * kGlobalRowInt4s + col,
+                                                                 smem_ptr + swizzled_offset, row < BlockShape::N);
     }
   }
 
@@ -151,7 +151,7 @@ public:
       if constexpr (Ctx::kUseWgmmaCpAsyncNPermute) row = permute_wgmma_ss_row(row);
       uint32_t offset = col * BlockShape::N + row;
       uint32_t gmem_offset = col * ProblemShape::N + index / kTileInt4s * 64 + index % kChunkRows;
-      legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + offset, index < kNumInt4s);
+      legacy_load_pred<kUseCpAsync, int4, 0, kEvictWeightsFirst>(gmem_ptr + gmem_offset, smem_ptr + offset, index < kNumInt4s);
     }
   }
 
@@ -172,7 +172,7 @@ public:
   void load_legacy(int4 *smem_ptr) {
     legacy_load_2d<
         kUseCpAsync, kNumInt4s, kNumLoadThreads,
-        kGmemStride, kSmemStride, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+        kGmemStride, kSmemStride, kLoadThreadOffset, int4, kEvictWeightsFirst>(gmem_ptr, smem_ptr);
   }
 
   CUDA_INLINE
