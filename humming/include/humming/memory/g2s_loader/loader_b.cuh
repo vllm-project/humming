@@ -21,7 +21,7 @@ private:
   static constexpr uint32_t kMultiCastSizeB = Ctx::kMultiCastSizeB;
   // M-grouped traversal reuses B immediately across neighboring CTAs. Avoid
   // retaining streamed weights at the expense of A's reuse across N tiles.
-  static constexpr bool kEvictWeightsFirst = Ctx::kUseUmmaSplitLoads && Ctx::kRasterGroupM > 1;
+  static constexpr bool kEvictWeightsFirst = (Ctx::kUseUmmaSplitLoads && Ctx::kRasterGroupM > 1) || Ctx::kEvictWeightsFirst;
 
   static constexpr uint32_t kWeightSmemBits = SharedStorage::kWeightSmemBits;
   static constexpr uint32_t kSwizzleBytes = MIN(128u, SharedStorage::kWeightStageK *kWeightSmemBits / 8);

@@ -108,6 +108,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr uint32_t kLoadThreadOffset = kNumThreads - kNumLoadThreads;
   static constexpr uint32_t kMultiCastSize = TuningConfig_::kMultiCastSizeA * TuningConfig_::kMultiCastSizeB;
   static constexpr uint32_t kRasterGroupM = TuningConfig_::kRasterGroupM;
+  static constexpr bool kEvictWeightsFirst = TuningConfig_::kEvictWeightsFirst;
 
   SharedStorage &smem;
   const KernelParams &params;

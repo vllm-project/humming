@@ -14,7 +14,7 @@ private:
   static constexpr bool kUseBlockScaledMma = Ctx::kUseBlockScaledMma;
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
   static constexpr bool kUseTma = Ctx::kUseTmaBS;
-  static constexpr bool kEvictWeightsFirst = Ctx::kUseUmmaSplitLoads && Ctx::kRasterGroupM > 1;
+  static constexpr bool kEvictWeightsFirst = (Ctx::kUseUmmaSplitLoads && Ctx::kRasterGroupM > 1) || Ctx::kEvictWeightsFirst;
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
   static constexpr uint32_t kLoadThreadOffset = Ctx::kLoadThreadOffset;
