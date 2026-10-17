@@ -304,13 +304,19 @@ CUDA_INLINE void tensor_map_acquire_cta(const void *gmem_desc_ptr) {
                : "memory");
 };
 
-template <uint32_t kMultiCastSize = 1>
+template <uint32_t kMultiCastSize = 1, bool kEvictFirst = false>
 CUDA_INLINE void tma_load_5d(const void *desc_ptr, void *smem_ptr, void *mbar_ptr,
                             uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t c4) {
   uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
   uint32_t mbar = cast_smem_ptr_to_uint(mbar_ptr);
   uint64_t desc = reinterpret_cast<uint64_t>(desc_ptr);
-  if constexpr (kMultiCastSize == 1) {
+  if constexpr (kMultiCastSize == 1 && kEvictFirst) {
+    uint64_t policy = create_tma_cache_policy();
+    asm volatile("cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                 " [%0], [%1, {%3, %4, %5, %6, %7}], [%2], %8;"
+                 :: "r"(smem), "l"(desc), "r"(mbar),
+                    "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(c4), "l"(policy) : "memory");
+  } else if constexpr (kMultiCastSize == 1) {
     asm volatile("cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes"
                  " [%0], [%1, {%3, %4, %5, %6, %7}], [%2];"
                  :: "r"(smem), "l"(desc), "r"(mbar),

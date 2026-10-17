@@ -80,7 +80,7 @@ public:
       if constexpr (Ctx::kUseFlatWeight) {
         uint32_t expert_k = col_offset / ProblemShape::N * ProblemShape::K + row_offset;
         if (cluster_rank == 0)
-          tma_load_5d<kMultiCastSizeB>(tensor_map_ptr, smem_ptr, mbar_ptr,
+          tma_load_5d<kMultiCastSizeB, kEvictWeightsFirst>(tensor_map_ptr, smem_ptr, mbar_ptr,
               0, col_offset % 64 / 16, col_offset % ProblemShape::N / 64, 0, expert_k * ElementQB::kBits / 128);
       } else if constexpr (Ctx::kUseRawWeight) {
         constexpr uint32_t kCoordinateBits = SharedStorage::kExpandUmmaWeight ? 1 : 32 / ElementQB::kBits;
