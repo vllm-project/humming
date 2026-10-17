@@ -230,6 +230,9 @@ class Sm120Heuristics(Sm89Heuristics):
 
         cls._tune_scaled_mma_pipeline(layer_config, config, gemm_type, use_m_major_input_scale)
         cls._tune_small_tile_transfers(layer_config, config, gemm_type, shape_m)
+        # A single M tile reads each weight tile once; keep the stream from evicting reused data in L2.
+        # For MoE, use the average rows per expert.
+        config["evict_weights_first"] = shape_m / (layer_config.num_experts or 1) <= config["block_shape"][0]
         return config
 
     @staticmethod

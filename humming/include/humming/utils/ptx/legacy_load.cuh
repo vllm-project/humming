@@ -1,48 +1,67 @@
 #pragma once
 
 #include <humming/utils/base.cuh>
+#include <humming/utils/ptx/tma.cuh>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define CP_ASYNC_L2_HINT ".L2::256B"
 #else
 #define CP_ASYNC_L2_HINT ""
 #endif
-#define CP_ASYNC_PREFIX(MODE) "cp.async." #MODE ".shared.global" CP_ASYNC_L2_HINT
+#define CP_ASYNC_PREFIX(MODE, CACHE_HINT) "cp.async." #MODE ".shared.global" CACHE_HINT CP_ASYNC_L2_HINT
 
-#define CP_ASYNC_ASM(MODE)                                          \
-  asm volatile(CP_ASYNC_PREFIX(MODE) " [%0], [%1], %2;\n" \
-               :                                                    \
-               : "r"(smem), "l"(gmem_ptr), "n"(BYTES)               \
-               : "memory");
+#define CP_ASYNC_ASM(MODE, EVICT_FIRST)                                                        \
+  if constexpr (EVICT_FIRST) {                                                                 \
+    asm volatile(CP_ASYNC_PREFIX(MODE, ".L2::cache_hint") " [%0], [%1], %2, %3;\n"             \
+                 :                                                                             \
+                 : "r"(smem), "l"(gmem_ptr), "n"(BYTES), "l"(create_tma_cache_policy())        \
+                 : "memory");                                                                  \
+  } else {                                                                                     \
+    asm volatile(CP_ASYNC_PREFIX(MODE, "") " [%0], [%1], %2;\n"                                \
+                 :                                                                             \
+                 : "r"(smem), "l"(gmem_ptr), "n"(BYTES)                                        \
+                 : "memory");                                                                  \
+  }
 
 #define CP_ASYNC_ZFILL_ASM(MODE)                                        \
-  asm volatile(CP_ASYNC_PREFIX(MODE) " [%0], [%1], %2, %3;\n" \
+  asm volatile(CP_ASYNC_PREFIX(MODE, "") " [%0], [%1], %2, %3;\n" \
                :                                                        \
                : "r"(smem), "l"(gmem_ptr), "n"(BYTES), "r"(src_size)    \
                : "memory");
 
-#define CP_ASYNC_PRED_ASM(MODE)                                            \
-  asm volatile("{\n"                                                       \
-               "  .reg .pred p;\n"                                         \
-               "  setp.ne.s32 p, %0, 0;\n"                                 \
-               "  @p " CP_ASYNC_PREFIX(MODE) " [%1], [%2], %3;\n"       \
-               "}\n"                                                       \
-               :                                                           \
-               : "r"((uint32_t)pred), "r"(smem), "l"(gmem_ptr), "n"(BYTES) \
-               : "memory");
+#define CP_ASYNC_PRED_ASM(MODE, EVICT_FIRST)                                                               \
+  if constexpr (EVICT_FIRST) {                                                                             \
+    asm volatile("{\n"                                                                                     \
+                 "  .reg .pred p;\n"                                                                       \
+                 "  setp.ne.s32 p, %0, 0;\n"                                                               \
+                 "  @p " CP_ASYNC_PREFIX(MODE, ".L2::cache_hint") " [%1], [%2], %3, %4;\n"                 \
+                 "}\n"                                                                                     \
+                 :                                                                                         \
+                 : "r"((uint32_t)pred), "r"(smem), "l"(gmem_ptr), "n"(BYTES), "l"(create_tma_cache_policy()) \
+                 : "memory");                                                                              \
+  } else {                                                                                                 \
+    asm volatile("{\n"                                                                                     \
+                 "  .reg .pred p;\n"                                                                       \
+                 "  setp.ne.s32 p, %0, 0;\n"                                                               \
+                 "  @p " CP_ASYNC_PREFIX(MODE, "") " [%1], [%2], %3;\n"                                    \
+                 "}\n"                                                                                     \
+                 :                                                                                         \
+                 : "r"((uint32_t)pred), "r"(smem), "l"(gmem_ptr), "n"(BYTES)                               \
+                 : "memory");                                                                              \
+  }
 
 #define CP_ASYNC_ZFILL_PRED_ASM(MODE)                                                      \
   asm volatile("{\n"                                                                       \
                "  .reg .pred p;\n"                                                         \
                "  setp.ne.s32 p, %0, 0;\n"                                                 \
-               "  @p " CP_ASYNC_PREFIX(MODE) " [%1], [%2], %3, %4;\n"                       \
+               "  @p " CP_ASYNC_PREFIX(MODE, "") " [%1], [%2], %3, %4;\n"                       \
                "}\n"                                                                       \
                :                                                                           \
                : "r"((uint32_t)pred2), "r"(smem), "l"(gmem_ptr), "n"(BYTES), "r"(src_size) \
                : "memory");
 
 
-template <bool use_cp_async, typename T, uint32_t cache_type = 0>
+template <bool use_cp_async, typename T, uint32_t cache_type = 0, bool evict_first = false>
 CUDA_INLINE void legacy_load(const T *gmem_ptr, T *smem_ptr) {
   if constexpr (!use_cp_async) {
     smem_ptr[0] = gmem_ptr[0];
@@ -54,13 +73,13 @@ CUDA_INLINE void legacy_load(const T *gmem_ptr, T *smem_ptr) {
   uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
 
   if constexpr (cache_type == 2 || (cache_type == 0 && BYTES == 16)) {
-    CP_ASYNC_ASM(cg);
+    CP_ASYNC_ASM(cg, evict_first)
   } else {
-    CP_ASYNC_ASM(ca);
+    CP_ASYNC_ASM(ca, evict_first)
   }
 };
 
-template <bool use_cp_async, typename T, uint32_t cache_type = 0>
+template <bool use_cp_async, typename T, uint32_t cache_type = 0, bool evict_first = false>
 CUDA_INLINE void legacy_load_pred(const T *gmem_ptr, T *smem_ptr, bool pred) {
   if constexpr (!use_cp_async) {
     if (pred) smem_ptr[0] = gmem_ptr[0];
@@ -71,9 +90,9 @@ CUDA_INLINE void legacy_load_pred(const T *gmem_ptr, T *smem_ptr, bool pred) {
   static_assert(cache_type != 2 || BYTES == 16);
   uint32_t smem = cast_smem_ptr_to_uint(smem_ptr);
   if constexpr (cache_type == 2 || (cache_type == 0 && BYTES == 16)) {
-    CP_ASYNC_PRED_ASM(cg);
+    CP_ASYNC_PRED_ASM(cg, evict_first)
   } else {
-    CP_ASYNC_PRED_ASM(ca);
+    CP_ASYNC_PRED_ASM(ca, evict_first)
   }
 };
 
@@ -114,7 +133,7 @@ CUDA_INLINE void legacy_load_zfill_pred(const T *gmem_ptr, T *smem_ptr, bool pre
   }
 };
 
-template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t thread_offset = 0, typename T = int4>
+template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t thread_offset = 0, typename T = int4, bool evict_first = false>
 CUDA_INLINE void legacy_load_1d(const T *gmem_ptr, T *smem_ptr) {
   constexpr uint32_t iters = CEIL_DIV(num_int4s, threads);
   const uint32_t thread_id = threadIdx.x - thread_offset;
@@ -124,12 +143,12 @@ CUDA_INLINE void legacy_load_1d(const T *gmem_ptr, T *smem_ptr) {
     const uint32_t index = i * threads + thread_id;
 
     if (num_int4s % threads == 0 || i != iters - 1 || index < num_int4s) {
-      legacy_load<use_cp_async>(gmem_ptr + index, smem_ptr + index);
+      legacy_load<use_cp_async, T, 0, evict_first>(gmem_ptr + index, smem_ptr + index);
     }
   }
 };
 
-template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t gmem_stride, uint32_t smem_stride, uint32_t thread_offset = 0, typename T = int4>
+template <bool use_cp_async, uint32_t num_int4s, uint32_t threads, uint32_t gmem_stride, uint32_t smem_stride, uint32_t thread_offset = 0, typename T = int4, bool evict_first = false>
 CUDA_INLINE void legacy_load_2d(const T *gmem_ptr, T *smem_ptr) {
   static_assert(num_int4s % smem_stride == 0);
   const uint32_t thread_id = threadIdx.x - thread_offset;
@@ -146,7 +165,7 @@ CUDA_INLINE void legacy_load_2d(const T *gmem_ptr, T *smem_ptr) {
         uint32_t smem_offset = (i * line_iters + j) * threads + thread_id;
         uint32_t gmem_offset = i * gmem_stride + j * threads + thread_id;
 
-        legacy_load<use_cp_async>(gmem_ptr + gmem_offset, smem_ptr + smem_offset);
+        legacy_load<use_cp_async, T, 0, evict_first>(gmem_ptr + gmem_offset, smem_ptr + smem_offset);
       }
     }
   } else {
@@ -160,9 +179,9 @@ CUDA_INLINE void legacy_load_2d(const T *gmem_ptr, T *smem_ptr) {
       uint32_t gmem_offset = smem_offset + (gmem_stride - smem_stride) * gmem_row;
 
       if (num_int4s % threads == 0 || i != iters - 1) {
-        legacy_load<use_cp_async>(gmem_ptr + gmem_offset, smem_ptr + smem_offset);
+        legacy_load<use_cp_async, T, 0, evict_first>(gmem_ptr + gmem_offset, smem_ptr + smem_offset);
       } else {
-        legacy_load_pred<use_cp_async>(gmem_ptr + gmem_offset, smem_ptr + smem_offset, smem_offset < num_int4s);
+        legacy_load_pred<use_cp_async, T, 0, evict_first>(gmem_ptr + gmem_offset, smem_ptr + smem_offset, smem_offset < num_int4s);
       }
     }
   }
