@@ -71,34 +71,41 @@ def test_long_k_balances_m_reuse_and_stream_k_grid():
     assert config["num_sms"] >= 64
 
 
+@pytest.mark.parametrize("shape_n", [512, 1024])
+@pytest.mark.parametrize("gemm_type", [GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS])
+def test_sparse_long_k_moe_uses_mma_without_extra_row_padding(shape_n, gemm_type):
+    layer = _layer(shape_n, 7168, num_experts=256)
+    sparse = Sm90H20Heuristics.get_config(layer, 8, gemm_type=gemm_type)
+    populated = Sm90H20Heuristics.get_config(layer, 1024, gemm_type=gemm_type)
+
+    assert sparse["mma_type"] == "mma"
+    assert sparse["block_shape"][0] == sparse["warp_shape"][0] == 8
+    assert populated.get("mma_type", "wgmma") == "wgmma"
+
+
 @pytest.mark.parametrize(
-    ("shape_n", "block_n"),
-    [(512, 256), (1024, 512)],
+    ("shape_m", "block_shape", "warp_shape", "num_ctas", "use_stream_k"),
+    [
+        (3072, (40, 256, 64), (40, 64, 64), 2, True),
+        (3840, (48, 128, 64), (48, 32, 64), 3, False),
+        (12288, (48, 128, 64), (48, 32, 64), 3, False),
+        (24576, (48, 128, 64), (48, 32, 64), 3, False),
+    ],
 )
-def test_sparse_long_k_moe_keeps_two_n_tiles_per_expert(shape_n, block_n):
-    config = Sm90H20Heuristics.get_config(
-        _layer(shape_n, 7168, num_experts=256),
-        8,
-        gemm_type=GemmType.INDEXED,
-    )
-
-    assert config["block_shape"] == (8, block_n, 64)
-    assert config["num_stages"] == 3
-
-
-@pytest.mark.parametrize("shape_m", [3072, 12288, 24576])
 @pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16])
-def test_large_mxfp4_grouped_contiguous_uses_three_resident_ctas(shape_m, a_dtype):
+def test_mxfp4_grouped_contiguous_selects_residency_for_expert_tiles(
+    shape_m, block_shape, warp_shape, num_ctas, use_stream_k, a_dtype
+):
     config = Sm90H20Heuristics.get_config(
         _mxfp4_layer(4608, 5120, a_dtype),
         shape_m,
         gemm_type=GemmType.GROUPED_CONTIGUOUS,
     )
 
-    assert config["block_shape"] == (48, 128, 64)
-    assert config["warp_shape"] == (48, 32, 64)
-    assert config["num_ctas_per_sm"] == 3
-    assert not config["use_stream_k"]
+    assert config["block_shape"] == block_shape
+    assert config["warp_shape"] == warp_shape
+    assert config["num_ctas_per_sm"] == num_ctas
+    assert config["use_stream_k"] is use_stream_k
 
 
 @pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16, dtypes.float8e4m3, dtypes.int8])

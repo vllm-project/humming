@@ -260,7 +260,8 @@ def test_moe_case_coverage():
 @pytest.mark.parametrize("raster_group_m", [1, 8])
 @pytest.mark.parametrize("use_stream_k", [False, True])
 @pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
-def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype, raster_group_m):
+@pytest.mark.parametrize("gemm_type", [GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED])
+def test_grouped_skips_unused_capacity(use_stream_k, offset_dtype, raster_group_m, gemm_type):
     """Graph replay uses live expert offsets and leaves unused rows untouched."""
     skip_if_unsupported(a_dtype=dtypes.bfloat16)
     layer = LayerConfig(
@@ -273,10 +274,10 @@ def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype, ra
         bs_dtype=dtypes.float8e8m0,
         weight_scale_group_size=32,
     )
-    compute = ComputeConfig(gemm_type=GemmType.GROUPED_CONTIGUOUS)
+    compute = ComputeConfig(gemm_type=gemm_type)
     runner = KernelTestRunner(
         KernelTestCase(
-            name="grouped-contiguous-unused-capacity",
+            name="grouped-unused-capacity",
             layer_config=layer,
             compute_config=compute,
             seed=2026,
@@ -289,9 +290,13 @@ def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype, ra
     kernel = HummingKernel.prepare_kernels(
         layer.to_str(), compute.to_str(), tuning, device=torch.device("cuda", 0)
     )
-    inputs = torch.empty(64, 256, device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
-    offsets = torch.zeros(5, device="cuda", dtype=offset_dtype)
+    is_masked = gemm_type == GemmType.GROUPED_MASKED
+    capacity = 64
+    input_rows = capacity * layer.num_experts if is_masked else capacity
+    inputs = torch.empty(input_rows, 256, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(input_rows, 512, device="cuda", dtype=torch.bfloat16)
+    layout_size = layer.num_experts if is_masked else layer.num_experts + 1
+    expert_layout = torch.zeros(layout_size, device="cuda", dtype=offset_dtype)
     locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
 
     def launch():
@@ -299,8 +304,8 @@ def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype, ra
             configs=kernel,
             inputs=inputs,
             outputs=output,
-            expert_layout=offsets,
-            valid_shape_m=64,
+            expert_layout=expert_layout,
+            valid_shape_m=input_rows,
             locks=locks,
             **runner.kernel_tensors,
         )
@@ -310,15 +315,19 @@ def test_grouped_contiguous_skips_unused_capacity(use_stream_k, offset_dtype, ra
     with torch.cuda.graph(graph):
         launch()
     for counts in ([0, 0, 0, 0], [0, 0, 0, 7], [13, 0, 5, 0], [3, 17, 0, 21], [16, 16, 16, 16]):
-        offsets.copy_(torch.tensor([0, *torch.tensor(counts).cumsum(0).tolist()], dtype=offset_dtype))
+        offsets = [0, *torch.tensor(counts).cumsum(0).tolist()]
+        expert_layout.copy_(torch.tensor(counts if is_masked else offsets, dtype=offset_dtype))
         inputs.normal_()
-        inputs[sum(counts) :] = float("nan")
+        valid_rows = torch.zeros(input_rows, device="cuda", dtype=torch.bool)
+        for expert, count in enumerate(counts):
+            start = expert * capacity if is_masked else offsets[expert]
+            valid_rows[start : start + count] = True
+        inputs[~valid_rows] = float("nan")
         output.fill_(-123)
         graph.replay()
-        start = 0
         for expert, count in enumerate(counts):
+            start = expert * capacity if is_masked else offsets[expert]
             expert_input = inputs[start : start + count].float()
             reference = (expert_input @ runner.weight_ref[expert].float().T).bfloat16()
             torch.testing.assert_close(output[start : start + count], reference, atol=0.01, rtol=0.01)
-            start += count
-        assert (output[start:] == -123).all()
+        assert (output[~valid_rows] == -123).all()

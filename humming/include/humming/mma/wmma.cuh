@@ -87,7 +87,13 @@ public:
       for (uint32_t j = 0; j < WarpShape::N / MmaShape::N; j++) {
         PRAGMA_UNROLL
         for (uint32_t m = 0; m < WarpShape::M / MmaShape::M; m++) {
-          MmaOpClass::fma(regs_a[buffer_id][m][k], regs_b[buffer_id][j][k], regs_c[0][m][j], regs_c[0][m][j]);
+          if constexpr (ElementA::kBits == 16 && MmaShape::M == 8 && MmaShape::N == 16 && MmaShape::K == 8 && !USE_PPU) {
+            uint32_t *weight_values = reinterpret_cast<uint32_t *>(regs_b[buffer_id][j]);
+            uint32_t transposed_b[2] = {weight_values[k], weight_values[k + 2]};
+            MmaOpClass::fma(regs_a[buffer_id][m][k], transposed_b, regs_c[0][m][j], regs_c[0][m][j]);
+          } else {
+            MmaOpClass::fma(regs_a[buffer_id][m][k], regs_b[buffer_id][j][k], regs_c[0][m][j], regs_c[0][m][j]);
+          }
           arith.may_apply_as_and_bs_on_mma_c(regs_c_as_ptr(), m, j, k, iter_id);
         }
       }
@@ -120,6 +126,34 @@ public:
 
   template <class T = uint32_t>
   CUDA_INLINE T *final_regs_c_as_ptr() {
+    if constexpr (ElementA::kBits == 16 && MmaShape::M == 8 && MmaShape::N == 16 && !USE_PPU) {
+      // Restore the logical 8x16 accumulator layout before the epilogue.
+      uint32_t lane = ctx.lane_id();
+      uint32_t source_lane = (lane % 4) * 8 + lane / 8;
+      bool is_odd_row = (lane / 4) % 2;
+      PRAGMA_UNROLL
+      for (uint32_t m = 0; m < WarpShape::M / MmaShape::M; m++) {
+        PRAGMA_UNROLL
+        for (uint32_t n = 0; n < WarpShape::N / MmaShape::N; n++) {
+          auto &values = regs_c[0][m][n];
+          PRAGMA_UNROLL
+          for (uint32_t column = 0; column < 2; column++) {
+            if constexpr (sizeof(typename MmaOpClass::ValTypeC) == 4) {
+              float even_first = __shfl_sync(0xffffffff, values[column * 2], source_lane);
+              float odd_first = __shfl_sync(0xffffffff, values[column * 2 + 1], source_lane);
+              float even_second = __shfl_sync(0xffffffff, values[column * 2], source_lane + 4);
+              float odd_second = __shfl_sync(0xffffffff, values[column * 2 + 1], source_lane + 4);
+              values[column * 2] = is_odd_row ? odd_first : even_first;
+              values[column * 2 + 1] = is_odd_row ? odd_second : even_second;
+            } else {
+              uint32_t first = __shfl_sync(0xffffffff, values[column], source_lane);
+              uint32_t second = __shfl_sync(0xffffffff, values[column], source_lane + 4);
+              values[column] = __byte_perm(first, second, is_odd_row ? 0x7632 : 0x5410);
+            }
+          }
+        }
+      }
+    }
     return regs_c_as_ptr<T>(final_regs_c_index());
   };
 

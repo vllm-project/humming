@@ -228,7 +228,7 @@ def estimate_smem_size_layer(
         add(128, 64)  # tensor_map_buffer[1] (CUtensorMap)
     if is_grouped:
         add(layer_config.num_experts * 4, 4)  # expert_tokens
-        if gemm_type == GemmType.GROUPED_CONTIGUOUS and raster_group_m > 1:
+        if raster_group_m > 1:
             add((layer_config.num_experts + 1) * 4, 4)  # expert_m_block_offset
         add(4, 4)  # total_m_blocks
         if gemm_type == GemmType.GROUPED_CONTIGUOUS:

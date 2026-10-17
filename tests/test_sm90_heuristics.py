@@ -288,7 +288,11 @@ def test_mxfp4_a16_indexed_preserves_warp_k_and_fits_grid(
 
 
 @pytest.mark.parametrize("shape_k", [512, 256])
-def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k):
+@pytest.mark.parametrize(
+    ("shape_m", "block_m", "block_n", "num_ctas"),
+    [(6144, 32, 512, 2), (8192, 40, 512, 1), (10240, 48, 256, 2), (12288, 64, 256, 2)],
+)
+def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k, shape_m, block_m, block_n, num_ctas):
     layer = _layer(
         6144,
         shape_k,
@@ -298,21 +302,17 @@ def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k):
         input_scale_group_size=0,
     )
 
-    small = Sm90Heuristics.get_config(
+    config = Sm90Heuristics.get_config(
         layer,
-        shape_m=6144,
-        gemm_type=GemmType.INDEXED,
-    )
-    large = Sm90Heuristics.get_config(
-        layer,
-        shape_m=8192,
+        shape_m=shape_m,
         gemm_type=GemmType.INDEXED,
     )
 
-    assert small["block_shape"] == (32, 512, 64)
-    assert small["num_ctas_per_sm"] == 2
-    assert large["block_shape"] == (48, 256, 64)
-    assert large["num_ctas_per_sm"] == 2
+    assert config["block_shape"] == (block_m, block_n, 64)
+    assert config["num_ctas_per_sm"] == num_ctas
+    tuning_fields = TuningConfig.get_field_names()
+    tuning = TuningConfig(**{key: value for key, value in config.items() if key in tuning_fields})
+    assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
 
 
 def test_nvfp4_a16_uses_narrow_first_wave_only():
@@ -406,3 +406,25 @@ def test_grouped_w4a8_ranges_match_direct_selection(monkeypatch, device_name, nu
         for shape_m in (lower + 1, min(upper, lower + num_experts * 2048)):
             assert select(layer, shape_m=shape_m, **kwargs) == config
         previous_upper = upper
+
+
+@pytest.mark.parametrize("gemm_type", [GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS])
+@pytest.mark.parametrize("routed_m", [8, 256, 1024])
+def test_small_a16_expert_tiles_use_mma_without_padding(gemm_type, routed_m):
+    layer = _layer(
+        1024,
+        7168,
+        num_experts=256,
+        a_dtype=dtypes.bfloat16,
+        as_dtype=None,
+        bs_dtype=dtypes.float8e4m3,
+        input_scale_group_size=0,
+        weight_scale_group_size=16,
+    )
+    config = Sm90Heuristics.get_config(layer, routed_m, gemm_type=gemm_type)
+
+    assert config["mma_type"] == "mma"
+    assert config["block_shape"][0] == config["warp_shape"][0] == 8
+    assert config["use_stream_k"] is True
+    assert not config.get("use_tma", False)
+    assert not config.get("use_warp_spec", False)

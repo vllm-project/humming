@@ -18,6 +18,7 @@ from humming.tune.candidate import (
     fit_pipeline_stages,
     get_problem_rejection_reasons,
 )
+from humming.tune.raster import get_moe_raster_group_m
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -153,6 +154,95 @@ def fit_sm90_tile(
             raise ValueError(f"no SM90 tile fits shared memory: {config}")
         config["block_shape"] = (block_m // warp_m * smaller_m, block_n, block_k)
         config["warp_shape"] = (smaller_m, warp_n, warp_k)
+
+
+def select_sm90_small_m_schedule(
+    problem: TuningProblem,
+    selected: TuningDecision | dict,
+    *,
+    is_h20: bool = False,
+) -> TuningDecision | dict:
+    layer = problem.layer_config
+    config = selected.to_config() if isinstance(selected, TuningDecision) else selected
+    num_sms = problem.device.num_sms
+    assert num_sms is not None
+    block_m, block_n, block_k = config["block_shape"]
+    weight_bits = layer.b_dtype.num_bits
+    is_power_of_two_weight = weight_bits & (weight_bits - 1) == 0
+    warp_n, warp_k = (64, 32) if is_power_of_two_weight else (32, 64)
+    mma_m = 8 if block_m <= 8 else math.ceil(block_m / 16) * 16
+    mma_k = 128
+    num_stages = 4
+    num_weight_tiles = (layer.shape_n // 128) * (layer.shape_k // 128)
+    reason = None
+    proposal = None
+
+    if problem.gemm_type == GemmType.DENSE:
+        has_two_cta_work = num_weight_tiles >= num_sms * 2 * num_stages * 2
+        has_small_accumulator = mma_m * warp_n <= 1024
+        num_ctas = 2 if has_two_cta_work and has_small_accumulator else 1
+        has_pipeline_work = num_weight_tiles >= num_sms * num_stages
+        has_small_m = problem.shape_m <= 16
+        has_decode_work = problem.shape_m <= 32 and weight_bits >= 4 and has_two_cta_work
+        has_decode_work &= mma_m == block_m
+        if has_pipeline_work and (has_small_m or has_decode_work):
+            reason = "selected MMA with CTA residency fitted to K work and accumulator size"
+    elif mma_m == 8:
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
+        if is_h20 and num_output_tiles > num_sms:
+            return selected
+        mma_k = 64
+        num_ctas = 4
+        reason = "selected MMA for eight-row expert tiles"
+    elif mma_m <= 32:
+        # Halving an indexed K tile adds loads without removing producer overhead.
+        if problem.gemm_type == GemmType.INDEXED and block_k > 128:
+            return selected
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
+        num_base_tiles = problem.estimate_num_blocks_m(block_m) * (layer.shape_n // block_n)
+        has_short_grid = num_output_tiles <= num_sms * 5 / 4
+        has_extra_k_parallelism = block_k <= 64 and num_output_tiles <= num_sms * 9 / 4
+        has_no_extra_padding = mma_m == block_m and num_output_tiles <= num_sms * 2
+        can_round_m = block_m <= 16 and (has_short_grid or has_extra_k_parallelism or has_no_extra_padding)
+        # Rounding 24-row expert tiles to 32 regresses with skewed routing.
+        if can_round_m:
+            num_ctas = 2 if mma_m == 16 and num_output_tiles >= num_sms / 2 else 1
+            reason = "selected MMA for a short expert grid with bounded row padding"
+        elif block_m < 32 and block_k >= 128 and num_base_tiles <= num_sms:
+            if config.get("use_tma", False) or config.get("use_warp_spec", False):
+                proposal = config | {"use_tma": False, "use_warp_spec": False}
+                reason = "removed producer and TMA overhead from a short expert grid"
+
+    if reason is None:
+        return selected
+    if proposal is None:
+        proposal = {
+            "mma_type": MmaType.MMA.value,
+            "block_shape": (mma_m, 128, mma_k),
+            "warp_shape": (mma_m, warp_n, warp_k),
+            "num_stages": num_stages,
+            "num_ctas_per_sm": num_ctas,
+            "use_stream_k": True,
+            "use_tma": False,
+            "use_warp_spec": False,
+        }
+    candidate = ScheduleCandidate.from_config("sm90_small_m", proposal)
+    analysis = analyze_candidate(problem, candidate)
+    if not analysis.legal:
+        return selected
+    if isinstance(selected, TuningDecision):
+        considered = selected.considered
+    else:
+        base_config = {key: value for key, value in config.items() if key != "num_sms"}
+        base = ScheduleCandidate.from_config("sm90_small_m_base", base_config)
+        considered = (analyze_candidate(problem, base),)
+    return TuningDecision(
+        problem=problem,
+        family="sm90_small_m",
+        selected=candidate,
+        considered=(*considered, analysis),
+        reason=reason,
+    )
 
 
 def get_sm90_specialized_config(
@@ -488,8 +578,13 @@ def get_overlap_config(
     scores = relative_work.mean(axis=1)
     config = configs[int(np.argmin(scores))]
     block_m, block_n, _ = config["block_shape"]
-    if not is_dense and block_m >= 48 and block_n == 256:
+    use_a16_raster = can_overlap_a16 and gemm_type != GemmType.INDEXED
+    use_wide_raster = gemm_type == GemmType.GROUPED_CONTIGUOUS and block_m >= 48 and block_n == 256
+    if use_a16_raster or use_wide_raster:
         config["raster_group_m"] = 4
+    is_fp8 = layer.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2)
+    if can_overlap_block and is_fp8 and not is_dense:
+        config["raster_group_m"] = get_moe_raster_group_m(shape_m, layer.num_experts, block_m)
     return config
 
 
@@ -630,6 +725,8 @@ def get_block_scaled_moe_config(
         return None
     block_m = best[1]
 
+    raster_group_m = get_moe_raster_group_m(shape_m, layer_config.num_experts, block_m)
+
     config = {
         "mma_type": MmaType.WGMMA.value,
         "block_shape": (block_m, block_n, 128),
@@ -642,7 +739,7 @@ def get_block_scaled_moe_config(
         "use_tma_c": use_warp_spec and not short_k,
         "smem_reuse_mode": "none",
         "wgmma_split_issue_wait": not use_warp_spec,
-        "raster_group_m": 1,
+        "raster_group_m": raster_group_m,
     }
     if short_k or use_stream_k:
         config["producer_stage_unroll"] = 2
@@ -657,6 +754,7 @@ def get_block_scaled_moe_config(
         smem_reuse_mode="none",
         use_tma=True,
         use_warp_spec=use_warp_spec,
+        raster_group_m=raster_group_m,
     )
     if smem_size * resident_ctas > 227 * 1024:
         return None

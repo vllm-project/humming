@@ -161,7 +161,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         }
         if (!next_tile()) break;
         producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id,
-                      scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
+            scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
         producer.prefetch_stage();
 
         PRAGMA_UNROLL_COUNT(TuningConfig::kProducerStageUnroll)
@@ -375,6 +375,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       } else {
         mma.set_accumulator_tile(tile_index);
         epilogue.load_secondary_input_scale(scheduler.m_block_id, scheduler.current_shape_m, scheduler.m_offset);
+        if constexpr (SharedStorage::kUseDynamicOutputMap)
+          epilogue.gmem_writer.seek(scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
         mbarrier_wait(&smem.umma_accumulator_ready, tile_index % 2);
         tcgen05_fence_after_thread_sync();
         if constexpr (Ctx::kUseTmaC && !Ctx::kOutputChunkRows) tma_wait_store_group<0, true>();
@@ -388,7 +390,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         for (uint32_t group = 0; group < kOutputGroups; group++) {
           ctx.math_group = group;
           epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id,
-                        scheduler.current_shape_m, scheduler.m_offset);
+              scheduler.current_shape_m, scheduler.m_offset);
           s2r.load_channel(scheduler.slice_id);
           if constexpr (Consumer::kHasChannelData && kSeparateOutputStorage) {
             if (group + 1 == kOutputGroups) {

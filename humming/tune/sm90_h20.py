@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 
 import numpy as np
 
@@ -6,10 +7,12 @@ from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
+from humming.tune.candidate import DeviceProfile, TuningDecision, TuningProblem
 from humming.tune.sm90_policies import (
     fit_sm90_tile,
     get_sm90_specialized_config,
     select_sm90_block_m,
+    select_sm90_small_m_schedule,
 )
 from humming.utils.math import ceil_div, round_up
 from humming.utils.smem import estimate_smem_size_layer
@@ -583,10 +586,50 @@ class Sm90H20Heuristics(DeviceHeuristics):
         config = cls._select_config(
             layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
         )
-        return fit_sm90_tile(
+        is_moe_a16 = gemm_type != GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        has_aligned_reduction = layer_config.shape_k >= 4096 and layer_config.shape_k % 128 == 0
+        can_use_mma = is_moe_a16 and has_aligned_reduction and layer_config.shape_n % 128 == 0
+        can_use_mma &= not use_f16_accum and not use_batch_invariant and not layer_config.use_packed_k_layout
+        if can_use_mma and config["block_shape"][0] == 8:
+            problem = TuningProblem(
+                layer_config=layer_config,
+                shape_m=cls.get_shape_m_sample(layer_config, shape_m),
+                gemm_type=gemm_type,
+                device=DeviceProfile(
+                    name="sm90_h20",
+                    sm_version=cls.sm_version,
+                    num_sms=current_device.sm_count,
+                    max_smem_size=cls.max_smem_size,
+                ),
+                use_m_major_input_scale=use_m_major_input_scale,
+                expert_probability_cv=cls.expert_probability_cv,
+            )
+            selected = select_sm90_small_m_schedule(problem, config, is_h20=True)
+            config = selected.to_config() if isinstance(selected, TuningDecision) else selected
+        is_dense_a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        can_tune_transfers = is_dense_a16 and layer_config.shape_k >= 4096
+        can_tune_transfers &= not use_batch_invariant and not use_f16_accum
+        if can_tune_transfers:
+            block_shape = config["block_shape"]
+            warp_m, warp_n, warp_k = config["warp_shape"]
+            num_ctas = config.get("num_ctas_per_sm", 1)
+            num_k_warps = block_shape[2] // warp_k
+            num_math_warps = math.prod(block_shape) // math.prod(config["warp_shape"])
+            accumulator_registers = warp_m * warp_n // 32
+            resident_math_warps = num_math_warps * num_ctas
+            if num_k_warps >= 4:
+                config = config | {"use_tma": True, "use_warp_spec": True}
+            elif num_k_warps > 1 and accumulator_registers > 32:
+                config = config | {"use_tma": resident_math_warps >= 16, "use_warp_spec": False}
+            elif num_math_warps == 4 and accumulator_registers <= 64:
+                config = config | {"use_tma": True}
+                if accumulator_registers < 64:
+                    config = config | {"use_warp_spec": True}
+        config = fit_sm90_tile(
             layer_config,
             config,
             use_f16_accum,
             gemm_type=gemm_type,
             use_m_major_input_scale=use_m_major_input_scale,
         )
+        return {key: value.value if isinstance(value, Enum) else value for key, value in config.items()}

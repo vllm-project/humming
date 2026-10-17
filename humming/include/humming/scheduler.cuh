@@ -41,7 +41,7 @@ private:
   static constexpr uint32_t kStreamKBlocks = CEIL_DIV(K_BLOCKS, kStreamKBlockAlignment) * kStreamKBlockAlignment;
 
   static constexpr uint32_t kRasterGroupM = Ctx::kRasterGroupM;
-  static constexpr bool kUseGroupedRaster = kIsGroupedContiguousGemm && kRasterGroupM > 1;
+  static constexpr bool kUseGroupedRaster = kIsGroupedGemm && kRasterGroupM > 1;
   static constexpr uint32_t kNumStages = Ctx::TuningConfig::kNumStages;
 
   static constexpr int32_t ct_gcd(int32_t a, int32_t b) { return b == 0 ? a : ct_gcd(b, a % b); }
@@ -104,7 +104,13 @@ public:
       uint32_t streamk_mn_blocks = mn_blocks;
       if (mn_blocks > kNumCtaGroups) {
         streamk_mn_blocks = mn_blocks % kNumCtaGroups;
-        if (streamk_mn_blocks && streamk_mn_blocks * 10 <= kNumCtaGroups) streamk_mn_blocks += kNumCtaGroups;
+        bool should_merge_previous_wave = streamk_mn_blocks * 10 <= kNumCtaGroups;
+        if constexpr (Ctx::kSmVersion == 89 && !Ctx::kUseTmaC) {
+          should_merge_previous_wave = streamk_mn_blocks * 2 <= kNumCtaGroups;
+        } else if constexpr (Ctx::kSmVersion >= 100 && Ctx::kSmVersion < 110 && Ctx::kUseTmaC) {
+          should_merge_previous_wave = true;
+        }
+        if (streamk_mn_blocks && should_merge_previous_wave) streamk_mn_blocks += kNumCtaGroups;
       }
 
       dp_mn_iters = (mn_blocks - streamk_mn_blocks) / kNumCtaGroups;
@@ -178,9 +184,13 @@ public:
             const uint32_t expert = base + lane;
             uint32_t tokens = 0;
             if (expert < kNumExperts) {
-              const uint32_t next_offset = ctx.smem.expert_offset[expert + 1];
-              tokens = next_offset - ctx.smem.expert_offset[expert];
-              ctx.smem.expert_tokens[expert] = tokens;
+              if constexpr (kIsGroupedContiguousGemm) {
+                const uint32_t next_offset = ctx.smem.expert_offset[expert + 1];
+                tokens = next_offset - ctx.smem.expert_offset[expert];
+                ctx.smem.expert_tokens[expert] = tokens;
+              } else {
+                tokens = ctx.smem.expert_tokens[expert];
+              }
             }
             uint32_t blocks = CEIL_DIV(tokens, BlockShape::M);
             PRAGMA_UNROLL
@@ -226,7 +236,7 @@ public:
 
   CUDA_INLINE
   void map_mn_block(uint32_t mn_index, uint32_t &m_id, uint32_t &n_id) {
-    if constexpr (kRasterGroupM <= 1 || !(kIsDenseGemm || kUseGroupedRaster)) {
+    if constexpr (kRasterGroupM <= 1) {
       m_id = mn_index / N_BLOCKS;
       n_id = mn_index % N_BLOCKS;
     } else {
@@ -328,10 +338,14 @@ public:
       }
       expert_id = lower;
       const uint32_t first_block = ctx.smem.expert_m_block_offset[expert_id];
-      m_offset = ctx.smem.expert_offset[expert_id] +
-                 (m_block_id - first_block) * BlockShape::M;
-      current_shape_m = ctx.smem.expert_offset[expert_id] +
-                        ctx.smem.expert_tokens[expert_id];
+      uint32_t expert_offset;
+      if constexpr (kIsGroupedContiguousGemm) {
+        expert_offset = ctx.smem.expert_offset[expert_id];
+      } else {
+        expert_offset = expert_id * expert_max_num_tokens;
+      }
+      m_offset = expert_offset + (m_block_id - first_block) * BlockShape::M;
+      current_shape_m = expert_offset + ctx.smem.expert_tokens[expert_id];
       old_expert_id = expert_id;
       return;
     }

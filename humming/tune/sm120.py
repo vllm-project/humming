@@ -4,6 +4,7 @@ from humming import dtypes
 from humming.config import GemmType, MmaType
 from humming.config.mma import get_default_mma_type
 from humming.device import current_device
+from humming.tune.raster import get_moe_raster_group_m
 from humming.tune.sm8x import Sm89Heuristics
 from humming.utils.math import round_up
 from humming.utils.smem import estimate_smem_size_layer
@@ -230,7 +231,60 @@ class Sm120Heuristics(Sm89Heuristics):
 
         cls._tune_scaled_mma_pipeline(layer_config, config, gemm_type, use_m_major_input_scale)
         cls._tune_small_tile_transfers(layer_config, config, gemm_type, shape_m)
+        if is_wna16:
+            cls._tune_moe_w4a16(layer_config, config, gemm_type, shape_m)
+        is_fp8 = a in (dtypes.float8e4m3, dtypes.float8e5m2) and a == layer_config.b_dtype
+        use_grouped_raster = cls.sm_version == 120 and gemm_type == GemmType.GROUPED_CONTIGUOUS
+        if use_grouped_raster and is_fp8 and layer_config.is_block_weight_scale:
+            config["raster_group_m"] = get_moe_raster_group_m(
+                shape_m, layer_config.num_experts, config["block_shape"][0], group_m=4, min_m_tiles=2
+            )
         return config
+
+    @classmethod
+    def _tune_moe_w4a16(cls, layer_config, config, gemm_type, shape_m) -> None:
+        if gemm_type not in (GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS):
+            return
+        if layer_config.b_dtype.num_bits != 4:
+            return
+
+        tokens_per_expert = shape_m / layer_config.num_experts
+        block_m = next((tile for tile in (8, 16, 32, 48) if tokens_per_expert < tile * 0.9), None)
+        if block_m is None:
+            return
+
+        max_ctas = 4 if block_m <= 16 else 2
+        best_ctas = 1
+        best_config = None
+        for block_n, block_k in ((128, 64), (64, 128)):
+            if layer_config.shape_n % block_n or layer_config.shape_k % block_k:
+                continue
+            candidate = config | {
+                "block_shape": (block_m, block_n, block_k),
+                "warp_shape": (block_m, 64, 32),
+                "num_stages": 4,
+                "num_sms": current_device.sm_count,
+                "use_stream_k": True,
+                "output_chunk_rows": 0,
+            }
+            cls._use_cp_async(candidate)
+            smem = estimate_smem_size_layer(
+                layer_config,
+                candidate["block_shape"],
+                gemm_type,
+                candidate["num_stages"],
+                warp_shape=candidate["warp_shape"],
+            )
+            grid_ctas = max(1, shape_m * (layer_config.shape_n // block_n) * 4 // current_device.sm_count)
+            num_ctas = min(max_ctas, cls.max_smem_size // smem, grid_ctas)
+            if num_ctas > best_ctas:
+                candidate["num_ctas_per_sm"] = num_ctas
+                best_ctas = num_ctas
+                best_config = candidate
+
+        if best_config is not None:
+            config.clear()
+            config.update(best_config)
 
     @staticmethod
     def _use_cp_async(config) -> None:

@@ -301,6 +301,10 @@ class MmaOpClassImpl:
         return code
 
     def generate_ptx(self, indent=0):
+        uses_half_m_float = self.shape[0] == 8 and self.a_dtype in ("f16", "bf16")
+        if uses_half_m_float and not current_device.is_ppu:
+            return self.generate_half_m_ptx(indent)
+
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
         cd_dtype = self.cd_dtype
@@ -355,6 +359,36 @@ class MmaOpClassImpl:
         asm_code = "".join("\n" + " " * indent + x for x in asm_code.split("\n"))
 
         return asm_code
+
+    def generate_half_m_ptx(self, indent=0):
+        assert self.shape[1] == 16 and self.shape[2] in (8, 16)
+        assert self.cd_dtype in ("f16", "f32")
+        constraint = "f" if self.cd_dtype == "f32" else "r"
+        output_count = self.reg_cd_count
+        output = [f"%{index}" for index in range(output_count)]
+        a_start = output_count
+        b_start = a_start + self.reg_a_count
+        # Compute B.T @ A.T with a native 16-row MMA; transpose C at the epilogue.
+        b_order = (0, 2, 1, 3) if self.shape[2] == 16 else (0, 1)
+        a_operands = [f"%{b_start + index}" for index in b_order]
+        b_operands = [f"%{a_start + index}" for index in range(self.reg_a_count)]
+        groups = [output, a_operands, b_operands, output]
+        input_types = f"{self.b_dtype}.{self.a_dtype}"
+        instruction = f"mma.sync.aligned.m16n8k{self.shape[2]}.row.col"
+        instruction += f".{self.cd_dtype}.{input_types}.{self.cd_dtype}"
+        operands = ", ".join("{" + ", ".join(group) + "}" for group in groups)
+        outputs = ", ".join(f'"+{constraint}"(d[{index}])' for index in range(output_count))
+        inputs = [f'"r"(a[{index}])' for index in range(self.reg_a_count)]
+        inputs += [f'"r"(b[{index}])' for index in range(self.reg_b_count)]
+        lines = [
+            "asm volatile(",
+            '  "{ "',
+            f'  "{instruction} {operands}; }}\\n"',
+            f"  : {outputs}",
+            f"  : {', '.join(inputs)}",
+            ");",
+        ]
+        return "\n".join(" " * indent + line for line in lines)
 
 
 class UmmaOpClassImpl(MmaOpClassImpl):

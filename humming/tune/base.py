@@ -6,6 +6,7 @@ import numpy as np
 from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import current_device
+from humming.tune.raster import get_moe_raster_group_m
 from humming.utils.math import round_up
 from humming.utils.smem import estimate_smem_size_layer
 
@@ -36,7 +37,7 @@ class DeviceHeuristics:
     b8_allowed_dtypes: list[dtypes.DataType] = []
     b4_allowed_dtypes: list[dtypes.DataType] = []
     sm_version: int = 0
-    expert_probability_cv: float = 0.25
+    expert_probability_cv: float = 0.0
 
     @classmethod
     def should_use_pdl_for_input(cls, layer_config: LayerConfig, shape_m: int) -> bool:
@@ -66,7 +67,8 @@ class DeviceHeuristics:
         use_m_major_input_scale: bool = False,
     ):
         compute_bound_min_shape_m = _estimate_compute_bound_threshold(layer_config, use_f16_accum)
-        is_moe_a16 = gemm_type != GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        is_a16 = layer_config.a_dtype.num_bits == 16
+        is_moe_a16 = gemm_type != GemmType.DENSE and is_a16
 
         # 1. base config
         group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
@@ -88,14 +90,16 @@ class DeviceHeuristics:
         num_warps_m = block_shape_m // warp_shape_m
 
         # 2. block_shape_m and warp_shape_m
+        can_use_mma_m8 = is_a16 and not current_device.is_ppu
         if not layer_config.num_experts:
             if shape_m <= block_shape_m:
-                block_shape_m = round_up(shape_m, 16)
+                block_shape_m = 8 if can_use_mma_m8 and shape_m <= 8 else round_up(shape_m, 16)
             else:
                 blocks = [math.ceil(shape_m / ((i + 1) * 16)) for i in range(block_shape_m // 16)]
                 block_shape_m = np.argmin(blocks).item() * 16 + 16
         else:
-            for moe_block_size in [16, 32, 48, 64]:
+            moe_block_sizes = [8, 16, 32, 48, 64] if can_use_mma_m8 else [16, 32, 48, 64]
+            for moe_block_size in moe_block_sizes:
                 if shape_m / layer_config.num_experts / moe_block_size < 0.9:
                     break
 
@@ -112,6 +116,15 @@ class DeviceHeuristics:
                 block_shape_m = 48
             else:
                 block_shape_m = moe_block_size
+
+        can_split_small_m = gemm_type != GemmType.DENSE or layer_config.a_dtype.num_bits != 16
+        can_split_small_m |= layer_config.b_dtype.num_bits >= 16 or cls.sm_version >= 90
+        can_split_small_m |= use_f16_accum or use_batch_invariant
+        prefer_n_warps = not can_split_small_m and block_shape_m < 64
+        prefer_n_warps &= num_warps_m == 2 and block_shape_m % 32 == 0
+        if prefer_n_warps:
+            num_warps_m = 1
+            warp_shape_n = max(32, warp_shape_n // 2)
 
         assert num_warps_m <= 2
         if num_warps_m == 2 and block_shape_m >= 64:
@@ -134,6 +147,8 @@ class DeviceHeuristics:
 
         num_sms = current_device.sm_count
         min_grid_blocks = math.ceil(num_sms * num_ctas_per_sm / 2)
+        if prefer_n_warps:
+            min_grid_blocks = max(min_grid_blocks, num_sms)
         # Large expert tiles need more than half a wave to amortize their
         # register footprint; small M tiles benefit more from a wider N.
         is_short_moe = is_moe_a16 and layer_config.shape_k <= 1024
@@ -206,7 +221,8 @@ class DeviceHeuristics:
                 block_shape_k = block_shape_k * 2
                 num_warps = num_warps * 2
 
-        if num_warps < 8 and warp_shape_m % 32 == 0:
+        can_split_m = can_split_small_m or warp_shape_m >= 64
+        if num_warps < 8 and warp_shape_m % 32 == 0 and can_split_m:
             warp_shape_m = warp_shape_m // 2
             num_warps = num_warps * 2
 
@@ -278,9 +294,42 @@ class DeviceHeuristics:
                 block_shape,
                 gemm_type,
                 num_stages_new,
+                warp_shape=(warp_shape_m, warp_shape_n, warp_shape_k),
+                mma_accum_bits=16 if use_f16_accum else 32,
+                output_chunk_rows=output_chunk_rows,
             )
-            if smem_size * num_ctas_per_sm < cls.max_smem_size:
+            if smem_size * num_ctas_per_sm <= cls.max_smem_size:
                 num_stages = num_stages_new
+
+        is_dense_a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        is_quantized_weight = layer_config.b_dtype.num_bits < 16
+        can_reuse_weight = is_dense_a16 and is_quantized_weight and not use_batch_invariant
+        has_split_m_warps = (block_shape_m, block_shape_n, block_shape_k) == (64, 64, 64)
+        has_split_m_warps &= (warp_shape_m, warp_shape_n, warp_shape_k) == (32, 64, 32)
+        use_weight_reuse = False
+        is_reuse_tile_aligned = layer_config.shape_n % 128 == 0 and layer_config.shape_k % 64 == 0
+        if can_reuse_weight and has_split_m_warps and is_reuse_tile_aligned:
+            reuse_block_shape = (64, 128, 64)
+            reuse_warp_shape = (64, 32, 64)
+            num_weight_tiles = (layer_config.shape_n // 128) * (layer_config.shape_k // 64)
+            has_pipeline_work = num_weight_tiles >= num_sms * 2 * 4
+            reuse_smem_size = estimate_smem_size_layer(
+                layer_config,
+                reuse_block_shape,
+                gemm_type,
+                2,
+                warp_shape=reuse_warp_shape,
+                mma_accum_bits=16 if use_f16_accum else 32,
+                output_chunk_rows=output_chunk_rows,
+            )
+            if has_pipeline_work and reuse_smem_size * 2 <= cls.max_smem_size:
+                use_weight_reuse = True
+                block_shape_m, block_shape_n, block_shape_k = reuse_block_shape
+                warp_shape_m, warp_shape_n, warp_shape_k = reuse_warp_shape
+                num_stages = 2
+                num_ctas_per_sm = 2
+                num_blocks_n = layer_config.shape_n // block_shape_n
+                num_blocks_m = cls.estimate_num_blocks_m(layer_config, shape_m, block_shape_m)
 
         use_stream_k = True
         if use_batch_invariant:
@@ -304,7 +353,8 @@ class DeviceHeuristics:
         use_stream_k = layer_config.shape_k > 1024 and use_stream_k and not use_dense_output_grid
         use_fp32_accum = layer_config.a_dtype.is_floating_point_type and not use_f16_accum
         can_use_output_grid = gemm_type == GemmType.DENSE or is_moe_a16 and layer_config.shape_k > 4096
-        if use_fp32_accum and can_use_output_grid:
+        can_balance_fp16_grid = use_f16_accum and gemm_type == GemmType.DENSE
+        if (use_fp32_accum or can_balance_fp16_grid) and can_use_output_grid and not use_weight_reuse:
             blocks_per_wave = num_sms * num_ctas_per_sm
             num_output_tiles = num_blocks_m * num_blocks_n
             num_waves = math.ceil(num_output_tiles / blocks_per_wave)
@@ -328,6 +378,10 @@ class DeviceHeuristics:
         has_small_dense_tile = gemm_type == GemmType.DENSE and block_shape_m * block_shape_n < 16384
         has_long_wide_weights = layer_config.shape_k > 4096 and layer_config.b_dtype.num_bits >= 7
         keep_full_pipeline = has_small_dense_tile and has_long_wide_weights and max_num_stages == 3
+        has_sparse_dense_grid = is_dense_a16 and num_ctas_per_sm == 1 and block_shape_m <= 64
+        has_sparse_dense_grid &= num_blocks_m * num_blocks_n * 3 < num_sms * 2
+        has_long_pipeline = layer_config.shape_k // block_shape_k >= 4 * num_stages
+        keep_full_pipeline |= has_sparse_dense_grid and has_long_pipeline and max_num_stages == 3
         has_large_a16_tile = layer_config.a_dtype.num_bits == 16 and block_shape_m >= 64
         has_large_a16_tile &= not keep_full_pipeline
         if use_fp32_accum and use_stream_k and has_large_a16_tile:
@@ -348,7 +402,7 @@ class DeviceHeuristics:
                 max_blocks_m = min(shape_m, max_blocks_m)
             num_sms = min(num_sms, math.ceil(num_blocks_n * max_blocks_m / num_ctas_per_sm))
 
-        return {
+        config = {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (warp_shape_m, warp_shape_n, warp_shape_k),
             "use_stream_k": use_stream_k,
@@ -359,6 +413,14 @@ class DeviceHeuristics:
             "output_chunk_rows": output_chunk_rows,
             "use_pdl": cls.sm_version >= 90,
         }
+        is_fp8 = layer_config.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2)
+        is_fp8 &= layer_config.a_dtype == layer_config.b_dtype
+        use_grouped_raster = cls.sm_version == 89 and gemm_type == GemmType.GROUPED_CONTIGUOUS
+        if use_grouped_raster and is_fp8 and layer_config.is_block_weight_scale:
+            config["raster_group_m"] = get_moe_raster_group_m(
+                shape_m, layer_config.num_experts, block_shape_m, group_m=2, min_m_tiles=2
+            )
+        return config
 
     @staticmethod
     @functools.lru_cache(maxsize=128)

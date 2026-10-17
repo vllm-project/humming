@@ -3,6 +3,18 @@ import math
 from humming.device import current_device
 
 
+def get_moe_raster_group_m(
+    shape_m: int,
+    num_experts: int,
+    block_m: int,
+    *,
+    group_m: int = 8,
+    min_m_tiles: int = 1,
+) -> int:
+    # Group M tiles only when experts have enough rows to reuse their weights.
+    return group_m if shape_m >= num_experts * block_m * min_m_tiles else 1
+
+
 def raster_group_m(
     shape_m: int,
     shape_n: int,

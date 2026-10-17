@@ -130,7 +130,8 @@ def _is_legal_geometry(
     if warp_shape[0] % 8:
         return False
     if mma_type == MmaType.MMA and warp_shape[0] % 16:
-        return False
+        if layer_config.a_dtype.num_bits != 16 or current_device.is_ppu:
+            return False
     if mma_type == MmaType.MXMMA and warp_shape[0] % 16:
         return False
     use_wgmma = mma_type == MmaType.WGMMA
