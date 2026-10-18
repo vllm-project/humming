@@ -385,6 +385,12 @@ Controls grouped traversal of M tiles for dense and grouped-contiguous GEMM.
 
 Defaults to `1`. Try `2`, `4`, or `8` to improve cache locality when adjacent M tiles can reuse weight data. Larger groups also change A reuse, and add expert tile lookup overhead in the grouped-contiguous path.
 
+#### `evict_weights_first`
+
+Loads weights with the L2 `evict_first` cache policy, through both TMA and `cp.async`. Defaults to `False`.
+
+Try `True` when weight is read once, e.g. `grid_m=1`, so streamed weights do not evict reused activations from L2. Keep `False` when several M tiles reuse the same weights.
+
 #### `multi_cast_size_a`, `multi_cast_size_b`
 
 The number of CTAs sharing a TMA multicast. Defaults to `1`, which disables multicast.
