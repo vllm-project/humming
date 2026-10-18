@@ -10,8 +10,16 @@
 #endif
 #define CP_ASYNC_PREFIX(MODE, CACHE_HINT) "cp.async." #MODE ".shared.global" CACHE_HINT CP_ASYNC_L2_HINT
 
+// Before CUDA 13.4, ptxas can misencode cp.async cache-policy registers on SM90+.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ < 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ < 4))
+#define CP_ASYNC_EVICT_FIRST_SUPPORTED 0
+#else
+#define CP_ASYNC_EVICT_FIRST_SUPPORTED 1
+#endif
+
 #define CP_ASYNC_ASM(MODE, EVICT_FIRST)                                                        \
-  if constexpr (EVICT_FIRST) {                                                                 \
+  if constexpr (EVICT_FIRST && CP_ASYNC_EVICT_FIRST_SUPPORTED) {                                 \
     asm volatile(CP_ASYNC_PREFIX(MODE, ".L2::cache_hint") " [%0], [%1], %2, %3;\n"             \
                  :                                                                             \
                  : "r"(smem), "l"(gmem_ptr), "n"(BYTES), "l"(create_tma_cache_policy())        \
@@ -30,7 +38,7 @@
                : "memory");
 
 #define CP_ASYNC_PRED_ASM(MODE, EVICT_FIRST)                                                               \
-  if constexpr (EVICT_FIRST) {                                                                             \
+  if constexpr (EVICT_FIRST && CP_ASYNC_EVICT_FIRST_SUPPORTED) {                                             \
     asm volatile("{\n"                                                                                     \
                  "  .reg .pred p;\n"                                                                       \
                  "  setp.ne.s32 p, %0, 0;\n"                                                               \
