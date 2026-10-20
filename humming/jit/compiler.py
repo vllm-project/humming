@@ -1,4 +1,5 @@
 import ctypes
+import functools
 import glob
 import json
 import os
@@ -170,6 +171,7 @@ class NVRTCCompiler(Compiler):
         return names, sources
 
     @classmethod
+    @functools.lru_cache(maxsize=1)
     def _get_version(cls):
         # The subprocess uses the toolkit library, which can differ from the
         # library selected by cuda-python's bindings.
