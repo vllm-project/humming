@@ -170,7 +170,7 @@ class NVRTCCompiler(Compiler):
         return names, sources
 
     @classmethod
-    def signature(cls):
+    def _get_version(cls):
         # The subprocess uses the toolkit library, which can differ from the
         # library selected by cuda-python's bindings.
         library = ctypes.CDLL(get_nvrtc_library_path())
@@ -180,7 +180,12 @@ class NVRTCCompiler(Compiler):
         version.restype = ctypes.c_int
         if version(ctypes.byref(major), ctypes.byref(minor)) != 0:
             raise RuntimeError("Could not query the NVRTC compiler version")
-        return f"nvrtc+{major.value}.{minor.value}"
+        return major.value, minor.value
+
+    @classmethod
+    def signature(cls):
+        major, minor = cls._get_version()
+        return f"nvrtc+{major}.{minor}"
 
     @classmethod
     def get_flags(cls, sm_version, disable_fast_math=False):
@@ -196,6 +201,9 @@ class NVRTCCompiler(Compiler):
             "--diag-suppress=39,161,174,177,940,1444",
             "-default-device",
         ]
+        if cls._get_version() >= (12, 9):
+            # Humming caches CUBINs; avoid driver initialization for NVRTC's cache in each subprocess.
+            flags.append("-no-cache")
         for d in cls._get_include_dirs():
             flags.append(f"-I{d}")
         if disable_fast_math:
