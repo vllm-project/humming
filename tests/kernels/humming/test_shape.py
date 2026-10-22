@@ -69,6 +69,21 @@ PROBLEM_SHAPE_CASES = (
         weight_scale_group_size=64,
     ),
     _case(
+        "float16-uint4-group128-bf16-output",
+        shape_n=4096,
+        shape_k=512,
+        a_dtype=dtypes.float16,
+        weight_scale_group_size=128,
+    ),
+    _case(
+        "float16-uint4-group128-e4m3-bf16-output",
+        shape_n=4096,
+        shape_k=512,
+        a_dtype=dtypes.float16,
+        bs_dtype=dtypes.float8e4m3,
+        weight_scale_group_size=128,
+    ),
+    _case(
         "minimum",
         shape_n=MIN_SHAPE_N,
         shape_k=MIN_SHAPE_K,
@@ -249,6 +264,7 @@ def test_shape_case_coverage():
     large_n = problem_configs["large-n-small-k"]
     large_k = problem_configs["small-n-large-k"]
     large_rectangular = problem_configs["large-rectangular"]
+    cross_output_dtype = problem_configs["float16-uint4-group128-bf16-output"]
 
     assert (minimum.shape_n, minimum.shape_k) == (MIN_SHAPE_N, MIN_SHAPE_K)
     assert large_n.shape_n >= 8192 and large_n.shape_k == MIN_SHAPE_K
@@ -258,6 +274,9 @@ def test_shape_case_coverage():
     assert (minimum.a_dtype.num_bits, minimum.b_dtype.num_bits) == (16, 4)
     assert (tile_boundary.a_dtype.num_bits, tile_boundary.b_dtype.num_bits) == (8, 7)
     assert (large_k.a_dtype.num_bits, large_k.b_dtype.num_bits) == (4, 3)
+    assert cross_output_dtype.a_dtype == dtypes.float16
+    assert cross_output_dtype.c_dtype == dtypes.bfloat16
+    assert cross_output_dtype.weight_scale_group_size == 128
 
     pad_configs = {case.name: case.layer_config for case in PAD_SHAPE_CASES}
     pad_modes = {(bool(config.pad_shape_n), bool(config.pad_shape_k)) for config in pad_configs.values()}

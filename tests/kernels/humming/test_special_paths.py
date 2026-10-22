@@ -354,3 +354,39 @@ def test_output_chunk_rows(
     shape_ms = (17, 13 * block_m + 1)
     results = KernelTestRunner(case).run(shape_ms)
     assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.parametrize(("block_k", "warp_k"), [(64, 32), (128, 64)])
+def test_fp16_group_scale_bf16_output_across_k_tiles(block_k, warp_k, monkeypatch):
+    skip_if_unsupported(a_dtype=dtypes.float16, mma_type="mma")
+    layer = LayerConfig(
+        shape_n=4096,
+        shape_k=512,
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128,
+    )
+    config = {
+        "mma_type": "mma",
+        "block_shape": (16, 128, block_k),
+        "warp_shape": (16, 32, warp_k),
+        "num_stages": 4,
+        "num_ctas_per_sm": 1,
+        "use_stream_k": False,
+        "use_tma": False,
+        "use_warp_spec": False,
+    }
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: config)
+    case = KernelTestCase(
+        name="fp16-group-scale-bf16-output",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shape_ms = (1, 17)
+
+    results = KernelTestRunner(case).run(shape_ms)
+
+    assert_kernel_test_shape_coverage(results, shape_ms)
