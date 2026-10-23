@@ -476,9 +476,9 @@ class HummingLayer(torch.nn.Module):
 
         layer_config = config.copy()
         for regex in config.get("dynamic", {}):
-            if regex[:1] != "-":
-                assert not re.match(regex[2:], prefix), f"layer {prefix} is unquantized"
-            elif re.match(regex[2:], prefix):
+            if regex.startswith("-:"):
+                assert not re.match(regex.removeprefix("-:"), prefix), f"layer {prefix} is unquantized"
+            elif re.match(regex.removeprefix("+:"), prefix):
                 layer_config.update(config["dynamic"][regex])
                 break
 
