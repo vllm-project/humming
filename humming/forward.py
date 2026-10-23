@@ -83,8 +83,9 @@ def may_process_input(
     should_transform = hadamard_block_size is not None and hadamard_block_size > 1
     has_activation = activation_type != "none"
     should_scatter = layout == "scatter"
+    should_zero_invalid = layout == "grouped_mask" and zero_invalid
     should_process = should_quantize or should_transform or has_activation or should_scatter
-    should_process = should_process or num_valid_tokens is not None
+    should_process = should_process or num_valid_tokens is not None or should_zero_invalid
     if not should_process:
         if outputs is not None and outputs is not inputs:
             outputs.copy_(inputs)
