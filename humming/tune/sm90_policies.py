@@ -177,6 +177,7 @@ def select_sm90_small_m_schedule(
     reason = None
     proposal = None
 
+    use_stream_k = True
     if problem.gemm_type == GemmType.DENSE:
         has_two_cta_work = num_weight_tiles >= num_sms * 2 * num_stages * 2
         has_small_accumulator = mma_m * warp_n <= 1024
@@ -185,8 +186,26 @@ def select_sm90_small_m_schedule(
         has_small_m = problem.shape_m <= 16
         has_decode_work = problem.shape_m <= 32 and weight_bits >= 4 and has_two_cta_work
         has_decode_work &= mma_m == block_m
+        # Stream-K splits K so that partial output grids fill the device. When the output
+        # tiles already fill the resident CTAs (one wave with few idle SMs, or full waves),
+        # each CTA streaming whole tiles through a deeper pipeline beats the split and its
+        # fixups (measured on H200: 0.84-0.92x at M <= 32 for the grid fills below).
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
+        fills_one_wave_alone = num_sms * 0.72 <= num_output_tiles <= num_sms
+        resident_ctas = num_sms * num_ctas
+        num_waves = math.ceil(num_output_tiles / resident_ctas)
+        has_full_waves = num_output_tiles >= 0.84 * resident_ctas * num_waves
+        keeps_whole_tiles = fills_one_wave_alone or (has_small_accumulator and has_full_waves)
+        if fills_one_wave_alone:
+            num_ctas = 1
+        # A 32-row accumulator leaves one CTA per SM, which hides less latency than the
+        # warp-specialized WGMMA schedule unless each CTA streams a whole tile.
+        has_decode_work &= has_small_accumulator or fills_one_wave_alone
         if has_pipeline_work and (has_small_m or has_decode_work):
             reason = "selected MMA with CTA residency fitted to K work and accumulator size"
+            if keeps_whole_tiles:
+                use_stream_k = False
+                num_stages = 6
     elif mma_m == 8:
         num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
         if is_h20 and num_output_tiles > num_sms:
@@ -222,7 +241,7 @@ def select_sm90_small_m_schedule(
             "warp_shape": (mma_m, warp_n, warp_k),
             "num_stages": num_stages,
             "num_ctas_per_sm": num_ctas,
-            "use_stream_k": True,
+            "use_stream_k": use_stream_k,
             "use_tma": False,
             "use_warp_spec": False,
         }
