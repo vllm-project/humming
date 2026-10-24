@@ -45,6 +45,18 @@ public:
   static constexpr uint32_t kPackedKFactor = Ctx::kPackedKFactor;
   static constexpr uint32_t kWarpIters = Ctx::kWarpIters;
   static constexpr uint32_t kNumKSlabs = WarpShape::K / kPartMmaShapeK;
+  // Adjacent K16 fragments share one aligned K32 scale group.
+  static constexpr bool kReuseBScaleAcrossFragments =
+      std::is_same<ElementA, BFloat16>::value &&
+      std::is_same<ElementB, BFloat16>::value &&
+      std::is_same<ElementQB, Float4E2M1>::value &&
+      std::is_same<typename Ctx::ElementBS, Float8E8M0>::value &&
+      !kHasZeroPoint && !kUsePackedKLayout && !kUseFusedE8m0Scale &&
+      !Ctx::kUseWarpSpec && !Ctx::kUseIntWeightScale &&
+      Ctx::kIsGroupWeightScale && Ctx::kWeightScaleGroupSize == 32 &&
+      WarpShape::N == 64 && WarpShape::K % 32 == 0 &&
+      BlockShape::K % 32 == 0 && MmaOpClass::kCTypeBits == 32;
+
   static constexpr uint32_t kRegsBKDim = kUsePackedKLayout ? kNumKSlabs : (kPartMmaShapeK / MmaShape::K);
 
   Ctx &ctx;
@@ -117,7 +129,8 @@ public:
           regs_b_ptr[1] = regs_b_ptr[2];
           regs_b_ptr[2] = tmp;
         }
-        arith.may_apply_bs_and_zp_on_b(regs_b_ptr, i, buffer_id);
+        arith.may_apply_bs_and_zp_on_b(
+            regs_b_ptr, i, buffer_id, kReuseBScaleAcrossFragments && iter_id % 2 != 0);
       };
     }
   };
