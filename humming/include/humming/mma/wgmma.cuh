@@ -224,6 +224,14 @@ public:
     }
   };
 
+  CUDA_INLINE void preserve_rs_input(uint32_t buffer_id) {
+    // Keep the asynchronous MMA's input registers live through its wait.
+    auto *values = reinterpret_cast<uint32_t *>(regs_b[buffer_id]);
+    PRAGMA_UNROLL
+    for (uint32_t r = 0; r < sizeof(regs_b[0]) / sizeof(uint32_t); ++r)
+      warpgroup_fence_operand(values[r]);
+  }
+
   CUDA_INLINE void run(uint32_t stage_id, uint32_t iter_id) {
     issue(stage_id, iter_id);
     wait_and_promote(stage_id, iter_id);

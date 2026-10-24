@@ -134,6 +134,33 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if (remaining_iters == 1) producer.load_channel();
       PRAGMA_UNROLL
       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+        constexpr bool kOverlapBDequant = Ctx::kUseWgmma && !Ctx::kUseStreamK &&
+            !Ctx::kUseWgmmaSs && !Ctx::kUseWgmmaSsKBatch && !Ctx::kUsePackedKLayout &&
+            !Ctx::kUseWarpSpec && !Ctx::kUseLdmatrixDequant &&
+            std::is_same<ElementA, BFloat16>::value &&
+            std::is_same<typename Ctx::ElementB, BFloat16>::value &&
+            std::is_same<ElementQB, Float4E2M1>::value &&
+            std::is_same<ElementBS, Float8E8M0>::value &&
+            !Ctx::kUseFusedE8m0Scale && !Ctx::kHasZeroPoint && !Ctx::kUseIntWeightScale &&
+            Ctx::kIsGroupWeightScale && Ctx::kWeightScaleGroupSize == 32 &&
+            MmaOpClass::kCTypeBits == 32 && WarpShape::M == 8 && WarpShape::N == 64 &&
+            Ctx::kWarpIters == 4 && BlockShape::K == WarpShape::K;
+        if constexpr (kOverlapBDequant) {
+          if (warp_iter_id % 2 == 0) {
+            // Prepare the other RS buffer while this fragment is in flight.
+            mma.issue(stage_id, warp_iter_id);
+            s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+            mma.transform_b(1, warp_iter_id + 1);
+            mma.wait_and_promote(stage_id, warp_iter_id);
+            mma.preserve_rs_input(warp_iter_id % 2);
+            if (warp_iter_id == Ctx::kWarpIters - 2) {
+              __syncthreads();
+              if constexpr (kNumStages > 2)
+                producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+            }
+            continue;
+          }
+        }
         if constexpr (Ctx::kWgmmaSplitIssueWait) {
           mma.issue(stage_id, warp_iter_id);
           if constexpr (Ctx::kWarpIters == 1) {
