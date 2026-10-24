@@ -110,7 +110,11 @@ CUDA_INLINE uint32_t fp_to_fp(uint32_t val) {
     return lop3_and_or(val, signbit_mask, magnitude);
   } else {
     constexpr uint32_t diff_exp_bits = TargetType::kExponentBits - SourceType::kExponentBits + TargetType::kIsSigned - SourceType::kIsSigned;
-    return lop3_and_or(val, signbit_mask, (val & mask) >> diff_exp_bits);
+    if constexpr (!SourceType::kIsSigned) {
+      return (val & mask) >> diff_exp_bits;
+    } else {
+      return lop3_and_or(val, signbit_mask, (val & mask) >> diff_exp_bits);
+    }
   }
 };
 
