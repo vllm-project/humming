@@ -57,6 +57,11 @@ public:
       WarpShape::N == 64 && WarpShape::K % 32 == 0 &&
       BlockShape::K % 32 == 0 && MmaOpClass::kCTypeBits == 32;
 
+  static constexpr bool kOverlapBDequant = kReuseBScaleAcrossFragments &&
+      !Ctx::kUseStreamK && !Ctx::kUseWgmmaSs && !Ctx::kUseWgmmaSsKBatch &&
+      !Ctx::kUseLdmatrixDequant && WarpShape::M == 8 &&
+      kWarpIters == 4 && BlockShape::K == WarpShape::K;
+
   static constexpr uint32_t kRegsBKDim = kUsePackedKLayout ? kNumKSlabs : (kPartMmaShapeK / MmaShape::K);
 
   Ctx &ctx;
