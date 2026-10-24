@@ -105,11 +105,17 @@ def _token_tuning_candidates(problem, device, transform_size: int):
         thread_alignment = max(32, transform_lanes)
         threads_per_task = round_up(row_lanes, thread_alignment)
 
+        if dynamic_scale_mode == "group_token":
+            if values_per_thread > 32:
+                continue
+            if not is_pow_of_two(threads_per_task):
+                # Only pad warp-local group reductions, which do not use reduction scratch.
+                if problem.quant_group_size > 32 * values_per_thread:
+                    continue
+                threads_per_task = 1 << (threads_per_task - 1).bit_length()
+
         if not 32 <= threads_per_task <= 1024:
             continue
-        if dynamic_scale_mode == "group_token":
-            if values_per_thread > 32 or not is_pow_of_two(threads_per_task):
-                continue
 
         max_tokens_per_block = min(problem.num_work_rows, 1024 // threads_per_task, 16)
         for tokens_per_block in powers_of_two_up_to(max_tokens_per_block):
