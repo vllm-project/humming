@@ -113,7 +113,7 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
   }
   ASSERT_CHECK(tensor.has_value(), "as must not be none for 4b or 8b activation");
 
-  uint32_t problem_shape_k = kernel_data.problem_shape_k;
+  uint32_t problem_shape_k = kernel_data.problem_shape_k - kernel_data.pad_shape_k;
   uint32_t group_size = kernel_data.input_scale_group_size;
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
   constexpr int64_t input_scale_m_alignment = 4;
