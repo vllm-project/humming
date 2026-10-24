@@ -153,8 +153,8 @@ public:
   };
 
   CUDA_INLINE
-  void may_apply_bs_and_zp_on_b(uint32_t *regs_b, uint32_t j, uint32_t buffer_id) {
-    may_process_bs_before_apply_on_b(j, buffer_id);
+  void may_apply_bs_and_zp_on_b(uint32_t *regs_b, uint32_t j, uint32_t buffer_id, bool reuse_bs = false) {
+    if (!reuse_bs) may_process_bs_before_apply_on_b(j, buffer_id);
 
     if constexpr (ElementA::kBits == 16 && kExpOffset.x) {
       uint32_t exp_val = kExpOffset.x + ((1 << (ElementA::kExponentBits - 1)) - 1);

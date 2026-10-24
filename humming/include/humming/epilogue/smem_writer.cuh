@@ -116,6 +116,44 @@ public:
     if (ctx.k_warp_id() != 0) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && !USE_PPU
+    // The unshuffled FP32 pairs have the stmatrix.trans source layout.
+    constexpr bool kMatrixStore = kUseWgmma && !Ctx::kUseStreamK && !Ctx::kUseWgmmaSs &&
+        !Ctx::kUseWgmmaSsNLayout && !Ctx::kUsePackedKLayout &&
+        std::is_same<ElementA, BFloat16>::value &&
+        std::is_same<ElementC, BFloat16>::value &&
+        std::is_same<ValTypeC, float>::value &&
+        BlockShape::M == 8 && WarpShape::M == 8 && WarpShape::N == 64 &&
+        K_WARPS == 1 && kOutputRows == 8 && !Ctx::kOutputChunkRows &&
+        !Ctx::kHasBias && !Ctx::kHasInputScale && !Ctx::kHasInputScale2 &&
+        !Ctx::kHasChannelWeightScale && !Ctx::kHasTensorWeightScale;
+    if constexpr (kMatrixStore) {
+      static_assert(sizeof(regs) == 8 * sizeof(float2));
+      const auto *pairs = reinterpret_cast<const float2 *>(&regs);
+      const uint32_t lane = ctx.lane_id();
+      const uint32_t row = lane % 8;
+      const uint32_t phase = offsetof(SharedStorage, reduce) / 128 % 8;
+      const uint32_t base = cast_smem_ptr_to_uint(ctx.smem.reduce);
+      PRAGMA_UNROLL
+      for (uint32_t group = 0; group < 2; ++group) {
+        uint32_t values[4];
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < 4; ++i) {
+          float2 value = pairs[group * 4 + i];
+          arith.may_apply_f32_on_smem_write(value, 0, group * 4 + i);
+          auto packed = this->float22num2(value);
+          values[i] = *reinterpret_cast<uint32_t *>(&packed);
+          arith.may_apply_on_smem_write(values[i], 0, group * 4 + i);
+        }
+        const uint32_t fragment = group * 4 + lane / 8;
+        const uint32_t offset = ctx.n_warp_id() * 8 * 64 + row * 64 +
+            (fragment ^ ((row + phase) % 8)) * 8;
+        st_shared<4, true>(base + offset * 2, values);
+      }
+      return;
+    }
+#endif
     scalar_t2 *smem_half2_ptr = reinterpret_cast<scalar_t2 *>(ctx.smem.reduce);
     uint32_t smem = offsetof(SharedStorage, reduce) / 128 % 8;
     using PackTypeC = std::conditional_t<

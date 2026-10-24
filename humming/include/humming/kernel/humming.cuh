@@ -134,6 +134,26 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if (remaining_iters == 1) producer.load_channel();
       PRAGMA_UNROLL
       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+        constexpr bool kOverlapBDequant = [] {
+          if constexpr (Ctx::kUseWgmma) return MMA::kOverlapBDequant;
+          else return false;
+        }();
+        if constexpr (kOverlapBDequant) {
+          if (warp_iter_id % 2 == 0) {
+            // Prepare the other RS buffer while this fragment is in flight.
+            mma.issue(stage_id, warp_iter_id);
+            s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+            mma.transform_b(1, warp_iter_id + 1);
+            mma.wait_and_promote(stage_id, warp_iter_id);
+            mma.preserve_rs_input(warp_iter_id % 2);
+            if (warp_iter_id == Ctx::kWarpIters - 2) {
+              __syncthreads();
+              if constexpr (kNumStages > 2)
+                producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+            }
+            continue;
+          }
+        }
         if constexpr (Ctx::kWgmmaSplitIssueWait) {
           mma.issue(stage_id, warp_iter_id);
           if constexpr (Ctx::kWarpIters == 1) {
