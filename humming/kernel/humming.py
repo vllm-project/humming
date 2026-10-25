@@ -489,6 +489,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
                 assert self.a_dtype in allowed_f16_dtypes
 
     def check_config(self):
+        if self.expert_end:
+            if self.expert_end > self.num_experts:
+                raise ValueError("expert_end must not exceed num_experts")
+            if self.use_stream_k:
+                raise ValueError("expert ranges require use_stream_k=False")
         if self.wgmma_use_late_as:
             assert self.mma_type == MmaType.WGMMA, "wgmma_use_late_as requires WGMMA"
             assert self.is_group_input_scale, "wgmma_use_late_as requires per-group input scales"

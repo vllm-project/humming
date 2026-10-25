@@ -494,6 +494,9 @@ class ComputeConfig(BaseHummingConfig):
     use_batch_invariant: bool = False
     use_m_major_input_scale: bool = False
     gemm_type: GemmType | None = None
+    # Optional [start, end) for grouped-contiguous GEMM; (0, 0) selects all experts.
+    expert_start: int = 0
+    expert_end: int = 0
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
         "gemm_type_id",
@@ -506,6 +509,13 @@ class ComputeConfig(BaseHummingConfig):
     def __post_init__(self):
         if isinstance(self.gemm_type, str):
             self.gemm_type = GemmType(self.gemm_type)
+        if type(self.expert_start) is not int or type(self.expert_end) is not int:
+            raise ValueError("expert range bounds must be integers")
+        if self.expert_start != 0 or self.expert_end != 0:
+            if not 0 <= self.expert_start < self.expert_end:
+                raise ValueError("expert range requires 0 <= expert_start < expert_end")
+            if self.gemm_type != GemmType.GROUPED_CONTIGUOUS:
+                raise ValueError("expert ranges require grouped-contiguous GEMM")
         self.is_indexed_gemm = self.gemm_type == GemmType.INDEXED
         self.is_grouped_contiguous_gemm = self.gemm_type == GemmType.GROUPED_CONTIGUOUS
         self.is_grouped_masked_gemm = self.gemm_type == GemmType.GROUPED_MASKED

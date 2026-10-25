@@ -187,6 +187,10 @@ public:
               if constexpr (kIsGroupedContiguousGemm) {
                 const uint32_t next_offset = ctx.smem.expert_offset[expert + 1];
                 tokens = next_offset - ctx.smem.expert_offset[expert];
+                // Keep global row offsets; only remove work outside the selected band.
+                if constexpr (Ctx::kExpertEnd > 0) {
+                  if (expert < Ctx::kExpertStart || expert >= Ctx::kExpertEnd) tokens = 0;
+                }
                 ctx.smem.expert_tokens[expert] = tokens;
               } else {
                 tokens = ctx.smem.expert_tokens[expert];
@@ -217,6 +221,9 @@ public:
             if constexpr (kIsGroupedContiguousGemm) {
               uint32_t next_offset = ctx.smem.expert_offset[index + 1];
               expert_tokens = next_offset - ctx.smem.expert_offset[index];
+              if constexpr (Ctx::kExpertEnd > 0) {
+                if (index < Ctx::kExpertStart || index >= Ctx::kExpertEnd) expert_tokens = 0;
+              }
               ctx.smem.expert_tokens[index] = expert_tokens;
             } else {
               expert_tokens = ctx.smem.expert_tokens[index];

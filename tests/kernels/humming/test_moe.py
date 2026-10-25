@@ -346,3 +346,94 @@ def test_grouped_skips_unused_capacity(use_stream_k, offset_dtype, raster_group_
             reference = (expert_input @ runner.weight_ref[expert].float().T).bfloat16()
             torch.testing.assert_close(output[start : start + count], reference, atol=0.01, rtol=0.01)
         assert (output[~valid_rows] == -123).all()
+
+
+@pytest.mark.parametrize("raster_group_m", [1, 8])
+@pytest.mark.parametrize("offset_dtype", [torch.int32, torch.int64])
+def test_grouped_expert_ranges(raster_group_m, offset_dtype):
+    """Disjoint expert bands compose on two streams, including graph replay."""
+    skip_if_unsupported(a_dtype=dtypes.bfloat16)
+    layer = LayerConfig(
+        shape_n=512,
+        shape_k=256,
+        num_experts=4,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.float4e2m1,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.float8e8m0,
+        weight_scale_group_size=32,
+    )
+    compute = ComputeConfig(gemm_type=GemmType.GROUPED_CONTIGUOUS)
+    runner = KernelTestRunner(
+        KernelTestCase(
+            name="grouped-expert-ranges",
+            layer_config=layer,
+            compute_config=compute,
+            seed=2026,
+            weight_std_scale=256**-0.5,
+        )
+    )
+    tuning = get_heuristics_config(layer, shape_m=64, gemm_type=compute.gemm_type)
+    tuning.update(use_stream_k=False, raster_group_m=raster_group_m)
+
+    def prepare(start=0, end=0, **overrides):
+        config = ComputeConfig(gemm_type=compute.gemm_type, expert_start=start, expert_end=end)
+        return HummingKernel.prepare_kernels(
+            layer.to_str(), config.to_str(), tuning | overrides, device=torch.device("cuda", 0)
+        )
+
+    with pytest.raises(ValueError, match="num_experts"):
+        prepare(0, 5)
+    with pytest.raises(ValueError, match="use_stream_k=False"):
+        prepare(0, 2, use_stream_k=True)
+    full, first, second = prepare(), prepare(0, 2), prepare(2, 4)
+    inputs = torch.empty(64, 256, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
+    reference = torch.empty_like(output)
+    offsets = torch.zeros(5, device="cuda", dtype=offset_dtype)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    def launch(kernel, target):
+        ops.launch_kernel(
+            configs=kernel,
+            inputs=inputs,
+            outputs=target,
+            expert_layout=offsets,
+            valid_shape_m=64,
+            **runner.kernel_tensors,
+        )
+
+    def pipeline():
+        parent = torch.cuda.current_stream()
+        for stream, kernel in zip(streams, (first, second), strict=True):
+            stream.wait_stream(parent)
+            with torch.cuda.stream(stream):
+                launch(kernel, output)
+        for stream in streams:
+            parent.wait_stream(stream)
+
+    pipeline()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pipeline()
+    for counts in ([0, 0, 0, 0], [0, 0, 0, 7], [13, 0, 5, 0], [3, 17, 0, 21], [16, 16, 16, 16]):
+        positions = [0, *torch.tensor(counts).cumsum(0).tolist()]
+        offsets.copy_(torch.tensor(positions, dtype=offset_dtype))
+        inputs.normal_()
+        inputs[positions[-1] :] = float("nan")
+        reference.fill_(-123)
+        launch(full, reference)
+        output.fill_(-123)
+        launch(second, output)
+        torch.testing.assert_close(output[positions[2] :], reference[positions[2] :], atol=0, rtol=0)
+        assert (output[: positions[2]] == -123).all()
+        output.fill_(-123)
+        graph.replay()
+        torch.testing.assert_close(output, reference, atol=0, rtol=0)
+        for expert, count in enumerate(counts):
+            start = positions[expert]
+            expected = (
+                inputs[start : start + count].float() @ runner.weight_ref[expert].float().T
+            ).bfloat16()
+            torch.testing.assert_close(output[start : start + count], expected, atol=0.01, rtol=0.01)

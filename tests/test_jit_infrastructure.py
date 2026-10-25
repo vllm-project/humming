@@ -33,6 +33,36 @@ class _FakeCompiler(Compiler):
         return 0, "stdout", "stderr"
 
 
+@pytest.mark.parametrize("bounds", [(0, 0), (0, 2), (2, 4)])
+def test_expert_range_config_roundtrip(bounds):
+    import json
+
+    from humming.config import ComputeConfig, GemmType
+
+    config = ComputeConfig(
+        gemm_type=GemmType.GROUPED_CONTIGUOUS, expert_start=bounds[0], expert_end=bounds[1]
+    )
+    assert ComputeConfig(**json.loads(config.to_str())) == config
+    assert f"kExpertStart = {bounds[0]}u" in config.to_cpp_str()
+    assert f"kExpertEnd = {bounds[1]}u" in config.to_cpp_str()
+
+
+@pytest.mark.parametrize("bounds", [(-1, 2), (2, 0), (2, 2), (3, 2), (0, 2.5)])
+def test_expert_range_config_rejects_invalid_bounds(bounds):
+    from humming.config import ComputeConfig, GemmType
+
+    with pytest.raises(ValueError, match="expert range"):
+        ComputeConfig(gemm_type=GemmType.GROUPED_CONTIGUOUS, expert_start=bounds[0], expert_end=bounds[1])
+
+
+@pytest.mark.parametrize("gemm_type", ["dense", "indexed", "grouped_masked"])
+def test_expert_range_config_rejects_other_layouts(gemm_type):
+    from humming.config import ComputeConfig
+
+    with pytest.raises(ValueError, match="grouped-contiguous"):
+        ComputeConfig(gemm_type=gemm_type, expert_end=2)
+
+
 def test_compiler_publishes_cache_while_holding_lock(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     lock_dir = tmp_path / "locks"
