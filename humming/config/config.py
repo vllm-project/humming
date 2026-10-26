@@ -534,6 +534,7 @@ class TuningConfig(BaseHummingConfig):
 
     wgmma_use_late_as: bool = False
     wgmma_split_issue_wait: bool = False
+    use_full_stage_prefetch: bool = False
 
     num_stages: int = 2
     producer_stage_unroll: int | None = None

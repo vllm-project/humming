@@ -489,6 +489,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
                 assert self.a_dtype in allowed_f16_dtypes
 
     def check_config(self):
+        if self.use_full_stage_prefetch:
+            if self.num_stages < 2:
+                raise ValueError("use_full_stage_prefetch requires at least two stages")
+            if self.mma_type not in (MmaType.MMA, MmaType.WGMMA):
+                raise ValueError("use_full_stage_prefetch requires MMA or WGMMA")
         if self.wgmma_use_late_as:
             assert self.mma_type == MmaType.WGMMA, "wgmma_use_late_as requires WGMMA"
             assert self.is_group_input_scale, "wgmma_use_late_as requires per-group input scales"

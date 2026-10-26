@@ -95,6 +95,17 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kWarpIters = kUseWgmmaSsKBatch ? 1 : (kUsePackedKLayout ? (WarpShape::N / 16) : (WarpShape::K / kPartMmaShapeK));
 
+  static constexpr uint32_t kPrefetchStages = TuningConfig::kUseFullStagePrefetch ?
+      TuningConfig::kNumStages : MAX(TuningConfig::kNumStages - 1, 2);
+  static constexpr bool kFullStageWgmma = TuningConfig::kUseFullStagePrefetch && kUseWgmma;
+  static_assert(!TuningConfig::kUseFullStagePrefetch ||
+                (((kUseWmma && kWarpIters > 1) || kUseWgmma) && TuningConfig::kNumStages >= 2),
+                "Full-stage prefetch requires multi-fragment register MMA or WGMMA, and at least two stages");
+  // cp.async tracks at most eight commit groups; deeper rings require per-slot mbarriers.
+  static constexpr uint32_t kMaxCpAsyncGroups = 8;
+  static_assert(!kUseCpAsync || kUseMBarrier || kPrefetchStages <= kMaxCpAsyncGroups,
+                "cp.async rings deeper than eight groups require per-slot mbarriers");
+
   // With a single fragment, next-stage prefetch aliases the current scale buffer.
   // Group AS and non-fused BS must survive until accumulator promotion has finished.
   static constexpr bool kPreserveASForPromotion = LayerConfig::kIsGroupInputScale && !TuningConfig::kWgmmaUseLateAS;
