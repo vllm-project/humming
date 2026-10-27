@@ -54,10 +54,10 @@ public:
       !kHasZeroPoint && !kUsePackedKLayout && !kUseFusedE8m0Scale &&
       !Ctx::kUseWarpSpec && !Ctx::kUseIntWeightScale &&
       Ctx::kIsGroupWeightScale && Ctx::kWeightScaleGroupSize == 32 &&
-      WarpShape::N == 64 && WarpShape::K % 32 == 0 &&
+      (WarpShape::N == 32 || WarpShape::N == 64) && WarpShape::K % 32 == 0 &&
       BlockShape::K % 32 == 0 && MmaOpClass::kCTypeBits == 32;
 
-  static constexpr bool kOverlapBDequant = kReuseBScaleAcrossFragments &&
+  static constexpr bool kOverlapBDequant = kReuseBScaleAcrossFragments && WarpShape::N == 64 &&
       !Ctx::kUseStreamK && !Ctx::kUseWgmmaSs && !Ctx::kUseWgmmaSsKBatch &&
       !Ctx::kUseLdmatrixDequant && WarpShape::M == 8 &&
       kWarpIters == 4 && BlockShape::K == WarpShape::K;
