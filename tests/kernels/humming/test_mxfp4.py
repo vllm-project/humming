@@ -189,6 +189,60 @@ def test_mxfp4_case_coverage():
     }
 
 
+@pytest.mark.parametrize(
+    "shape_k,group_size,warp_n,gemm_type,has_bias,use_stream_k",
+    [
+        pytest.param(64, 32, 64, GemmType.DENSE, False, False, id="single-k-tile"),
+        pytest.param(192, 32, 64, GemmType.DENSE, False, False, id="pipeline-drain"),
+        pytest.param(1024, 32, 64, GemmType.GROUPED_CONTIGUOUS, False, False, id="expert-boundaries"),
+        pytest.param(1024, 64, 64, GemmType.DENSE, False, False, id="group64-fallback"),
+        pytest.param(1024, 32, 32, GemmType.DENSE, False, False, id="warp-n32-fallback"),
+        pytest.param(1024, 32, 64, GemmType.DENSE, True, False, id="bias-fallback"),
+        pytest.param(1024, 32, 64, GemmType.GROUPED_CONTIGUOUS, False, True, id="stream-k-fallback"),
+    ],
+)
+def test_mxfp4_bf16_wgmma_dataflow(
+    shape_k, group_size, warp_n, gemm_type, has_bias, use_stream_k, monkeypatch
+):
+    """Pin the small-M RS path and its fallbacks instead of relying on heuristics."""
+    skip_if_unsupported(a_dtype=dtypes.bfloat16, mma_type="wgmma")
+    is_dense = gemm_type == GemmType.DENSE
+    layer = LayerConfig(
+        shape_n=512,
+        shape_k=shape_k,
+        num_experts=0 if is_dense else 4,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.float4e2m1,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.float8e8m0,
+        weight_scale_group_size=group_size,
+        has_bias=has_bias,
+        sm_version=90,
+    )
+    tuning = dict(
+        mma_type="wgmma",
+        block_shape=(8, 512, 64),
+        warp_shape=(8, warp_n, 64),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=False,
+        use_stream_k=use_stream_k,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+    case = KernelTestCase(
+        name="mxfp4-bf16-wgmma-dataflow",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=gemm_type),
+        top_k=1 if is_dense else 2,
+        seed=2026,
+    )
+    shape_ms = (1, 7, 8, 9, 17)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
 @pytest.mark.parametrize("checkpoint_format", ["mxfp4-pack-quantized", "float-quantized"])
 @pytest.mark.parametrize("group_size", [32, 64, 128])
 def test_mxfp4_input_schema_compatibility(checkpoint_format, group_size, monkeypatch):
