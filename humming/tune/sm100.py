@@ -503,6 +503,8 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             block_m, block_n, _ = config["block_shape"]
             if block_m < 96 or block_n != 128 or not can_pair:
                 return config
+            # Each CTA needs eight-row alignment; size resources after aligning the pair.
+            block_m = round_up(block_m, 16)
             use_stream_k = False
             cta_group_size = 2
         else:
