@@ -199,7 +199,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
     PRAGMA_UNROLL_COUNT(4)
     for (uint32_t i = 0; i < CEIL_DIV(kQuantGroupSize, 32 * buffer_num_elem); i++) {
       uint32_t offset = (32 * i + threadIdx.x) * buffer_num_elem;
-      uint32_t gmem_offset = offset + blockIdx.x * kQuantGroupSize;
+      size_t gmem_offset = offset + static_cast<size_t>(blockIdx.x) * kQuantGroupSize;
 
       if (offset < kQuantGroupSize) {
         buffer = in_ptr[gmem_offset / buffer_num_elem];
@@ -284,7 +284,7 @@ __global__ void quant_weight(uint4 *in_ptr, uint4 *out_ptr, uint32_t *out_scale_
   PRAGMA_UNROLL_COUNT(4)
   for (uint32_t i = 0; i < CEIL_DIV(kQuantGroupSize, 32 * buffer_num_elem); i++) {
     uint32_t offset = (32 * i + threadIdx.x) * buffer_num_elem;
-    uint32_t gmem_offset = offset + blockIdx.x * kQuantGroupSize;
+    size_t gmem_offset = offset + static_cast<size_t>(blockIdx.x) * kQuantGroupSize;
 
     if (offset < kQuantGroupSize) {
       buffer = in_ptr[gmem_offset / buffer_num_elem];
