@@ -2,6 +2,10 @@
 
 #include <humming/utils/base.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/math.cuh>
+#else
+
 CUDA_INLINE uint32_t prmt(uint32_t a, uint32_t b, uint32_t s) {
   uint32_t res;
   asm volatile("prmt.b32 %0, %1, %2, %3;\n"
@@ -26,3 +30,5 @@ CUDA_INLINE uint32_t lop3_and_or(uint32_t a, uint32_t b, uint32_t c) {
 CUDA_INLINE uint32_t lop3_and_xor(uint32_t a, uint32_t b, uint32_t c) {
   return lop3<(0xF0 & 0xCC) ^ 0xAA>(a, b, c);
 };
+
+#endif  // HUMMING_HIP

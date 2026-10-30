@@ -23,6 +23,9 @@ from humming.testing.process_input import (
         ((12, 1), ("float8e3m4", "float4e0m3", "float4e2m1")),
     ],
 )
+@pytest.mark.skipif(
+    torch.version.hip is not None, reason="NVIDIA SM capability gating (ROCm gates on its dtype set)"
+)
 def test_quantization_support_matches_cubin_patcher(monkeypatch, quant_dtype, capability, supported_dtypes):
     """Patched conversion formats are available on SM100/103 and SM120/121, but not SM107."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

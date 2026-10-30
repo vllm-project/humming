@@ -212,7 +212,11 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
       else sync_part_threads<128, Base::kNumThreads, 4>();
     } else {
       uint32_t barrier_id = threadIdx.x < 256 ? 1 : (threadIdx.x < 384 ? 3 : 4);
+#ifdef HUMMING_HIP
+      HUMMING_NAMED_BARRIER_SYNC(barrier_id, 128);
+#else
       asm volatile("bar.sync %0, 128;" ::"r"(barrier_id) : "memory");
+#endif
     }
   }
 

@@ -3,7 +3,6 @@ import dataclasses
 import math
 from typing import ClassVar
 
-import cuda.bindings.driver as cbd
 import torch
 
 from humming.jit.runtime import KernelRuntime
@@ -43,14 +42,9 @@ class DequantKernel(KernelRuntime):
         func = self.load_cubin()
         device = inputs.device
         total_size = inputs.nelement()
-        config = cbd.CUlaunchConfig()
-        config.gridDimX = math.ceil(total_size / (32 * 32))
-        config.gridDimY = 1
-        config.gridDimZ = 1
-        config.blockDimX = 32
-        config.blockDimY = 1
-        config.blockDimZ = 1
-        config.hStream = torch.cuda.current_stream(device).cuda_stream
+        grid = (math.ceil(total_size / (32 * 32)), 1, 1)
+        block = (32, 1, 1)
+        stream = torch.cuda.current_stream(device).cuda_stream
 
         arg_values = (
             inputs.data_ptr(),
@@ -61,5 +55,5 @@ class DequantKernel(KernelRuntime):
             is_signed,
         )
 
-        cbd.cuLaunchKernelEx(config, func, (arg_values, self.arg_types), 0)
+        self.launch(func, grid, block, stream, arg_values)
         return outputs

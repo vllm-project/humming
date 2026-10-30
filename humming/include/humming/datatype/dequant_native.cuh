@@ -60,6 +60,24 @@ template <class SourceType, class TargetType>
 constexpr bool kUseNativeWeightDequant = kNativeDequantSupported<SourceType, TargetType>;
 
 
+#ifdef HUMMING_HIP
+// No PTX cvt on ROCm: kNativeDequantSupported is false there, so these are never instantiated.
+template <class SourceType, class TargetType>
+CUDA_INLINE uint32_t dequant_native_x2(uint16_t packed) {
+  static_assert(kNativeDequantSupported<SourceType, TargetType>);
+  return 0;
+}
+
+template <class TargetType>
+CUDA_INLINE void dequant_e2m1_native_x8(uint32_t packed, uint32_t *dst) {
+  static_assert(kNativeDequantSupported<Float4E2M1, TargetType>);
+}
+
+template <class SourceType, class TargetType>
+CUDA_INLINE void dequant_native_x8(uint32_t packed0, uint32_t packed1, uint32_t *dst) {
+  static_assert(kNativeDequantSupported<SourceType, TargetType>);
+}
+#else
 template <class SourceType, class TargetType>
 CUDA_INLINE uint32_t dequant_native_x2(uint16_t packed) {
   static_assert(kNativeDequantSupported<SourceType, TargetType>);
@@ -137,6 +155,9 @@ CUDA_INLINE void dequant_native_x8(uint32_t packed0, uint32_t packed1, uint32_t 
     dst[i] = dequant_native_x2<SourceType, TargetType>(packed[i]);
   }
 }
+
+
+#endif
 
 
 template <class SourceType, class TargetType>

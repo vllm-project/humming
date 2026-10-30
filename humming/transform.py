@@ -1,4 +1,5 @@
 import dataclasses
+import math
 
 import torch
 
@@ -31,6 +32,12 @@ def prepare_layer_config(
             torch_dtype = torch.bfloat16 if info.sm_major >= 8 else torch.float16
 
     f16_dtype = dtypes.DataType.from_torch_dtype(torch_dtype)
+    if info.is_rocm:
+        # The gfx950 MFMA GEMM works on N multiples of 64 and K multiples of 128.
+        from humming.kernel.humming_mfma import MFMA_K_ALIGNMENT, MFMA_N_ALIGNMENT
+
+        pad_n_to_multiple = math.lcm(pad_n_to_multiple, MFMA_N_ALIGNMENT)
+        pad_k_to_multiple = math.lcm(pad_k_to_multiple, MFMA_K_ALIGNMENT)
     pad_shape_n = round_up(shape_n, pad_n_to_multiple) - shape_n
     pad_shape_k = round_up(shape_k, pad_k_to_multiple) - shape_k
 
@@ -582,6 +589,9 @@ def transform_humming_tensors(
     else:
         tensors = tensors.copy()
 
+    if current_device.is_rocm:
+        return transform_mfma_tensors(config, tensors)
+
     weight = tensors["weight"]
     zero_point = tensors["zero_point"] if config.has_zero_point else None
     bias = tensors["bias"] if config.has_bias else None
@@ -688,4 +698,43 @@ def transform_humming_tensors(
     ]:
         if tensor is not None:
             outputs[name] = tensor
+    return outputs
+
+
+def transform_mfma_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """ROCm: padded Humming tensors -> the gfx950 MFMA GEMM layout (docs/rocm/mfma_layout.md).
+
+    weight [N, K * bits / 32] int32 (MFMA fragment order), weight_scale [groups, N] in the
+    activation dtype, zero_point [groups, N] uint8, bias [N] unchanged. MoE layers keep a
+    leading expert dim on every tensor ([E, N, ...], [E, groups, N], bias [E, N]).
+    """
+    from humming.kernel.humming_mfma import check_mfma_layer_config
+    from humming.rocm import layout
+
+    check_mfma_layer_config(config)
+    if config.a_dtype.num_bits < 16:
+        from humming.kernel.humming_mfma_f8 import transform_mfma_f8_tensors
+
+        return transform_mfma_f8_tensors(config, tensors)
+    num_bits = config.b_dtype.num_bits
+    a_dtype = dtypes.torch_dtype_map[config.a_dtype]
+
+    weight = tensors["weight"]
+    # Bound the int64 temporaries of the pure-torch repack to ~2^26 codes per chunk. MoE weights
+    # [E, N, K * bits / 32] are repacked as [E * N, ...]: chunks of 16 rows never straddle experts.
+    weight_shape = weight.shape
+    weight = weight.reshape(-1, weight_shape[-1])
+    rows_per_chunk = max(16, (1 << 26) // config.shape_k // 16 * 16)
+    weight = torch.cat(
+        [layout.repack_weight_for_mfma(chunk, num_bits) for chunk in weight.split(rows_per_chunk, dim=0)],
+        dim=0,
+    ).reshape(weight_shape)
+    outputs = {"weight": weight.contiguous()}
+    outputs["weight_scale"] = layout.transform_weight_scale(tensors["weight_scale"], a_dtype)
+    if config.has_zero_point:
+        # Packed along N: [N * bits / 32, groups] -> codes [N, groups].
+        zero_point = layout.unpack_weight(tensors["zero_point"].transpose(-1, -2).contiguous(), num_bits)
+        outputs["zero_point"] = layout.transform_zero_point(zero_point.transpose(-1, -2))
+    if config.has_bias:
+        outputs["bias"] = tensors["bias"].to(a_dtype).contiguous()
     return outputs

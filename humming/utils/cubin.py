@@ -30,6 +30,9 @@ _RC_MESSAGE = {
 
 _cached_lib = None
 
+_EM_AMDGPU = 0xE0
+_AMDGPU_KERNEL_DESCRIPTOR_SUFFIX = ".kd"
+
 
 def is_cubin_patch_enabled() -> bool:
     return os.environ.get("HUMMING_DISABLE_PATCH_CUBIN", "0") != "1"
@@ -42,6 +45,7 @@ def get_cubin_kernel_names(path: str | os.PathLike) -> list[str]:
 
     byte_order = "<" if data[5] == 1 else ">"
     machine = struct.unpack_from(f"{byte_order}H", data, 18)[0]
+    is_amdgpu = machine == _EM_AMDGPU
     # PPU and CUDA use different st_other bits for kernel entry points.
     kernel_flag = 0x20 if machine == 0x10E else 0x10
     section_offset = struct.unpack_from(f"{byte_order}Q", data, 40)[0]
@@ -65,11 +69,22 @@ def get_cubin_kernel_names(path: str | os.PathLike) -> list[str]:
         symbol_entry_size = section[9]
         for offset in range(symbol_offset, symbol_offset + symbol_size, symbol_entry_size):
             name_offset, info, other, *_ = struct.unpack_from(symbol_format, data, offset)
-            if info & 0xF != 2 or not other & kernel_flag or name_offset >= string_size:
+            if name_offset >= string_size:
+                continue
+            if is_amdgpu:
+                # Every AMDGPU kernel has a "<name>.kd" kernel-descriptor object.
+                if info & 0xF != 1:
+                    continue
+            elif info & 0xF != 2 or not other & kernel_flag:
                 continue
             name_start = string_offset + name_offset
             name_end = data.index(b"\0", name_start, string_offset + string_size)
-            names.append(data[name_start:name_end].decode())
+            name = data[name_start:name_end].decode()
+            if is_amdgpu:
+                if not name.endswith(_AMDGPU_KERNEL_DESCRIPTOR_SUFFIX):
+                    continue
+                name = name[: -len(_AMDGPU_KERNEL_DESCRIPTOR_SUFFIX)]
+            names.append(name)
     return names
 
 

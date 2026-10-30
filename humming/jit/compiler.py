@@ -11,6 +11,7 @@ from filelock import FileLock
 
 import humming.utils.jit as jit_utils
 from humming.device import current_device
+from humming.utils import rocm as rocm_utils
 from humming.utils.cuda import filter_cuda_paths
 from humming.utils.nvrtc import get_nvrtc_library_path, may_build_nvrtc_compile_binary
 
@@ -317,6 +318,66 @@ class NVCCCompiler(Compiler):
 
         cmd = [nvcc_path, source_path, "-o", target_path] + flags
         with open(cache_dirname / "cmdline.json", "w") as f:
+            json.dump(cmd, f, ensure_ascii=False)
+
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.returncode, result.stdout, result.stderr
+
+
+class HIPCCCompiler(Compiler):
+    """Compile a kernel source to a raw ROCm code object (``.hsaco``, an AMDGPU ELF) with hipcc.
+
+    ``sm_version`` carries the GCN target (``"gfx950"``) on ROCm. The output keeps the
+    ``kernel.cubin`` cache file name so callers stay platform agnostic.
+    """
+
+    @classmethod
+    def signature(cls):
+        return f"hipcc+rocm-{rocm_utils.get_rocm_version()}+{current_device.arch}"
+
+    @classmethod
+    def get_flags(cls, sm_version, disable_fast_math=False):
+        debug_flags = [
+            "-gline-tables-only" if flag == "-lineinfo" else flag for flag in cls.debug_kernel_flags()
+        ]
+        flags = [
+            "-x",
+            "hip",
+            # Raw device ELF; --genco alone wraps it in a clang offload bundle.
+            "--cuda-device-only",
+            "--no-gpu-bundle-output",
+            f"--offload-arch={sm_version}",
+            "-std=c++17",
+            # HUMMING_HIPCC_OPT_LEVEL=0 is a debugging aid to rule out optimizer miscompiles.
+            f"-O{os.environ.get('HUMMING_HIPCC_OPT_LEVEL', '3')}",
+            "-DHUMMING_HIP=1",
+            *debug_flags,
+            *[f"-I{d}" for d in cls.include_dirs()],
+            "-Wno-unused-result",
+            "-Wno-unused-value",
+            "-Wno-deprecated-declarations",
+            # Counterpart of nvcc --use_fast_math: FTZ for fp32, contracted FMAs and
+            # approximate transcendental functions.
+            "-fgpu-flush-denormals-to-zero",
+            "-ffp-contract=fast",
+            "-fapprox-func",
+        ]
+        if disable_fast_math:
+            flags.remove("-fgpu-flush-denormals-to-zero")
+            flags.remove("-fapprox-func")
+            flags.remove("-ffp-contract=fast")
+        return flags
+
+    @classmethod
+    def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr, flags):
+        if kernel_expr:
+            # Device-only compilation still emits kernels whose address is taken in host code.
+            with open(source_path, "a") as f:
+                f.write(f"\nauto ptr = reinterpret_cast<void*>(&{kernel_expr});\n")
+
+        target_path = (Path(cache_dirname) / "kernel_tmp.cubin").as_posix()
+        cmd = [rocm_utils.get_hipcc_path(), *flags, source_path, "-o", target_path]
+        with open(Path(cache_dirname) / "cmdline.json", "w") as f:
             json.dump(cmd, f, ensure_ascii=False)
 
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

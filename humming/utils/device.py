@@ -9,6 +9,7 @@ from types import ModuleType
 from filelock import FileLock
 
 import humming.utils.jit as jit_utils
+from humming.utils import rocm as rocm_utils
 from humming.utils.cuda import find_all_cuda_paths, get_cuda_library_path
 
 _extension: ModuleType | None = None
@@ -29,6 +30,42 @@ def _get_cuda_include_paths() -> list[str]:
     return environment["include_paths"]
 
 
+def _run_device_info_build(command: list[str], temporary_path: Path, output_path: Path) -> str:
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to build the device info extension:\nCMD: {' '.join(command)}\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+    os.replace(temporary_path, output_path)
+    return output_path.as_posix()
+
+
+def _build_rocm_device_info_extension(source_path: Path, output_path: Path, compiler: str) -> str:
+    temporary_path = output_path.with_suffix(".tmp")
+    rocm_library_path = rocm_utils.get_rocm_library_path()
+    command = [
+        compiler,
+        "-O3",
+        "-std=c++17",
+        "-fPIC",
+        "-shared",
+        "-DHUMMING_HIP=1",
+        "-D__HIP_PLATFORM_AMD__",
+        str(source_path),
+        f"-I{sysconfig.get_paths()['include']}",
+        f"-I{rocm_utils.get_rocm_include_path()}",
+        f"-L{rocm_library_path}",
+        f"-Wl,-rpath,{rocm_library_path}",
+        "-Wl,--no-as-needed",
+        "-lamdhip64",
+        "-Wl,--as-needed",
+        "-o",
+        str(temporary_path),
+    ]
+    return _run_device_info_build(command, temporary_path, output_path)
+
+
 def build_device_info_extension(
     output_path: str | Path,
     compiler: str | None = None,
@@ -38,6 +75,8 @@ def build_device_info_extension(
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     compiler = compiler or jit_utils.get_cpp_compiler()
+    if rocm_utils.is_rocm_build():
+        return _build_rocm_device_info_extension(source_path, output_path, compiler)
     if jit_utils.IS_WINDOWS:
         cuda_library = (
             Path(cuda_library_dir) / "cuda.lib"
@@ -70,14 +109,7 @@ def build_device_info_extension(
     if cuda_library_dir is not None:
         command.append(f"-L{cuda_library_dir}")
     command.extend(["-Wl,--no-as-needed", "-lcuda", "-Wl,--as-needed", "-o", str(temporary_path)])
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to build the device info extension:\nCMD: {' '.join(command)}\n"
-            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        )
-    os.replace(temporary_path, output_path)
-    return output_path.as_posix()
+    return _run_device_info_build(command, temporary_path, output_path)
 
 
 def _load_device_info_extension(path: str | Path) -> ModuleType:
@@ -104,12 +136,18 @@ def _get_device_info_extension() -> ModuleType:
 
     source_path = Path(__file__).parents[1] / "csrc" / "device_info.cpp"
     extension_name = jit_utils.get_native_artifact_name("device_info")
-    precompiled_path = jit_utils.get_precompiled_artifact_path(source_path, extension_name)
+    is_rocm = rocm_utils.is_rocm_build()
+    # Precompiled wheels only ship the CUDA driver build.
+    precompiled_path = (
+        None if is_rocm else jit_utils.get_precompiled_artifact_path(source_path, extension_name)
+    )
     if precompiled_path is not None:
         _extension = _load_device_info_extension(precompiled_path)
         return _extension
 
     signature = jit_utils.get_native_platform_signature()
+    if is_rocm:
+        signature += f"rocm-{rocm_utils.get_rocm_version()}"
     source_hash = jit_utils.hash_path_content(str(source_path), releative=True)
     build_hash = jit_utils.hash_to_hex(source_hash + signature)
     build_dir = Path(jit_utils.get_humming_cache_dir()) / "device_info" / build_hash

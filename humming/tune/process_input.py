@@ -30,6 +30,15 @@ _MINIMUM_SM_BY_DTYPE = {
     dtypes.float8e3m4: 100,
 }
 
+# ROCm (gfx950) process_input outputs. E3M4/E0M3 only exist through the NVIDIA cubin patch.
+_ROCM_SUPPORTED_DTYPES = {
+    dtypes.int4,
+    dtypes.int8,
+    dtypes.float8e4m3,
+    dtypes.float8e5m2,
+    dtypes.float4e2m1,
+}
+
 
 def _is_pure_hadamard(problem) -> bool:
     return (
@@ -525,9 +534,12 @@ def _tuning_config_for_device(config: ProcessInputProblemConfig, shape_m: int, d
 
     if config.quant_dtype is not None and minimum_sm is None:
         raise ValueError(f"unsupported quant_dtype: {config.quant_dtype}")
-    if minimum_sm is not None and device.sm_version < minimum_sm:
+    if device.is_rocm:
+        if config.quant_dtype is not None and config.quant_dtype not in _ROCM_SUPPORTED_DTYPES:
+            raise RuntimeError(f"{config.quant_dtype} output is not supported on {device.arch}")
+    elif minimum_sm is not None and device.sm_version < minimum_sm:
         raise RuntimeError(f"{config.quant_dtype} output requires SM{minimum_sm} or newer")
-    is_undocumented_fp_supported = supports_undocumented_fp_dtypes(device.sm_version)
+    is_undocumented_fp_supported = not device.is_rocm and supports_undocumented_fp_dtypes(device.sm_version)
     if config.quant_dtype in UNDOCUMENTED_FP_DTYPES and not is_undocumented_fp_supported:
         raise RuntimeError(f"{config.quant_dtype} output is not supported on SM{device.sm_version}")
 

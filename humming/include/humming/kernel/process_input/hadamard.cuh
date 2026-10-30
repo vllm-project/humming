@@ -73,7 +73,7 @@ CUDA_INLINE void hadamard(float *values, float *shared) {
       for (uint32_t value = 0; value < kValuesPerLane; value++)
         shared[own + value] = values[value];
       if constexpr (kTileBarriers && kTiles > 1 && kTiles < 16) {
-        asm volatile("bar.sync %0, %1;" : : "r"(barrier), "r"(kLanes) : "memory");
+        HUMMING_NAMED_BARRIER_SYNC(barrier, kLanes);
       } else {
         __syncthreads();
       }
@@ -83,7 +83,7 @@ CUDA_INLINE void hadamard(float *values, float *shared) {
         values[value] = fmaf(values[value], sign, partner_value);
       }
       if constexpr (kTileBarriers && kTiles > 1 && kTiles < 16) {
-        asm volatile("bar.sync %0, %1;" : : "r"(barrier), "r"(kLanes) : "memory");
+        HUMMING_NAMED_BARRIER_SYNC(barrier, kLanes);
       } else {
         __syncthreads();
       }

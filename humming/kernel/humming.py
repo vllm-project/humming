@@ -28,7 +28,7 @@ from humming.config.mma import (
     supports_undocumented_fp_dtypes,
     uses_undocumented_fp_operand,
 )
-from humming.device import current_device, get_device_index
+from humming.device import DeviceInfo, current_device, get_device_index
 from humming.jit.runtime import KernelRuntime
 from humming.tune import get_heuristics_config
 from humming.utils.smem import estimate_smem_size_config
@@ -693,6 +693,10 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     @classmethod
     def _resolve_configs(cls, layer_config, compute_config, tuning_config, device=None):
         device_index = get_device_index(device)
+        if DeviceInfo(device_index).is_rocm:
+            from humming.kernel.humming_mfma import resolve_mfma_configs
+
+            return resolve_mfma_configs(layer_config, compute_config, tuning_config, device_index)
         layer_obj = dict(cls._prepare_config_obj(layer_config))
         compute_obj = dict(cls._prepare_config_obj(compute_config))
         tuning_obj = cls._prepare_config_obj(tuning_config)
@@ -720,6 +724,14 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         cache_key = (layer_config_str, compute_config_str, tuning_config_str, device_index)
         if cache_key in cls._str2kernel_cache:
             return cls._str2kernel_cache[cache_key]
+
+        if DeviceInfo(device_index).is_rocm:
+            # ROCm runs the gfx950 MFMA GEMM instead of HummingKernel.
+            from humming.kernel.humming_mfma import prepare_mfma_kernels
+
+            res = prepare_mfma_kernels(layer_config, compute_config, tuning_config, device_index)
+            cls._str2kernel_cache[cache_key] = res
+            return res
 
         config_objs = cls._resolve_configs(layer_config, compute_config, tuning_config, device_index)
         layer_config_obj, compute_config_obj, tuning_config_obj = config_objs

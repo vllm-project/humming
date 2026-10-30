@@ -1,7 +1,7 @@
 #pragma once
 
 #include "./torch_api.h"
-#include <cuda.h>
+#include "./gpu_api.h"
 
 #if CUDA_VERSION < 12080
 // CUDA 12.8 added these Driver API values. Wheels built with older headers can

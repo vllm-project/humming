@@ -295,6 +295,9 @@ class HummingWeightSchema(BaseWeightSchema):
     def convert_symmetric_integer_weight(
         self, tensors: dict[str, torch.Tensor]
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
+        if current_device.is_rocm:
+            # The ROCm MFMA GEMM dequantizes offset-binary integer codes directly.
+            return self, tensors
         num_bits = self.b_dtype.num_bits
         has_integer_zero_point = self.has_zero_point and not self.is_fp_zero_point
         if not self.b_dtype.is_integer_type or not 2 <= num_bits <= 8 or has_integer_zero_point:

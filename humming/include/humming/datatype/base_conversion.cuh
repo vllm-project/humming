@@ -1,8 +1,11 @@
 #pragma once
 
+#include <humming/utils/platform.cuh>
+#ifndef HUMMING_HIP
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#endif
 #include <humming/datatype/dtypes.cuh>
 #include <humming/utils/all.cuh>
 

@@ -1,6 +1,9 @@
 #pragma once
 
+#include <humming/utils/platform.cuh>
+#ifndef HUMMING_HIP
 #include <cuda_fp8.h>
+#endif
 
 #include <humming/datatype/dtypes.cuh>
 #include <humming/utils/all.cuh>
@@ -172,7 +175,7 @@ CUDA_INLINE void sync_slice_threads() {
 
   if constexpr (kSlices > 1 && kSlices < 16) {
     uint32_t barrier = (threadIdx.x - kWarpOffset * 32) / kSyncThreads + 1;
-    asm volatile("bar.sync %0, %1;" : : "r"(barrier), "r"(kSyncThreads) : "memory");
+    HUMMING_NAMED_BARRIER_SYNC(barrier, kSyncThreads);
   } else {
     __syncthreads();
   }
@@ -315,6 +318,60 @@ constexpr float target_maximum() {
 }
 
 
+#ifdef HUMMING_HIP
+// ROCm equivalents of the PTX cvt.rn.satfinite / cvt.rni.s8 conversions used below.
+
+// satfinite: finite values (and infinities) are clamped to +-maximum, NaN stays NaN.
+CUDA_INLINE float saturate_to_finite(float value, float maximum) {
+  return value != value ? value : fminf(fmaxf(value, -maximum), maximum);
+}
+
+
+// Two values -> two OCP FP8 bytes (values[0] in the low byte), round to nearest even.
+template <class TargetType>
+CUDA_INLINE uint16_t convert_float2_to_fp8x2(float low, float high) {
+  constexpr float kMaximum = target_maximum<TargetType>();
+  float saturated_low = saturate_to_finite(low, kMaximum);
+  float saturated_high = saturate_to_finite(high, kMaximum);
+  uint32_t converted;
+  if constexpr (std::is_same<TargetType, Float8E4M3>::value)
+    converted = static_cast<uint32_t>(__builtin_amdgcn_cvt_pk_fp8_f32(saturated_low, saturated_high, 0, false));
+  else if constexpr (std::is_same<TargetType, Float8E5M2>::value)
+    converted = static_cast<uint32_t>(__builtin_amdgcn_cvt_pk_bf8_f32(saturated_low, saturated_high, 0, false));
+  else
+    static_assert(sizeof(TargetType) == 0, "E3M4 relies on the NVIDIA cubin patch");
+  return static_cast<uint16_t>(converted & 0xFFFFu);
+}
+
+
+// One value -> E2M1 nibble, round to nearest even, satfinite, sign of zero kept.
+// NaN saturates to the largest magnitude.
+CUDA_INLINE uint32_t convert_float_to_e2m1(float value) {
+  uint32_t sign = (__float_as_uint(value) >> 31) << 3;
+  float magnitude = fabsf(value);
+  uint32_t code;
+  if (magnitude != magnitude) code = 7;
+  else if (magnitude <= 0.25f) code = 0;
+  else if (magnitude < 0.75f) code = 1;
+  else if (magnitude <= 1.25f) code = 2;
+  else if (magnitude < 1.75f) code = 3;
+  else if (magnitude <= 2.5f) code = 4;
+  else if (magnitude < 3.5f) code = 5;
+  else if (magnitude <= 5.f) code = 6;
+  else code = 7;
+  return sign | code;
+}
+
+
+// cvt.rni.s8.f32: round to nearest even, saturate to [-128, 127], NaN -> 0.
+CUDA_INLINE int32_t convert_float_to_s8(float value) {
+  if (value != value) return 0;
+  float rounded = rintf(fminf(fmaxf(value, -128.f), 127.f));
+  return static_cast<int32_t>(rounded);
+}
+#endif
+
+
 template <class TargetType, uint32_t kValues>
 CUDA_INLINE void pack_float(const float *values, uint8_t *packed) {
   constexpr bool kFp8 = std::is_same<TargetType, Float8E3M4>::value || std::is_same<TargetType, Float8E4M3>::value || std::is_same<TargetType, Float8E5M2>::value;
@@ -322,6 +379,23 @@ CUDA_INLINE void pack_float(const float *values, uint8_t *packed) {
   static_assert(kFp8 || kFp4);
   static_assert(kValues % 2 == 0);
 
+#ifdef HUMMING_HIP
+  if constexpr (kFp8) {
+    PRAGMA_UNROLL
+    for (uint32_t value = 0; value < kValues; value += 2) {
+      uint16_t output = convert_float2_to_fp8x2<TargetType>(values[value], values[value + 1]);
+      *reinterpret_cast<uint16_t *>(packed + value) = output;
+    }
+  } else {
+    static_assert(std::is_same<TargetType, Float4E2M1>::value, "E0M3 relies on the NVIDIA cubin patch");
+    PRAGMA_UNROLL
+    for (uint32_t value = 0; value < kValues; value += 2) {
+      uint32_t low = convert_float_to_e2m1(values[value]);
+      uint32_t high = convert_float_to_e2m1(values[value + 1]);
+      packed[value / 2] = static_cast<uint8_t>(low | (high << 4));
+    }
+  }
+#else
   if constexpr (kFp8) {
 #if __CUDA_ARCH__ >= 890
     if constexpr (kValues % 4 == 0) {
@@ -405,6 +479,7 @@ CUDA_INLINE void pack_float(const float *values, uint8_t *packed) {
     asm("trap;");
 #endif
   }
+#endif  // HUMMING_HIP
 }
 
 
@@ -412,6 +487,11 @@ template <uint32_t kValues>
 CUDA_INLINE void pack_int8(const float *values, uint8_t *packed) {
   static_assert(kValues >= 1 && (kValues & (kValues - 1)) == 0);
 
+#ifdef HUMMING_HIP
+  PRAGMA_UNROLL
+  for (uint32_t value = 0; value < kValues; value++)
+    packed[value] = static_cast<uint8_t>(convert_float_to_s8(values[value]));
+#else
   if constexpr (kValues % 4 == 0) {
     PRAGMA_UNROLL
     for (uint32_t value = 0; value < kValues; value += 4) {
@@ -449,6 +529,7 @@ CUDA_INLINE void pack_int8(const float *values, uint8_t *packed) {
     asm("cvt.rni.s8.f32 %0, %1;" : "=r"(output) : "f"(values[0]));
     packed[0] = output;
   }
+#endif  // HUMMING_HIP
 }
 
 
@@ -457,6 +538,14 @@ CUDA_INLINE void pack_int4(const float *values, uint8_t *packed) {
   static_assert(kValues >= 2 && (kValues & (kValues - 1)) == 0);
   constexpr uint32_t kSelectNibbles = (0xF0 & 0xAA) | (0xCC & ~0xAA);
 
+#ifdef HUMMING_HIP
+  PRAGMA_UNROLL
+  for (uint32_t value = 0; value < kValues; value += 2) {
+    uint32_t even = static_cast<uint32_t>(convert_float_to_s8(values[value])) & 0xFu;
+    uint32_t odd = static_cast<uint32_t>(convert_float_to_s8(values[value + 1])) & 0xFu;
+    packed[value / 2] = static_cast<uint8_t>(even | (odd << 4));
+  }
+#else
   if constexpr (kValues % 8 == 0) {
     PRAGMA_UNROLL
     for (uint32_t value = 0; value < kValues; value += 8) {
@@ -490,6 +579,7 @@ CUDA_INLINE void pack_int4(const float *values, uint8_t *packed) {
         : "f"(values[0]), "f"(values[1]));
     packed[0] = static_cast<uint8_t>(output);
   }
+#endif  // HUMMING_HIP
 }
 
 

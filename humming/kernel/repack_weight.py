@@ -3,7 +3,6 @@ import dataclasses
 import math
 from typing import ClassVar
 
-import cuda.bindings.driver as cbd
 import jinja2
 import torch
 
@@ -87,14 +86,9 @@ class RepackWeightKernel(KernelRuntime):
 
         device = inputs.device
 
-        config = cbd.CUlaunchConfig()
-        config.gridDimX = math.ceil(shape_n / 64)
-        config.gridDimY = math.ceil(shape_k / 64)
-        config.gridDimZ = num_experts
-        config.blockDimX = 32
-        config.blockDimY = 1
-        config.blockDimZ = 1
-        config.hStream = torch.cuda.current_stream(device).cuda_stream
+        grid = (math.ceil(shape_n / 64), math.ceil(shape_k / 64), num_experts)
+        block = (32, 1, 1)
+        stream = torch.cuda.current_stream(device).cuda_stream
 
         arg_values = (
             inputs.data_ptr(),
@@ -107,4 +101,4 @@ class RepackWeightKernel(KernelRuntime):
             interleave_mode,
         )
 
-        cbd.cuLaunchKernelEx(config, func, (arg_values, self.arg_types), 0)
+        self.launch(func, grid, block, stream, arg_values)

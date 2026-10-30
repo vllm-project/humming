@@ -272,7 +272,25 @@ __global__ void weight_repack_nk(
   constexpr uint32_t kNumBitsPaddedB = static_next_power_of_2(kNumBitsB);
   uint32_t out_arr[4 * kNumBitsPaddedB];
 
+#ifdef HUMMING_HIP
+  // hipcc (ROCm 7.1, -O2+) lowers the runtime interleave_mode selects into a negative SGPR
+  // scratch base (s_sub_i32 sN, 0, ...; scratch_load ... off, sN offset:X), which faults on
+  // gfx950. Dispatching to compile-time interleave modes avoids the selects.
+  auto pack_with_interleave_mode = [&](auto interleave_mode_constant) {
+    humming_pack_weight<kNumBitsB, kNumBitsA, kUseNativeDequant>(
+        reinterpret_cast<uint32_t *>(tmp), out_arr, decltype(interleave_mode_constant)::value);
+  };
+  // humming_pack_weight only looks at (mode % 2) and (mode / 2 == 0).
+  const uint32_t normalized_interleave_mode = (interleave_mode % 2) + (interleave_mode / 2 == 0 ? 0 : 2);
+  switch (normalized_interleave_mode) {
+    case 0: pack_with_interleave_mode(CompileTimeConstant<0>{}); break;
+    case 1: pack_with_interleave_mode(CompileTimeConstant<1>{}); break;
+    case 2: pack_with_interleave_mode(CompileTimeConstant<2>{}); break;
+    default: pack_with_interleave_mode(CompileTimeConstant<3>{}); break;
+  }
+#else
   humming_pack_weight<kNumBitsB, kNumBitsA, kUseNativeDequant>(reinterpret_cast<uint32_t *>(tmp), out_arr, interleave_mode);
+#endif
 
   uint32_t out_stride = (256 / kNumBitsA) * padded_shape_n * kNumBitsB / 32;
   uint32_t col_offset = (256 / kNumBitsA) * (64 * blockIdx.x) * kNumBitsB / 32;

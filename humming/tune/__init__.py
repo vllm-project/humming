@@ -8,6 +8,7 @@ from humming.config import GemmType, LayerConfig, MmaType
 from humming.config.mma import get_default_mma_type
 from humming.device import DeviceInfo, get_device_index
 from humming.tune.base import DeviceHeuristics
+from humming.tune.gfx950 import Gfx950Heuristics
 from humming.tune.ppu_sm80 import PPUSm80Heuristics
 from humming.tune.raster import raster_group_m_for_config
 from humming.tune.sm8x import (
@@ -43,6 +44,12 @@ ppu_heuristics_map: dict[int, type[DeviceHeuristics]] = {80: PPUSm80Heuristics}
 
 def get_heuristics_class(device: int | torch.device | None = None) -> type[DeviceHeuristics]:
     info = DeviceInfo(device)
+    if info.is_rocm:
+        if info.arch != "gfx950":
+            raise NotImplementedError(
+                f"Humming's ROCm GEMM (MFMA) is tuned and tested on gfx950 only, got {info.arch}"
+            )
+        return Gfx950Heuristics
     sm_version = info.sm_version
     if info.is_ppu:
         return ppu_heuristics_map[80]

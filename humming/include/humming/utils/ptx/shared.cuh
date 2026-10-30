@@ -2,6 +2,10 @@
 
 #include <humming/utils/base.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/shared.cuh>
+#else
+
 template <int count>
 CUDA_INLINE void ld_shared(const int4 *smem_ptr, int4 *regs_ptr) {
   uint32_t *a = reinterpret_cast<uint32_t *>(regs_ptr);
@@ -110,3 +114,5 @@ CUDA_INLINE void aiu_ld_shared(
     static_assert(count == 2 || count == 4, "invalid count");
   }
 }
+
+#endif  // HUMMING_HIP

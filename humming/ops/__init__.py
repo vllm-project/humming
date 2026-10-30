@@ -7,6 +7,7 @@ from humming.ops.launcher import (
     register_kernel,
     register_process_input_kernel,
 )
+from humming.ops.moe import moe_align_block_size, moe_align_block_size_torch
 from humming.ops.weight import (
     dequant_weight,
     pack_weight,
@@ -28,6 +29,8 @@ __all__ = [
     "pack_weight",
     "unpack_weight",
     "humming_gemm",
+    "moe_align_block_size",
+    "moe_align_block_size_torch",
     "process_mxfp4_w4a8_weight",
     "tops_bench",
 ]

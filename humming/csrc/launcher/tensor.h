@@ -3,7 +3,7 @@
 #include "./tma.h"
 #include "./torch_api.h"
 #include "./utils.h"
-#include <cuda.h>
+#include "./gpu_api.h"
 
 inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, KernelData &kernel_data, int64_t top_k) {
   if (c.has_value()) return c.value();

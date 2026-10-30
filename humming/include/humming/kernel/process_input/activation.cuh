@@ -1,7 +1,10 @@
 #pragma once
 
+#include <humming/utils/platform.cuh>
+#ifndef HUMMING_HIP
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#endif
 
 #include <humming/utils/all.cuh>
 
@@ -29,9 +32,14 @@ CUDA_INLINE void load_values(float *values, const SourceType *input) {
       PRAGMA_UNROLL
       for (uint32_t word = 0; word < kValuesPerLoad / 2; word++) {
         uint32_t low, high;
+#ifdef HUMMING_HIP
+        low = words[word] << 16;
+        high = words[word] & 0xffff0000u;
+#else
         asm("shl.b32 %0, %2, 16; and.b32 %1, %2, 0xffff0000;"
             : "=&r"(low), "=&r"(high)
             : "r"(words[word]));
+#endif
         values[value + word * 2] = __uint_as_float(low);
         values[value + word * 2 + 1] = __uint_as_float(high);
       }

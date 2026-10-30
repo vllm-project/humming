@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include <cuda.h>
+#include <humming/utils/platform.cuh>
 
 
 #ifndef USE_PPU
@@ -62,7 +62,11 @@ CUDA_INLINE void debug_kernel_timeout_check(
     const char *message = "Humming kernel execution timeout") {
 #if HUMMING_DEBUG_KERNEL
   if ((threadIdx.x % 32) == 0 && clock64() - start_clock >= kDebugKernelTimeoutClocks) {
+#ifdef HUMMING_HIP
+    HUMMING_DEVICE_ASSERT_FAIL(message);
+#else
     __assertfail(message, __FILE__, __LINE__, __func__, 1);
+#endif
   }
 #endif
 }

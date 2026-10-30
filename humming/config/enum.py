@@ -51,6 +51,8 @@ class MmaType(enum.Enum):
     WGMMA = "wgmma"
     UMMA = "umma"
     MXMMA = "mxmma"
+    # ROCm gfx950 weight-only GEMM (humming/kernel/humming_mfma.py); not a HummingKernel MMA.
+    MFMA = "mfma"
 
 
 class WeightScaleType(enum.Enum):

@@ -148,5 +148,20 @@ class DeviceInfo:
     def tensorcore_tops(self) -> dict[str, float]:
         return self._get_value().tensorcore_tops
 
+    @property
+    def is_rocm(self) -> bool:
+        """True on AMD GPUs. ``sm_major``/``sm_minor``/``sm_version`` are then 0."""
+        return self._get_value().is_rocm
+
+    @property
+    def arch(self) -> str:
+        """``"sm_90"``-style on CUDA, GCN target without features (``"gfx950"``) on ROCm."""
+        return self._get_value().arch
+
+    @property
+    def warp_size(self) -> int:
+        """Hardware wavefront width: 32 on NVIDIA, 64 on CDNA."""
+        return self._get_value().warp_size
+
 
 current_device = DeviceInfo(-1)

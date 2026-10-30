@@ -1,6 +1,6 @@
 #define USE_CUDA 1
 
-#include <cuda.h>
+#include "./gpu_api.h"
 #include <map>
 #include <memory>
 #include <mutex>
@@ -11,6 +11,8 @@
 
 #include "./elf.h"
 #include "./mapped_file.h"
+#include "./mfma.h"
+#include "./mfma_moe.h"
 #include "./process_input.h"
 #include "./tensor.h"
 #include "./torch_api.h"
@@ -21,6 +23,10 @@ struct RegisteredKernel {
   std::string cubin_path;
   std::string kernel_name;
   KernelData metadata;
+#ifdef HUMMING_HIP
+  std::optional<MfmaKernelData> mfma;
+  std::optional<uint32_t> mfma_moe_type;  // MFMA MoE kernels only (mfma_moe.h)
+#endif
 };
 
 static std::shared_mutex g_kernel_mutex;
@@ -51,6 +57,22 @@ inline KernelData find_registered_kernel_data(int64_t kernel_id) {
   ASSERT_CHECK(it != g_registered_kernels.end(), "kernel not registered.");
   return it->second.metadata;
 }
+
+#ifdef HUMMING_HIP
+inline std::optional<MfmaKernelData> find_registered_mfma_kernel_data(int64_t kernel_id) {
+  std::shared_lock lock(g_kernel_mutex);
+  auto it = g_registered_kernels.find(kernel_id);
+  ASSERT_CHECK(it != g_registered_kernels.end(), "kernel not registered.");
+  return it->second.mfma;
+}
+
+inline std::optional<uint32_t> find_registered_mfma_moe_type(int64_t kernel_id) {
+  std::shared_lock lock(g_kernel_mutex);
+  auto it = g_registered_kernels.find(kernel_id);
+  ASSERT_CHECK(it != g_registered_kernels.end(), "kernel not registered.");
+  return it->second.mfma_moe_type;
+}
+#endif
 
 inline LoadedKernel get_or_load_kernel(int64_t kernel_id, CUcontext context) {
   std::shared_ptr<const MappedFile> cubin;
@@ -137,6 +159,27 @@ Tensor launch_kernel_impl(
   int64_t dev = a.get_device();
   DeviceContextGuard context_guard(dev);
   CUcontext context = get_current_context();
+#ifdef HUMMING_HIP
+  if (find_registered_mfma_kernel_data(configs[find_kernel_configs_target_index(configs, 1)]).has_value()) {
+    int64_t shape_m = valid_shape_m > 0 ? valid_shape_m : a.size(0);
+    auto moe_type = find_registered_mfma_moe_type(configs[find_kernel_configs_target_index(configs, 1)]);
+    if (moe_type.has_value() && valid_shape_m <= 0) shape_m = a.size(0) * (moe_type.value() == 1 ? top_k : 1);
+    int64_t index = find_kernel_configs_target_index(configs, std::max<int64_t>(shape_m, 1));
+    int64_t kernel_id = configs[index];
+    int64_t num_cus = configs.size() < 2 ? 0 : configs[index + 1];
+    auto mfma_data = find_registered_mfma_kernel_data(kernel_id);
+    ASSERT_CHECK(mfma_data.has_value(), "configs mix MFMA and non-MFMA kernels");
+    LoadedKernel kernel = get_or_load_kernel(kernel_id, context);
+    if (moe_type.has_value()) {
+      return launch_mfma_moe_kernel(mfma_data.value(), moe_type.value(), kernel.func, get_num_sms(num_cus, dev), a, b,
+                                    bs, bs2_, as_, as2_, bzp_, bias_, c_, sorted_ids_, expert_ids_, num_tokens_padded_,
+                                    expert_layout_, locks_, top_k, valid_shape_m, should_check_tensor);
+    }
+    ASSERT_CHECK(!num_tokens_padded_.has_value() && !expert_layout_.has_value(), "MFMA GEMM does not support MoE");
+    return launch_mfma_kernel(mfma_data.value(), kernel.func, get_num_sms(num_cus, dev), a, b, bs, bs2_, as_, as2_,
+                              bzp_, bias_, c_, sorted_ids_, expert_ids_, locks_, should_check_tensor);
+  }
+#endif
   KernelData base_kernel_data = find_registered_kernel_data(configs, 1);
 
   int64_t shape_m = a.size(0);
@@ -278,6 +321,26 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
     kernel_name = name;
   }
   ASSERT_CHECK(!kernel_name.empty(), "no humming kernel found in ", cubin_path);
+
+#ifdef HUMMING_HIP
+  if (is_mfma_cubin(reader)) {
+    RegisteredKernel registered{cubin, cubin_path, kernel_name, KernelData{}, read_mfma_kernel_data(reader),
+                                read_mfma_moe_type(reader)};
+    registered.metadata.num_threads = registered.mfma->num_threads;
+    registered.metadata.mma_type = MmaType::MFMA;
+    std::unique_lock lock(g_kernel_mutex);
+    auto path_it = g_path_ids.find(cubin_path);
+    if (path_it != g_path_ids.end()) return path_it->second;
+    int64_t hash_id = get_kernel_registration_id(cubin_path, kernel_name);
+    auto kernel_it = g_registered_kernels.find(hash_id);
+    bool no_collision = kernel_it == g_registered_kernels.end() || kernel_it->second.cubin_path == cubin_path;
+    ASSERT_CHECK(no_collision, "kernel id collision for ", cubin_path);
+    if (kernel_it == g_registered_kernels.end()) g_registered_kernels.emplace(hash_id, std::move(registered));
+    auto result = std::make_tuple(hash_id, kernel_name);
+    g_path_ids[cubin_path] = result;
+    return result;
+  }
+#endif
 
   KernelData metadata = {
       reader.getUint32("SMEM_SIZE"),

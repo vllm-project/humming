@@ -4,6 +4,7 @@ import torch
 
 from humming import ops
 from humming.config import LayerConfig
+from humming.device import DeviceInfo
 from humming.tune import get_heuristics_class
 
 
@@ -42,6 +43,9 @@ def _resolve_use_pdl(
     if use_pdl is not None:
         return use_pdl
     if not inputs.is_cuda:
+        return False
+    if DeviceInfo(inputs.device).is_rocm:
+        # No programmatic dependent launch on ROCm.
         return False
 
     heuristics = get_heuristics_class(inputs.device)

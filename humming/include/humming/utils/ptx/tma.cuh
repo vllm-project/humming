@@ -2,6 +2,10 @@
 
 #include <humming/utils/base.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/tma.cuh>
+#else
+
 CUDA_INLINE uint64_t create_tma_cache_policy() {
   uint64_t policy;
   asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
@@ -329,3 +333,5 @@ CUDA_INLINE void tma_load_5d(const void *desc_ptr, void *smem_ptr, void *mbar_pt
                     "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(c4) : "memory");
   }
 }
+
+#endif  // HUMMING_HIP

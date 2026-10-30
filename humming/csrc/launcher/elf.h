@@ -10,6 +10,9 @@
 #include <vector>
 
 #define SHT_NOBITS 8
+// e_machine values with non-CUDA kernel symbol conventions.
+#define HUMMING_EM_PPU 0x10E
+#define HUMMING_EM_AMDGPU 0xE0
 typedef uint64_t Elf64_Addr;
 typedef uint64_t Elf64_Off;
 typedef uint16_t Elf64_Half;
@@ -78,8 +81,12 @@ public:
 
     for (int i = 0; i < ehdr->e_shnum; ++i) {
       if (shdrs[i].sh_type == 2) {
+        if (ehdr->e_machine == HUMMING_EM_AMDGPU) {
+          readAmdgpuSymbolTable(shdrs, ehdr->e_shnum, i);
+          continue;
+        }
         // PPU marks kernel entry points with 0x20; CUDA uses 0x10.
-        readSymbolTable(shdrs, ehdr->e_shnum, i, ehdr->e_machine == 0x10E ? 0x20 : 0x10);
+        readSymbolTable(shdrs, ehdr->e_shnum, i, ehdr->e_machine == HUMMING_EM_PPU ? 0x20 : 0x10);
       }
     }
   }
@@ -94,6 +101,10 @@ public:
     uint32_t val = 0;
     std::memcpy(&val, data.data() + it->second, sizeof(uint32_t));
     return val;
+  }
+
+  bool hasSymbol(const std::string &name) const {
+    return symbolOffsets.find(name) != symbolOffsets.end();
   }
 
   bool getBool(const std::string &name) {
@@ -127,6 +138,39 @@ public:
       } else {
         uint64_t absOffset = shdr.sh_offset + sym.st_value;
         symbolOffsets[sName] = absOffset;
+      }
+    }
+  }
+
+  // AMDGPU code objects are shared objects: st_value is a virtual address, and every kernel
+  // `name` has a kernel-descriptor object symbol `name.kd`.
+  void readAmdgpuSymbolTable(const Elf64_Shdr *shdrs, int num_shdrs, int symIdx) {
+    const Elf64_Shdr &symtab = shdrs[symIdx];
+    const Elf64_Shdr &strtab = shdrs[symtab.sh_link];
+    const std::string kernel_descriptor_suffix = ".kd";
+
+    const char *names = data.data() + strtab.sh_offset;
+    int count = symtab.sh_size / symtab.sh_entsize;
+    const Elf64_Sym *syms = reinterpret_cast<const Elf64_Sym *>(data.data() + symtab.sh_offset);
+
+    for (int i = 0; i < count; ++i) {
+      const Elf64_Sym &sym = syms[i];
+      if (sym.st_name == 0 || sym.st_name >= strtab.sh_size) continue;
+      if (sym.st_shndx == 0 || sym.st_shndx >= num_shdrs) continue;
+      std::string symbol_name = names + sym.st_name;
+      bool is_object = (sym.st_info & 0xF) == 1;
+      bool is_kernel_descriptor = is_object && symbol_name.size() > kernel_descriptor_suffix.size() &&
+          symbol_name.compare(symbol_name.size() - kernel_descriptor_suffix.size(), kernel_descriptor_suffix.size(), kernel_descriptor_suffix) == 0;
+      if (is_kernel_descriptor) {
+        kernelNames.push_back(symbol_name.substr(0, symbol_name.size() - kernel_descriptor_suffix.size()));
+        continue;
+      }
+
+      const auto &shdr = shdrs[sym.st_shndx];
+      if (shdr.sh_type == SHT_NOBITS) {
+        symbolOffsets[symbol_name] = 0;
+      } else {
+        symbolOffsets[symbol_name] = shdr.sh_offset + (sym.st_value - shdr.sh_addr);
       }
     }
   }

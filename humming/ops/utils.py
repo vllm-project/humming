@@ -15,6 +15,7 @@ from filelock import FileLock
 from torch._subclasses.fake_tensor import FakeTensor
 
 import humming.utils.jit as jit_utils
+from humming.utils import rocm as rocm_utils
 from humming.utils.cuda import filter_cuda_paths, get_cuda_library_path
 
 _libs = {}
@@ -171,7 +172,10 @@ def get_humming_launcher_build_dir(use_torch_stable_api: bool):
     cache_dir = jit_utils.get_humming_cache_dir()
     torch_major, torch_minor = torch.__version__.split(".")[:2]
     version = "torch211_stable" if use_torch_stable_api else f"torch{torch_major}{torch_minor}_nostable"
-    version += "_" + jit_utils.hash_to_hex(jit_utils.get_native_platform_signature())
+    platform_signature = jit_utils.get_native_platform_signature()
+    if rocm_utils.is_rocm_build():
+        platform_signature += f"rocm-{rocm_utils.get_rocm_version()}"
+    version += "_" + jit_utils.hash_to_hex(platform_signature)
 
     launcher_build_dir = os.path.join(cache_dir, f"launcher/{version}/{launcher_code_hash}")
     Path(launcher_build_dir).mkdir(exist_ok=True, parents=True)
@@ -191,6 +195,9 @@ def _get_precompiled_launcher_path() -> Path | None:
     from packaging.version import Version
 
     if Version(torch.__version__) < Version("2.11"):
+        return None
+    if rocm_utils.is_rocm_build():
+        # Precompiled launchers are built against the CUDA driver API.
         return None
 
     humming_dir = Path(__file__).parents[1]
@@ -225,12 +232,26 @@ def init_humming_launcher():
         dirname = os.path.dirname(humming.__file__)
         filename = os.path.join(dirname, "csrc/launcher/launcher.cpp")
 
-        cuda_env = filter_cuda_paths(
-            required_headers=["cuda.h", "crt/host_defines.h", "cuda/std/cstdint"],
-        )
-
         extra_cflags = ["-O3", f"-DUSE_TORCH_STABLE_API={int(USE_TORCH_STABLE_API)}"]
-        extra_ldflags = ["-lcuda", "-lc10_cuda", "-ltorch_cuda"]
+        if rocm_utils.is_rocm_build():
+            # The launcher calls the HIP runtime through csrc/launcher/gpu_api.h. Link the
+            # libamdhip64 bundled with torch so both share one HIP runtime.
+            torch_lib_dir = Path(torch.__file__).parent / "lib"
+            extra_include_paths = [str(rocm_utils.get_rocm_include_path())]
+            extra_cflags += ["-DHUMMING_HIP=1", "-D__HIP_PLATFORM_AMD__=1"]
+            extra_ldflags = [
+                f"-L{torch_lib_dir}",
+                f"-Wl,-rpath,{torch_lib_dir}",
+                "-lamdhip64",
+                "-lc10_hip",
+                "-ltorch_hip",
+            ]
+        else:
+            cuda_env = filter_cuda_paths(
+                required_headers=["cuda.h", "crt/host_defines.h", "cuda/std/cstdint"],
+            )
+            extra_include_paths = list(cuda_env["include_paths"])
+            extra_ldflags = ["-lcuda", "-lc10_cuda", "-ltorch_cuda"]
         if jit_utils.IS_WINDOWS:
             extra_cflags = [
                 "/O2",
@@ -252,7 +273,7 @@ def init_humming_launcher():
         torch.utils.cpp_extension.load(
             name="humming_launcher",
             sources=[filename],
-            extra_include_paths=list(cuda_env["include_paths"]),
+            extra_include_paths=extra_include_paths,
             extra_ldflags=extra_ldflags,
             extra_cflags=extra_cflags,
             build_directory=build_dir,

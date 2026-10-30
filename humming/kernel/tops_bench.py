@@ -2,7 +2,6 @@ import ctypes
 import dataclasses
 from typing import ClassVar
 
-import cuda.bindings.driver as cbd
 import jinja2
 import torch
 
@@ -77,17 +76,12 @@ class TopsBenchKernel(KernelRuntime):
 
     def __call__(self):
         device = torch.cuda.current_device()
-        config = cbd.CUlaunchConfig()
-        config.gridDimX = self.num_ctas
-        config.gridDimY = 1
-        config.gridDimZ = 1
-        config.blockDimX = self.num_warps * 32
-        config.blockDimY = 1
-        config.blockDimZ = 1
-        config.hStream = torch.cuda.current_stream(device).cuda_stream
+        grid = (self.num_ctas, 1, 1)
+        block = (self.num_warps * 32, 1, 1)
+        stream = torch.cuda.current_stream(device).cuda_stream
 
         func = self.load_cubin()
         tensor = torch.empty((1,), dtype=torch.uint32, device=device)
         arg_values = (tensor.data_ptr(),)
 
-        cbd.cuLaunchKernelEx(config, func, (arg_values, self.arg_types), 0)
+        self.launch(func, grid, block, stream, arg_values)

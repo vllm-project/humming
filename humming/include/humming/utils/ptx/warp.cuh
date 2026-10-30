@@ -2,6 +2,10 @@
 
 #include <humming/utils/base.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/warp.cuh>
+#else
+
 
 CUDA_INLINE bool warp_elect_leader() {
   uint32_t leader;
@@ -22,3 +26,5 @@ CUDA_INLINE uint32_t warp_reduce_add(uint32_t local_count) {
   return __reduce_add_sync(0xffffffff, local_count);
 #endif
 }
+
+#endif  // HUMMING_HIP

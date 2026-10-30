@@ -3,6 +3,16 @@
 #include <humming/utils/base.cuh>
 #include <humming/utils/ptx/tma.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/unsupported.cuh>
+// ROCm: cp.async does not exist. Kernels must instantiate the loaders with use_cp_async=false
+// (plain synchronous copies); the cp.async paths become error-on-use stubs.
+#define CP_ASYNC_ASM(MODE, EVICT_FIRST) humming_rocm_unsupported_primitive();
+#define CP_ASYNC_ZFILL_ASM(MODE) humming_rocm_unsupported_primitive();
+#define CP_ASYNC_PRED_ASM(MODE, EVICT_FIRST) humming_rocm_unsupported_primitive();
+#define CP_ASYNC_ZFILL_PRED_ASM(MODE) humming_rocm_unsupported_primitive();
+#else
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define CP_ASYNC_L2_HINT ".L2::256B"
 #else
@@ -67,6 +77,7 @@
                :                                                                           \
                : "r"((uint32_t)pred2), "r"(smem), "l"(gmem_ptr), "n"(BYTES), "r"(src_size) \
                : "memory");
+#endif  // HUMMING_HIP
 
 
 template <bool use_cp_async, typename T, uint32_t cache_type = 0, bool evict_first = false>
@@ -200,6 +211,18 @@ CUDA_INLINE void legacy_load_2d(const T *gmem_ptr, T *smem_ptr) {
 }
 
 
+#ifdef HUMMING_HIP
+// Loads issued with use_cp_async=false are synchronous, so group commit/wait are no-ops.
+CUDA_INLINE void cp_async_commit_group() {}
+
+template <uint32_t N>
+CUDA_INLINE void cp_async_wait_group() {}
+
+HUMMING_ROCM_UNSUPPORTED_STUB(void, cp_async_commit_mbarrier)
+HUMMING_ROCM_UNSUPPORTED_STUB(void, aiu_load_gmem)
+HUMMING_ROCM_UNSUPPORTED_STUB(void, aiu_load_gmem_linear_2d)
+HUMMING_ROCM_UNSUPPORTED_STUB(void, aiu_load_gmem_linear_3d)
+#else
 CUDA_INLINE void cp_async_commit_group() {
   asm volatile("cp.async.commit_group;\n");
 }
@@ -272,3 +295,5 @@ CUDA_INLINE void aiu_load_gmem_linear_3d(
         "r"(gmem_offset1), "r"(gmem_offset2), "r"(gmem_offset3),
         "r"(smem_dim1), "r"(smem_dim2), "r"(smem_dim3));
 };
+
+#endif  // HUMMING_HIP

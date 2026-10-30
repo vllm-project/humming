@@ -2,6 +2,10 @@
 
 #include <humming/utils/base.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/wgmma.cuh>
+#else
+
 CUDA_INLINE void wgmma_fence() {
   asm volatile("wgmma.fence.sync.aligned;\n" ::
                    : "memory");
@@ -27,3 +31,5 @@ CUDA_INLINE void warpgroup_fence_operand(float &reg) {
   asm volatile(""
       : "+f"(reg)::"memory");
 }
+
+#endif  // HUMMING_HIP

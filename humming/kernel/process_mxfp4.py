@@ -3,7 +3,6 @@ import dataclasses
 import math
 from typing import ClassVar
 
-import cuda.bindings.driver as cbd
 import torch
 
 from humming.jit.runtime import KernelRuntime
@@ -44,14 +43,9 @@ class ProcessMxfp4W4A8Kernel(KernelRuntime):
         func = self.load_cubin()
         device = inputs.device
         num_groups = delta_scale_offsets.nelement()
-        config = cbd.CUlaunchConfig()
-        config.gridDimX = math.ceil(num_groups / 128)
-        config.gridDimY = 1
-        config.gridDimZ = 1
-        config.blockDimX = 128
-        config.blockDimY = 1
-        config.blockDimZ = 1
-        config.hStream = torch.cuda.current_stream(device).cuda_stream
+        grid = (math.ceil(num_groups / 128), 1, 1)
+        block = (128, 1, 1)
+        stream = torch.cuda.current_stream(device).cuda_stream
 
         arg_values = (
             inputs.data_ptr(),
@@ -60,5 +54,5 @@ class ProcessMxfp4W4A8Kernel(KernelRuntime):
             num_groups,
         )
 
-        cbd.cuLaunchKernelEx(config, func, (arg_values, self.arg_types), 0)
+        self.launch(func, grid, block, stream, arg_values)
         return outputs

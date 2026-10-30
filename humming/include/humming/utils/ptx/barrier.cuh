@@ -2,6 +2,10 @@
 
 #include <humming/utils/base.cuh>
 
+#ifdef HUMMING_HIP
+#include <humming/utils/hip/barrier.cuh>
+#else
+
 
 CUDA_INLINE void griddepcontrol_wait() {
 #if (__CUDA_ARCH__ >= 900)
@@ -196,3 +200,5 @@ CUDA_INLINE void mbarrier_arrive(void *barrier) {
                  : "memory");
   }
 };
+
+#endif  // HUMMING_HIP

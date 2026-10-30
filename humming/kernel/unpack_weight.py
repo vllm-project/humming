@@ -3,7 +3,6 @@ import dataclasses
 import math
 from typing import ClassVar
 
-import cuda.bindings.driver as cbd
 import jinja2
 import torch
 
@@ -29,17 +28,12 @@ class UnpackWeightKernel(KernelRuntime):
     def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor):
         func = self.load_cubin()
         device = inputs.device
-        config = cbd.CUlaunchConfig()
         num_elements = outputs.nelement()
-        config.gridDimX = math.ceil(num_elements / (32 * 32))
-        config.gridDimY = 1
-        config.gridDimZ = 1
-        config.blockDimX = 32
-        config.blockDimY = 1
-        config.blockDimZ = 1
-        config.hStream = torch.cuda.current_stream(device).cuda_stream
+        grid = (math.ceil(num_elements / (32 * 32)), 1, 1)
+        block = (32, 1, 1)
+        stream = torch.cuda.current_stream(device).cuda_stream
 
         arg_values = (inputs.data_ptr(), outputs.data_ptr(), num_elements)
 
-        cbd.cuLaunchKernelEx(config, func, (arg_values, self.arg_types), 0)
+        self.launch(func, grid, block, stream, arg_values)
         return outputs

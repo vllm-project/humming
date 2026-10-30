@@ -2,7 +2,6 @@ import ctypes
 import dataclasses
 from typing import ClassVar
 
-import cuda.bindings.driver as cbd
 import jinja2
 import torch
 
@@ -65,14 +64,9 @@ class QuantWeightKernel(KernelRuntime):
         group_size = inputs.size(-1) if group_size <= 0 else group_size
 
         device = inputs.device
-        config = cbd.CUlaunchConfig()
-        config.gridDimX = inputs.nelement() // group_size
-        config.gridDimY = 1
-        config.gridDimZ = 1
-        config.blockDimX = 32
-        config.blockDimY = 1
-        config.blockDimZ = 1
-        config.hStream = torch.cuda.current_stream(device).cuda_stream
+        grid = (inputs.nelement() // group_size, 1, 1)
+        block = (32, 1, 1)
+        stream = torch.cuda.current_stream(device).cuda_stream
 
         arg_values = (
             inputs.data_ptr(),
@@ -81,4 +75,4 @@ class QuantWeightKernel(KernelRuntime):
             0 if zero_point is None else zero_point.data_ptr(),
         )
 
-        cbd.cuLaunchKernelEx(config, func, (arg_values, self.arg_types), 0)
+        self.launch(func, grid, block, stream, arg_values)

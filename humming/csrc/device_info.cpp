@@ -2,9 +2,14 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#ifdef HUMMING_HIP
+#include <hip/hip_runtime.h>
+#else
 #include <cuda.h>
+#endif
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -12,6 +17,10 @@ struct DeviceData {
   int64_t index;
   char name[256];
   bool is_ppu;
+  bool is_rocm;
+  // "sm_<major><minor>" on CUDA, the GCN target without features on ROCm ("gfx950").
+  char arch[64];
+  int64_t warp_size;
   int64_t sm_count;
   int64_t max_threads_per_block;
   int64_t max_threads_per_sm;
@@ -52,6 +61,9 @@ enum DeviceAttribute : uint32_t {
   SM_CLOCK_KHZ,
   MEMORY_BANDWIDTH_GBPS,
   TENSORCORE_TOPS,
+  IS_ROCM,
+  ARCH,
+  WARP_SIZE,
   NUM_DEVICE_ATTRIBUTES,
 };
 
@@ -73,6 +85,52 @@ struct PyDeviceInfo {
 std::vector<PyObject *> device_infos;
 PyObject *dynamic_device_info = nullptr;
 
+#ifdef HUMMING_HIP
+bool check_hip(hipError_t result, const char *function) {
+  if (result == hipSuccess) return true;
+  PyErr_Format(
+      PyExc_RuntimeError,
+      "%s failed with HIP error %d: %s (%s)",
+      function,
+      static_cast<int>(result),
+      hipGetErrorName(result),
+      hipGetErrorString(result));
+  return false;
+}
+
+bool get_attribute(int device, hipDeviceAttribute_t attribute, int64_t *result) {
+  int value;
+  if (!check_hip(hipDeviceGetAttribute(&value, attribute, device), "hipDeviceGetAttribute")) return false;
+  *result = value;
+  return true;
+}
+
+bool initialize_cuda() {
+  if (cuda_initialized) return true;
+  if (!check_hip(hipInit(0), "hipInit")) return false;
+  cuda_initialized = true;
+  return true;
+}
+
+bool get_device_count(int *device_count) {
+  if (cached_device_count < 0) {
+    if (!initialize_cuda()) return false;
+    int count;
+    if (!check_hip(hipGetDeviceCount(&count), "hipGetDeviceCount")) return false;
+    cached_device_count = count;
+  }
+  *device_count = cached_device_count;
+  return true;
+}
+
+bool resolve_current_device_index(int64_t *device_index) {
+  if (!initialize_cuda()) return false;
+  int device;
+  if (!check_hip(hipGetDevice(&device), "hipGetDevice")) return false;
+  *device_index = device;
+  return true;
+}
+#else
 bool check_cuda(CUresult result, const char *function) {
   if (result == CUDA_SUCCESS) return true;
   const char *name = "unknown";
@@ -130,6 +188,7 @@ bool resolve_current_device_index(int64_t *device_index) {
   *device_index = device;
   return true;
 }
+#endif
 
 bool validate_device_index(int64_t device_index) {
   int device_count;
@@ -173,7 +232,55 @@ int64_t get_fp16_tensorcore_ops_per_clock(int64_t sm_version, bool is_ppu) {
   }
 }
 
+#ifdef HUMMING_HIP
+// Dense MFMA operations per CU per clock, relative to FP16.
+int64_t get_fp16_matrix_ops_per_clock(const char *arch) {
+  if (std::strcmp(arch, "gfx950") == 0) return 4096;
+  if (std::strcmp(arch, "gfx942") == 0 || std::strcmp(arch, "gfx941") == 0 || std::strcmp(arch, "gfx940") == 0) return 2048;
+  return 0;
+}
+
+PyObject *make_rocm_tensorcore_tops(const DeviceData &info) {
+  struct MatrixCoreType {
+    const char *name;
+    double multiplier;
+    bool requires_gfx950;
+  };
+  // gfx950 runs FP6/FP4 MFMA at 4x and FP8/INT8 at 2x the FP16 rate; it has no INT4,
+  // E3M4 or E0M3 MFMA. gfx942 has FP8/INT8 at 2x but no FP6/FP4.
+  static constexpr MatrixCoreType types[] = {
+      {"float16", 1.0, false},
+      {"bfloat16", 1.0, false},
+      {"float8e4m3", 2.0, false},
+      {"float8e5m2", 2.0, false},
+      {"float6e2m3", 4.0, true},
+      {"float6e3m2", 4.0, true},
+      {"float4e2m1", 4.0, true},
+      {"int8", 2.0, false},
+  };
+  PyObject *result = PyDict_New();
+  if (result == nullptr) return nullptr;
+  bool is_gfx950 = std::strcmp(info.arch, "gfx950") == 0;
+  for (const MatrixCoreType &type : types) {
+    if (type.requires_gfx950 && !is_gfx950) continue;
+    double tops = info.base_tensorcore_tops * type.multiplier;
+    if (tops == 0) continue;
+    PyObject *value = PyFloat_FromDouble(tops);
+    if (value == nullptr || PyDict_SetItemString(result, type.name, value) < 0) {
+      Py_XDECREF(value);
+      Py_DECREF(result);
+      return nullptr;
+    }
+    Py_DECREF(value);
+  }
+  return result;
+}
+#endif
+
 PyObject *make_tensorcore_tops(const DeviceData &info) {
+#ifdef HUMMING_HIP
+  return make_rocm_tensorcore_tops(info);
+#endif
   struct TensorCoreType {
     const char *name;
     double multiplier;
@@ -214,6 +321,48 @@ PyObject *make_tensorcore_tops(const DeviceData &info) {
   return result;
 }
 
+#ifdef HUMMING_HIP
+bool query_device_data(int64_t device_index, DeviceData *info) {
+  info->index = device_index;
+  int device = static_cast<int>(device_index);
+  hipDeviceProp_t properties;
+  if (!check_hip(hipGetDeviceProperties(&properties, device), "hipGetDeviceProperties")) return false;
+  std::snprintf(info->name, sizeof(info->name), "%s", properties.name);
+  std::snprintf(info->arch, sizeof(info->arch), "%s", properties.gcnArchName);
+  char *feature_separator = std::strchr(info->arch, ':');
+  if (feature_separator != nullptr) *feature_separator = '\0';
+  info->is_ppu = false;
+  info->is_rocm = true;
+  // HIP reports the GCN generation as compute capability (gfx950 -> 9.5), which would
+  // read as an SM90+ NVIDIA part. Report 0 so every sm_version gate takes the oldest path.
+  info->sm_major = 0;
+  info->sm_minor = 0;
+  bool success =
+      get_attribute(device, hipDeviceAttributeWarpSize, &info->warp_size) &&
+      get_attribute(device, hipDeviceAttributeMultiprocessorCount, &info->sm_count) &&
+      get_attribute(device, hipDeviceAttributeMaxThreadsPerBlock, &info->max_threads_per_block) &&
+      get_attribute(device, hipDeviceAttributeMaxThreadsPerMultiProcessor, &info->max_threads_per_sm) &&
+      get_attribute(device, hipDeviceAttributeMaxRegistersPerMultiprocessor, &info->max_registers_per_sm) &&
+      get_attribute(device, hipDeviceAttributeL2CacheSize, &info->l2_cache_size) &&
+      get_attribute(device, hipDeviceAttributeMaxSharedMemoryPerBlock, &info->default_smem_size) &&
+      get_attribute(device, hipDeviceAttributeSharedMemPerBlockOptin, &info->max_smem_size) &&
+      get_attribute(device, hipDeviceAttributeMemoryClockRate, &info->memory_clock_khz) &&
+      get_attribute(device, hipDeviceAttributeMemoryBusWidth, &info->memory_bus_width) &&
+      get_attribute(device, hipDeviceAttributeClockRate, &info->sm_clock_khz);
+  if (!success) return false;
+  if (info->max_smem_size == 0) info->max_smem_size = info->default_smem_size;
+  // CDNA3/CDNA4 vector L1 is 32 KB per CU.
+  bool is_cdna3_or_newer = std::strncmp(info->arch, "gfx94", 5) == 0 || std::strncmp(info->arch, "gfx95", 5) == 0;
+  info->l1_cache_size = is_cdna3_or_newer ? 32 * 1024 : 0;
+  // HBM on CDNA reports the half-rate memory clock: four transfers per reported clock
+  // (MI355X: 2000 MHz * 8192 bit * 4 / 8 = 8.19 TB/s).
+  int64_t memory_clock_multiplier = 4;
+  info->memory_bandwidth_gbps = info->memory_clock_khz * memory_clock_multiplier * info->memory_bus_width / 8.0 / 1e6;
+  info->base_tensorcore_tops =
+      info->sm_count * get_fp16_matrix_ops_per_clock(info->arch) * info->sm_clock_khz / 1e9;
+  return true;
+}
+#else
 bool query_device_data(int64_t device_index, DeviceData *info) {
   info->index = device_index;
 
@@ -258,8 +407,12 @@ bool query_device_data(int64_t device_index, DeviceData *info) {
   info->memory_bandwidth_gbps = info->memory_clock_khz * memory_clock_multiplier * info->memory_bus_width / 8.0 / 1e6;
   info->base_tensorcore_tops =
       info->sm_count * get_fp16_tensorcore_ops_per_clock(sm_version, info->is_ppu) * info->sm_clock_khz / 1e9;
+  info->is_rocm = false;
+  info->warp_size = 32;
+  std::snprintf(info->arch, sizeof(info->arch), "sm_%lld", static_cast<long long>(sm_version));
   return true;
 }
+#endif
 
 PyObject *make_attribute_value(const DeviceData &info, DeviceAttribute attribute) {
   switch (attribute) {
@@ -285,6 +438,9 @@ PyObject *make_attribute_value(const DeviceData &info, DeviceAttribute attribute
     case SM_CLOCK_KHZ: return PyLong_FromLongLong(info.sm_clock_khz);
     case MEMORY_BANDWIDTH_GBPS: return PyFloat_FromDouble(info.memory_bandwidth_gbps);
     case TENSORCORE_TOPS: return make_tensorcore_tops(info);
+    case IS_ROCM: return PyBool_FromLong(info.is_rocm);
+    case ARCH: return PyUnicode_FromString(info.arch);
+    case WARP_SIZE: return PyLong_FromLongLong(info.warp_size);
     default: Py_UNREACHABLE();
   }
 }
@@ -402,6 +558,14 @@ PyObject *format_device_info(PyDeviceInfo *self) {
       return nullptr;
     }
   }
+  // ROCm-only fields are appended so the CUDA representation stays unchanged.
+  PyObject *rocm_suffix = values[IS_ROCM] == Py_True
+      ? PyUnicode_FromFormat(", is_rocm=%R, arch=%R, warp_size=%R", values[IS_ROCM], values[ARCH], values[WARP_SIZE])
+      : PyUnicode_FromString("");
+  if (rocm_suffix == nullptr) {
+    for (PyObject *value : values) Py_XDECREF(value);
+    return nullptr;
+  }
   PyObject *result = PyUnicode_FromFormat(
       "DeviceInfo(index=%R, name=%R, is_ppu=%R, sm_count=%R, max_threads_per_block=%R, "
       "max_threads_per_sm=%R, max_registers_per_sm=%R, "
@@ -409,7 +573,7 @@ PyObject *format_device_info(PyDeviceInfo *self) {
       "l2_cache_size=%R, l2_cache_size_mb=%R, l1_cache_size=%R, l1_cache_size_kb=%R, "
       "default_smem_size=%R, max_smem_size=%R, max_smem_size_kb=%R, "
       "memory_clock_khz=%R, memory_bus_width=%R, "
-      "sm_clock_khz=%R, memory_bandwidth_gbps=%R, tensorcore_tops=%R)",
+      "sm_clock_khz=%R, memory_bandwidth_gbps=%R, tensorcore_tops=%R%U)",
       values[INDEX],
       values[NAME],
       values[IS_PPU],
@@ -431,7 +595,9 @@ PyObject *format_device_info(PyDeviceInfo *self) {
       values[MEMORY_BUS_WIDTH],
       values[SM_CLOCK_KHZ],
       values[MEMORY_BANDWIDTH_GBPS],
-      values[TENSORCORE_TOPS]);
+      values[TENSORCORE_TOPS],
+      rocm_suffix);
+  Py_DECREF(rocm_suffix);
   for (PyObject *value : values) Py_DECREF(value);
   return result;
 }
@@ -475,6 +641,9 @@ PyGetSetDef DeviceInfo_properties[] = {
     DEVICE_PROPERTY("sm_clock_khz", SM_CLOCK_KHZ),
     DEVICE_PROPERTY("memory_bandwidth_gbps", MEMORY_BANDWIDTH_GBPS),
     DEVICE_PROPERTY("tensorcore_tops", TENSORCORE_TOPS),
+    DEVICE_PROPERTY("is_rocm", IS_ROCM),
+    DEVICE_PROPERTY("arch", ARCH),
+    DEVICE_PROPERTY("warp_size", WARP_SIZE),
     {nullptr, nullptr, nullptr, nullptr, nullptr},
 };
 

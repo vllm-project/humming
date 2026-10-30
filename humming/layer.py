@@ -330,7 +330,11 @@ class HummingLayer(torch.nn.Module):
         if self.torch_dtype is None:
             self.torch_dtype = torch.get_default_dtype()
             if self.torch_dtype not in [torch.float16, torch.bfloat16]:
-                self.torch_dtype = torch.bfloat16 if current_device.sm_major >= 8 else torch.float16
+                self.torch_dtype = (
+                    torch.bfloat16
+                    if current_device.is_rocm or current_device.sm_major >= 8
+                    else torch.float16
+                )
         assert self.torch_dtype in [torch.float16, torch.bfloat16], self.torch_dtype
 
         self.input_config = self.input_config or {}

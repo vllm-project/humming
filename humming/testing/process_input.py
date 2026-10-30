@@ -355,6 +355,13 @@ def skip_if_process_input_unsupported(quant_dtype=None, group_scale_dtype=None):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
+    if getattr(torch.version, "hip", None) is not None:
+        # HIP reports gfx950 as capability 9.5; gate on the ROCm dtype set instead.
+        for dtype in (quant_dtype, group_scale_dtype):
+            if dtype is not None and dtypes.DataType.from_any(dtype) in UNDOCUMENTED_FP_DTYPES:
+                pytest.skip(f"{dtype} relies on NVIDIA cubin patching")
+        return
+
     major, minor = torch.cuda.get_device_capability()
     capability = major * 10 + minor
 
