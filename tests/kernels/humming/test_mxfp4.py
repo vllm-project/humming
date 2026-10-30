@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from humming import dtypes
-from humming.config import ComputeConfig, GemmType, LayerConfig
+from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
 from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error
 from humming.schema.compressed_tensors import CompressedTensorsInputSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
@@ -152,6 +152,60 @@ MXFP4_CASES = (
     ),
 )
 
+SMALL_M_GROUPED_FP4_CASES = (
+    (
+        _case(
+            "mxfp4-small-m-grouped-dsv-w13-a16",
+            shape_n=4608,
+            shape_k=5120,
+            gemm_type=GemmType.GROUPED_CONTIGUOUS,
+            num_experts=96,
+            top_k=6,
+            a_dtype=dtypes.bfloat16,
+            input_scale_group_size=0,
+        ),
+        MmaType.MMA,
+        128,
+        4,
+        False,
+        False,
+    ),
+    (
+        _case(
+            "mxfp4-small-m-grouped-dsv-w2-a16",
+            shape_n=5120,
+            shape_k=2304,
+            gemm_type=GemmType.GROUPED_CONTIGUOUS,
+            num_experts=96,
+            top_k=6,
+            a_dtype=dtypes.bfloat16,
+            input_scale_group_size=0,
+        ),
+        MmaType.MMA,
+        256,
+        2,
+        False,
+        False,
+    ),
+    (
+        _case(
+            "mxfp4-small-m-grouped-dsv-w13-a8",
+            shape_n=4608,
+            shape_k=5120,
+            gemm_type=GemmType.GROUPED_CONTIGUOUS,
+            num_experts=96,
+            top_k=6,
+            as_dtype=dtypes.float32,
+            input_scale_group_size=32,
+        ),
+        MmaType.WGMMA,
+        256,
+        2,
+        True,
+        True,
+    ),
+)
+
 
 @pytest.mark.parametrize(
     "expected_fused,test_case",
@@ -173,6 +227,38 @@ def test_mxfp4(expected_fused, test_case):
             result.tuning_values.get("use_packed_k_layout", config.use_packed_k_layout) for result in results
         )
     assert_kernel_test_shape_coverage(results)
+
+
+@pytest.mark.parametrize(
+    ("test_case", "mma_type", "block_n", "num_ctas", "use_tma", "use_warp_spec"),
+    SMALL_M_GROUPED_FP4_CASES,
+    ids=[case.name for case, *_ in SMALL_M_GROUPED_FP4_CASES],
+)
+def test_mxfp4_grouped_small_m_policy(
+    test_case,
+    mma_type,
+    block_n,
+    num_ctas,
+    use_tma,
+    use_warp_spec,
+    monkeypatch,
+):
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    config = test_case.layer_config
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=mma_type.value)
+
+    shape_ms = (128,)
+    results = KernelTestRunner(test_case).run(shape_ms=shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms=shape_ms)
+
+    tuning = results[0].tuning_config
+    assert tuning.mma_type == mma_type
+    assert tuning.block_shape == (8, block_n, 128)
+    assert tuning.warp_shape[0] == 8
+    assert tuning.num_ctas_per_sm == num_ctas
+    assert not tuning.use_stream_k
+    assert tuning.use_tma is use_tma
+    assert tuning.use_warp_spec is use_warp_spec
 
 
 def test_mxfp4_case_coverage():
@@ -234,12 +320,7 @@ def test_fp4_weight_schema_compatibility(
         has_supported_scales = group_size == 32 and bs_dtype == "float8e8m0"
     resolved_bs_dtype = dtypes.DataType.from_str(bs_dtype) if bs_dtype is not None else dtypes.bfloat16
     dtype_error = get_dtype_compatibility_error(activation_dtype, dtypes.bfloat16, resolved_bs_dtype)
-    is_supported = all([
-        has_supported_groups,
-        has_supported_dtype,
-        has_supported_scales,
-        dtype_error is None
-    ])
+    is_supported = all([has_supported_groups, has_supported_dtype, has_supported_scales, dtype_error is None])
     assert inputs.is_compatible_with(weight, torch.bfloat16) == is_supported
 
 
