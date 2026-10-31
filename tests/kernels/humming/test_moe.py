@@ -239,6 +239,31 @@ MOE_CASES = (
         input_scale_group_size=64,
         weight_scale_group_size=64,
     ),
+    _case(
+        # Unpadded K 288 ends in a padded K slab; pad 96 also leaves a whole padded K block.
+        "indexed-fp8-mxfp4-k288-pad32",
+        GemmType.INDEXED,
+        shape_k=320,
+        pad_shape_k=32,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float32,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_token",
+        weight_scale_group_size=32,
+    ),
+    _case(
+        "indexed-fp8-mxfp4-k288-pad96",
+        GemmType.INDEXED,
+        shape_k=384,
+        pad_shape_k=96,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float32,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_token",
+        weight_scale_group_size=32,
+    ),
 ) + tuple(
     # FP8 GS128 x MXFP4 whose unpadded K (576, a TP-split MoE intermediate)
     # ends in a partial input-scale group.

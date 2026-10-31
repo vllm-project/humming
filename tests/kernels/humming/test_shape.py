@@ -262,6 +262,127 @@ def test_shape(test_case):
     assert_kernel_test_shape_coverage(results)
 
 
+FP8_TOKEN_MXFP4 = dict(
+    a_dtype=dtypes.float8e4m3,
+    b_dtype=dtypes.float4e2m1,
+    as_dtype=dtypes.float32,
+    bs_dtype=dtypes.float8e8m0,
+    input_quant_mode="dynamic_token",
+    weight_scale_group_size=32,
+)
+FP8_TOKEN_FP8_CHANNEL = dict(
+    a_dtype=dtypes.float8e4m3,
+    b_dtype=dtypes.float8e4m3,
+    as_dtype=dtypes.float32,
+    bs_dtype=dtypes.bfloat16,
+    input_quant_mode="dynamic_token",
+    weight_scale_group_size=0,
+)
+FUSED_MXFP4_LAYOUT = dict(use_fused_e8m0_scale=True, use_packed_k_layout=False, input_scale_group_size=0)
+FP8_CHANNEL_LAYOUT = dict(
+    use_fused_e8m0_scale=False, use_packed_k_layout=False, input_scale_group_size=0, weight_scale_group_size=0
+)
+
+
+def _padded_k_case(
+    name,
+    unpadded_k,
+    shape_k,
+    block_k,
+    warp_k=64,
+    num_stages=3,
+    layer_values=None,
+    expected_layout=FUSED_MXFP4_LAYOUT,
+    **tuning_values,
+):
+    padding = dict(shape_k=shape_k, pad_shape_k=shape_k - unpadded_k)
+    layer_values = FP8_TOKEN_MXFP4 | (layer_values or {}) | padding
+    tile = dict(block_shape=(64, 128, block_k), warp_shape=(64, 32, warp_k), num_stages=num_stages)
+    return pytest.param(layer_values, tile | tuning_values, expected_layout, id=name)
+
+
+PADDED_K_CASES = (
+    _padded_k_case("whole-padded-block", 288, 384, block_k=64),
+    _padded_k_case("k-split-warpgroups", 288, 384, block_k=128, num_stages=4),
+    _padded_k_case("split-issue-wait", 288, 384, block_k=64, wgmma_split_issue_wait=True),
+    _padded_k_case("single-unpadded-block", 32, 128, block_k=64),
+    _padded_k_case("aligned-unpadded-k", 256, 384, block_k=64),
+    _padded_k_case("last-block-stage-0", 224, 256, block_k=64),
+    _padded_k_case("last-block-last-stage", 160, 192, block_k=64),
+    _padded_k_case(
+        "ss-k-batch",
+        288,
+        512,
+        block_k=256,
+        warp_k=128,
+        layer_values=FP8_TOKEN_FP8_CHANNEL,
+        expected_layout=FP8_CHANNEL_LAYOUT,
+    ),
+    _padded_k_case(
+        "ss-k-batch-split-issue-wait",
+        288,
+        512,
+        block_k=256,
+        warp_k=128,
+        layer_values=FP8_TOKEN_FP8_CHANNEL,
+        expected_layout=FP8_CHANNEL_LAYOUT,
+        wgmma_split_issue_wait=True,
+    ),
+    _padded_k_case(
+        "packed-k",
+        288,
+        512,
+        block_k=256,
+        warp_k=128,
+        layer_values=dict(use_packed_k_layout=True),
+        expected_layout=FUSED_MXFP4_LAYOUT | dict(use_packed_k_layout=True),
+    ),
+    _padded_k_case(
+        "promotion-excluded",
+        288,
+        384,
+        block_k=64,
+        layer_values=dict(
+            input_quant_mode="dynamic_group", input_scale_group_size=128, use_packed_k_layout=False
+        ),
+        expected_layout=FUSED_MXFP4_LAYOUT | dict(input_scale_group_size=128),
+    ),
+    _padded_k_case("stream-k-excluded", 288, 384, block_k=64, num_stages=5, use_stream_k=True),
+    _padded_k_case("warp-spec-excluded", 288, 384, block_k=128, num_stages=4, use_warp_spec=True),
+)
+
+
+@pytest.mark.parametrize("layer_values,tuning_values,expected_layout", PADDED_K_CASES)
+def test_padded_k_slabs(layer_values, tuning_values, expected_layout, monkeypatch):
+    skip_if_unsupported(a_dtype=dtypes.float8e4m3, mma_type="wgmma", use_tma=True)
+    layer = LayerConfig(shape_n=512, c_dtype=dtypes.bfloat16, **layer_values)
+    for name, value in expected_layout.items():
+        assert getattr(layer, name) == value, (name, getattr(layer, name))
+    config = (
+        dict(
+            mma_type="wgmma",
+            num_sms=6,
+            num_ctas_per_sm=1,
+            use_tma=True,
+            use_stream_k=False,
+            use_warp_spec=False,
+        )
+        | tuning_values
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: config)
+    case = KernelTestCase(
+        name="padded-k-slabs",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    # On 6 SMs, M=17 makes stream-K split K mid-tile; M=129 runs full data-parallel waves.
+    shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
 def test_shape_case_coverage():
     problem_configs = {case.name: case.layer_config for case in PROBLEM_SHAPE_CASES}
     minimum = problem_configs["minimum"]

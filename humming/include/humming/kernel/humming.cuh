@@ -100,8 +100,15 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     __syncthreads();
 
     uint32_t &slice_iters = scheduler.slice_iters;
-    constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
+    constexpr bool kSkipPaddedK = [] {
+      if constexpr (Ctx::kUseWgmma) return MMA::should_skip_padded_k();
+      else return false;
+    }();
+    constexpr uint32_t kValidK = ProblemShape::K - PadShape::K;
+    constexpr uint32_t kStaticSliceIters = kSkipPaddedK ? CEIL_DIV(kValidK, BlockShape::K) : ProblemShape::K / BlockShape::K;
+    constexpr bool kHasPartialKBlock = kSkipPaddedK && kValidK % BlockShape::K != 0;
     const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
+    const uint32_t num_loop_iters = num_slice_iters - (kHasPartialKBlock ? 1 : 0);
     producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
     s2r_pipe.seek(scheduler.m_offset);
     if constexpr (Ctx::kUseTmaA) producer.prefetch_stage();
@@ -128,14 +135,19 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     s2r_pipe.template load_stage_iter<true>(0, 0);
     mma.transform_b(0, 0);
 
-    auto consume_stage = [&](uint32_t stage_id, uint32_t slice_iter) {
+    auto consume_stage = [&](uint32_t stage_id, uint32_t slice_iter, auto is_partial_k_block) {
+      constexpr bool kInPartialKBlock = decltype(is_partial_k_block)::value != 0;
+      auto run_mma = [&](uint32_t warp_iter_id) {
+        if constexpr (Ctx::kUseWgmma) mma.template run<kInPartialKBlock>(stage_id, warp_iter_id);
+        else mma.run(stage_id, warp_iter_id);
+      };
       debug_kernel_timeout_check(debug_start_clock);
       const uint32_t remaining_iters = num_slice_iters - slice_iter;
       if (remaining_iters == 1) producer.load_channel();
       PRAGMA_UNROLL
       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
         if constexpr (Ctx::kWgmmaSplitIssueWait) {
-          mma.issue(stage_id, warp_iter_id);
+          mma.template issue<kInPartialKBlock>(stage_id, warp_iter_id);
           if constexpr (Ctx::kWarpIters == 1) {
             // Refill a different stage; the current WGMMA stage stays live until wait.
             __syncthreads();
@@ -160,7 +172,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           }
         } else {
           if constexpr (Ctx::kWarpIters == 1) {
-            mma.run(stage_id, warp_iter_id);
+            run_mma(warp_iter_id);
             __syncthreads();
             if constexpr (kNumStages > 2) {
               producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
@@ -173,11 +185,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
                                                (Ctx::kPreserveASForPromotion || Ctx::kPreserveBSForPromotion);
           if constexpr (kDeferScalePrefetch) {
             s2r_pipe.load_stage_iter_data(stage_id, warp_iter_id + 1);
-            if constexpr (Ctx::kWarpIters > 1) mma.run(stage_id, warp_iter_id);
+            if constexpr (Ctx::kWarpIters > 1) run_mma(warp_iter_id);
             s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
           } else {
             s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
-            if constexpr (Ctx::kWarpIters > 1) mma.run(stage_id, warp_iter_id);
+            if constexpr (Ctx::kWarpIters > 1) run_mma(warp_iter_id);
           }
           if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
             __syncthreads();
@@ -195,18 +207,21 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       }
     };
 
-    const uint32_t num_full_stage_cycles = num_slice_iters / kNumStages;
+    const uint32_t num_full_stage_cycles = num_loop_iters / kNumStages;
     for (uint32_t cycle_id = 0; cycle_id < num_full_stage_cycles; cycle_id++) {
       unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
-        consume_stage(stage_id, cycle_id * kNumStages + stage_id);
+        consume_stage(stage_id, cycle_id * kNumStages + stage_id, CompileTimeConstant<0>{});
       });
     }
-    const uint32_t tail_stage_iters = num_slice_iters % kNumStages;
+    const uint32_t tail_stage_iters = num_loop_iters % kNumStages;
     unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
       if (stage_id < tail_stage_iters) {
-        consume_stage(stage_id, num_full_stage_cycles * kNumStages + stage_id);
+        consume_stage(stage_id, num_full_stage_cycles * kNumStages + stage_id, CompileTimeConstant<0>{});
       }
     });
+    if constexpr (kHasPartialKBlock) {
+      consume_stage((kStaticSliceIters - 1) % kNumStages, kStaticSliceIters - 1, CompileTimeConstant<1>{});
+    }
 
     consumer.wait_channel();
     s2r_pipe.load_channel(scheduler.slice_id);

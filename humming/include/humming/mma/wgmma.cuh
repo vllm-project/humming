@@ -30,6 +30,8 @@ public:
   using ElementA = typename Ctx::ElementA;
   using ElementQB = typename Ctx::ElementQB;
   using ElementB = typename Ctx::ElementB;
+  using ProblemShape = typename Ctx::ProblemShape;
+  using PadShape = typename Ctx::PadShape;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::N][WarpShape::M / MmaShape::M];
 
@@ -46,6 +48,7 @@ public:
   static constexpr uint32_t kWarpIters = Ctx::kWarpIters;
   static constexpr uint32_t kNumKSlabs = WarpShape::K / kPartMmaShapeK;
   static constexpr uint32_t kRegsBKDim = kUsePackedKLayout ? kNumKSlabs : (kPartMmaShapeK / MmaShape::K);
+  static constexpr uint32_t kLastKBlockValidK = (ProblemShape::K - PadShape::K - 1) % BlockShape::K + 1;
 
   Ctx &ctx;
   ArithClass &arith;
@@ -122,8 +125,8 @@ public:
     }
   };
 
-  CUDA_INLINE
-  void issue(uint32_t stage_id, uint32_t iter_id) {
+  template <bool kInPartialKBlock = false>
+  CUDA_INLINE void issue(uint32_t stage_id, uint32_t iter_id) {
     static_assert(WarpShape::M == MmaShape::M);
     static_assert(kPartMmaShapeK == MmaShape::K);
     uint32_t buffer_id = iter_id % 2;
@@ -137,6 +140,11 @@ public:
 
     uint32_t delta_m = kUsePackedKLayout ? iter_id : 0;
     uint32_t delta_j = final_regs_c_index() == 0 ? delta_m : 0;
+
+    if constexpr (kInPartialKBlock) {
+      const uint32_t first_k_slab = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? 0 : (iter_id % kItersPerHalf) * kPackedKFactor;
+      if (ctx.k_warp_offset() + first_k_slab * kPartMmaShapeK >= kLastKBlockValidK) return;
+    }
 
     fence_accumulators(delta_j);
     wgmma_fence();
@@ -211,8 +219,9 @@ public:
     }
   };
 
+  template <bool kInPartialKBlock = false>
   CUDA_INLINE void run(uint32_t stage_id, uint32_t iter_id) {
-    issue(stage_id, iter_id);
+    issue<kInPartialKBlock>(stage_id, iter_id);
     wait_and_promote(stage_id, iter_id);
   }
 
@@ -249,6 +258,12 @@ public:
     if constexpr (ElementA::kBits < 16 && Ctx::kInputScaleGroupSize > 0) return 1;
     if constexpr (ElementA::kBits < 16 && !kUseFusedE8m0Scale && (Ctx::kIsGroupWeightScale || Ctx::kIsBlockWeightScale)) return 1;
     return 0;
+  };
+
+  // Padded K adds nothing while padded weights are finite. Promoting kernels still need the padded
+  // slabs: a scale group's first slab resets the partial accumulator.
+  static constexpr bool should_skip_padded_k() {
+    return PadShape::K > 0 && final_regs_c_index() == 0 && !Ctx::kUseStreamK && !Ctx::kUseWarpSpec;
   };
 
   template <class T = uint32_t>
