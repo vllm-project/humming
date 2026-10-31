@@ -5,7 +5,7 @@ from typing import Literal
 import numpy as np
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType, TuningConfig
+from humming.config import GemmType, InputQuantizationMode, LayerConfig, MmaType, TuningConfig
 from humming.config.mma import get_default_mma_type
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
@@ -269,6 +269,18 @@ def get_sm90_specialized_config(
             return config | {"use_stream_k": False}
         return config
 
+    indexed_token_config = get_short_k_indexed_token_config(
+        layer_config,
+        shape_m,
+        gemm_type,
+        use_f16_accum,
+        use_batch_invariant,
+        is_h20=is_h20,
+        use_m_major_input_scale=use_m_major_input_scale,
+        expert_probability_cv=expert_probability_cv,
+    )
+    if indexed_token_config is not None:
+        return indexed_token_config
     compact_config = get_compact_scaled_moe_config(
         layer_config,
         shape_m,
@@ -343,6 +355,56 @@ def get_sm90_specialized_config(
     if packed_config is not None:
         return finalize_config(packed_config)
     return finalize_config(scaled_config)
+
+
+def get_short_k_indexed_token_config(
+    layer_config: LayerConfig,
+    shape_m: int,
+    gemm_type: GemmType,
+    use_f16_accum: bool,
+    use_batch_invariant: bool,
+    *,
+    is_h20: bool = False,
+    use_m_major_input_scale: bool = False,
+    expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
+) -> dict | None:
+    layer = layer_config
+    is_indexed_fp32 = gemm_type == GemmType.INDEXED and not use_f16_accum
+    is_decode_grid = 0 < shape_m <= min(768, 2 * layer.num_experts)
+    if is_h20 or use_batch_invariant or not (is_indexed_fp32 and is_decode_grid):
+        return None
+    has_token_fp8 = layer.a_dtype == dtypes.float8e4m3 and layer.as_dtype == dtypes.float32
+    has_token_fp8 &= layer.input_quant_mode == InputQuantizationMode.DynamicToken
+    has_token_fp8 &= layer.input_scale_group_size == 0 and not use_m_major_input_scale
+    has_mxfp4 = layer.b_dtype == dtypes.float4e2m1 and layer.bs_dtype == dtypes.float8e8m0
+    has_mxfp4 &= layer.weight_scale_group_size == 32 and layer.use_fused_e8m0_scale
+    has_plain_output = layer.c_dtype == dtypes.bfloat16 and not layer.has_bias and not layer.has_zero_point
+    has_short_aligned_k = 128 <= layer.shape_k <= 512 and layer.shape_k % 128 == 0
+    if not (has_token_fp8 and has_mxfp4 and has_plain_output and has_short_aligned_k):
+        return None
+    if layer.use_packed_k_layout or layer.shape_n % 256 or layer.pad_shape_n:
+        return None
+    if get_problem_rejection_reasons(layer, MmaType.WGMMA):
+        return None
+    counts = DeviceHeuristics.get_expert_rows(layer, shape_m, gemm_type, expert_probability_cv)
+    num_output_tiles = ((counts + 7) // 8).sum(axis=1).mean() * (layer.shape_n // 256)
+    if num_output_tiles < 2 * current_device.sm_count:
+        return None
+    # Enough independent tiles exist to fill two CTAs per SM without splitting
+    # a reduction that has only one to four K iterations.
+    config = {
+        "mma_type": MmaType.WGMMA.value,
+        "block_shape": (8, 256, 128),
+        "warp_shape": (8, 32, 128),
+        "num_stages": 4,
+        "num_ctas_per_sm": 2,
+        "use_stream_k": False,
+        "use_tma": False,
+        "use_warp_spec": False,
+        "smem_reuse_mode": "all_stages",
+    }
+    fitted = fit_sm90_tile(layer, config, gemm_type=gemm_type)
+    return fitted if fitted == config else None
 
 
 def get_compact_scaled_moe_config(

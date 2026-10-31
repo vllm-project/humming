@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -9,6 +10,7 @@ from humming.device import DeviceInfo
 from humming.tune import _get_heuristics_config
 from humming.tune.sm90 import Sm90Heuristics
 from humming.tune.sm90_h20 import Sm90H20Heuristics
+from humming.tune.sm90_policies import get_short_k_indexed_token_config
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +44,49 @@ def _layer(
         weight_scale_group_size=weight_scale_group_size,
         use_packed_k_layout=use_packed_k_layout,
     )
+
+
+@pytest.mark.parametrize("shape_m", [48, 192, 384, 768])
+def test_short_k_indexed_token_schedule_and_ranges(shape_m):
+    layer = replace(_layer(5120, 384, num_experts=384, input_scale_group_size=0), pad_shape_k=64)
+    config = Sm90Heuristics.get_config(layer, shape_m, gemm_type=GemmType.INDEXED)
+    assert config["block_shape"] == (8, 256, 128)
+    assert config["num_ctas_per_sm"] == 2
+    assert not config["use_stream_k"]
+    ranges = Sm90Heuristics.get_configs(layer, gemm_type=GemmType.INDEXED)
+    selected = next(values for lower, upper, values in ranges if lower < shape_m <= upper)
+    assert selected == config
+
+
+@pytest.mark.parametrize(
+    ("layer_changes", "call_changes"),
+    [
+        ({}, {"shape_m": 1}),
+        ({}, {"shape_m": 769}),
+        ({"num_experts": 8}, {"shape_m": 48}),
+        ({}, {"is_h20": True}),
+        ({}, {"use_f16_accum": True}),
+        ({}, {"use_batch_invariant": True}),
+        ({}, {"use_m_major_input_scale": True}),
+        ({}, {"gemm_type": GemmType.GROUPED_CONTIGUOUS}),
+        ({}, {"gemm_type": GemmType.GROUPED_MASKED}),
+        ({"num_experts": 0}, {"gemm_type": GemmType.DENSE}),
+        ({"shape_k": 640}, {}),
+        ({"shape_n": 4992}, {}),
+        ({"pad_shape_n": 64}, {}),
+        ({"use_packed_k_layout": True}, {}),
+        ({"use_fused_e8m0_scale": False}, {}),
+        ({"input_scale_group_size": 128, "input_quant_mode": "dynamic_group"}, {}),
+        ({"c_dtype": dtypes.float16}, {}),
+        ({"has_bias": True}, {}),
+    ],
+)
+def test_short_k_indexed_token_schedule_falls_back(layer_changes, call_changes):
+    layer = _layer(5120, 384, num_experts=384, input_scale_group_size=0)
+    layer = replace(layer, **layer_changes)
+    arguments = dict(shape_m=48, gemm_type=GemmType.INDEXED, use_f16_accum=False, use_batch_invariant=False)
+    arguments.update(call_changes)
+    assert get_short_k_indexed_token_config(layer, **arguments) is None
 
 
 @pytest.mark.parametrize(
