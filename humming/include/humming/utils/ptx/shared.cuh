@@ -1,11 +1,16 @@
 #pragma once
 
 #include <humming/utils/base.cuh>
+#include <humming/utils/ptx/volta.cuh>
 
 template <int count>
 CUDA_INLINE void ld_shared(const int4 *smem_ptr, int4 *regs_ptr) {
   uint32_t *a = reinterpret_cast<uint32_t *>(regs_ptr);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  volta_ldmatrix<count>(smem, a);
+  return;
+#endif
   if constexpr (count == 4) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
@@ -27,6 +32,10 @@ template <int kSourceBits, int count>
 CUDA_INLINE void ld_shared_dequant(uint32_t smem, uint32_t *a) {
   static_assert(kSourceBits == 2 || kSourceBits == 4);
   static_assert(count == 2 || count == 4);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+  volta_ldmatrix_trans<count>(smem, a);
+  return;
+#endif
 #if defined(HUMMING_USE_NATIVE_LDMATRIX_DEQUANT) && HUMMING_USE_NATIVE_LDMATRIX_DEQUANT
   if constexpr (kSourceBits == 4) {
     if constexpr (count == 4) {

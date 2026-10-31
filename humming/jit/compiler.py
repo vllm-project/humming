@@ -36,6 +36,13 @@ class Compiler:
         raise NotImplementedError
 
     @staticmethod
+    def register_usage_flags(sm_version):
+        # On sm_70 this option turned a heavily spilling kernel into an illegal shared-memory read.
+        if str(sm_version).startswith("70"):
+            return []
+        return ["--ptxas-options=--register-usage-level=10"]
+
+    @staticmethod
     def humming_include_dir():
         dirname = os.path.dirname(__file__)
         dirname = os.path.abspath(dirname + "/../include/")
@@ -199,7 +206,7 @@ class NVRTCCompiler(Compiler):
             "--dopt=on",
             "-extra-device-vectorization",
             "--ptxas-options=-O3",
-            "--ptxas-options=--register-usage-level=10",
+            *cls.register_usage_flags(sm_version),
             "--diag-suppress=39,161,174,177,940,1444",
             "-default-device",
         ]
@@ -284,7 +291,7 @@ class NVCCCompiler(Compiler):
         flags = [
             "-std=c++17",
             *cls.debug_kernel_flags(),
-            "--ptxas-options=--register-usage-level=10",
+            *cls.register_usage_flags(sm_version),
             "--use_fast_math",
             "--diag-suppress=39,161,174,177,940,1444",
             *[f"-I{d}" for d in cls.include_dirs()],

@@ -172,6 +172,39 @@ public:
     if constexpr (ElementA::kBits == 16 && (kIsGroupWeightScale || kIsBlockWeightScale || kIsFpZeroPoint)) {
 
       scalar_t2 *b_f16_ptr = reinterpret_cast<scalar_t2 *>(regs_b);
+#if HUMMING_VOLTA
+      if constexpr (Ctx::kVoltaPrefill) {
+        // Volta prompts: words 0-3 are column j (tile 2i), words 4-7 column 8+j (tile 2i+1); lane 4j holds both scales.
+        static_assert(kIsGroupWeightScale && !kIsBlockWeightScale && !kIsFpZeroPoint && ElementBS::kBits != 8,
+            "Volta prompt path: fp16 group scales only");
+        const VoltaLane vl = volta_lane();
+        uint32_t scale_word = __shfl_sync(0xffffffff, bs[buffer_id][j], vl.j * 4);
+        PRAGMA_UNROLL
+        for (uint32_t h = 0; h < 2; h++) {
+          uint32_t scale_half = (scale_word >> (h * 16)) & 0xffffu;
+          uint32_t scale_pair = scale_half | (scale_half << 16);
+          scalar_t2 scale2 = *reinterpret_cast<scalar_t2 *>(&scale_pair);
+          PRAGMA_UNROLL
+          for (uint32_t w = 0; w < 4; w++)
+            b_f16_ptr[h * 4 + w] = __hmul2(b_f16_ptr[h * 4 + w], scale2);
+        }
+        return;
+      }
+      if constexpr (Ctx::kVoltaDecode) {
+        // Volta decode: all four words are column 8nh + j; its scale sits in lane 4j's word for this group.
+        static_assert(kIsGroupWeightScale && !kIsBlockWeightScale && ElementBS::kBits != 8,
+            "Volta decode path: fp16 group scales only");
+        const VoltaLane vl = volta_lane();
+        uint32_t scale_word = __shfl_sync(0xffffffff, bs[buffer_id][j], vl.j * 4);
+        uint32_t scale_half = (scale_word >> (vl.nh * 16)) & 0xffffu;
+        uint32_t scale_pair = scale_half | (scale_half << 16);
+        scalar_t2 scale2 = *reinterpret_cast<scalar_t2 *>(&scale_pair);
+        PRAGMA_UNROLL
+        for (uint32_t w = 0; w < 4; w++)
+          b_f16_ptr[w] = __hmul2(b_f16_ptr[w], scale2);
+        return;
+      }
+#endif
       scalar_t2 bs_f16_ptr[2];
       scalar_t2 bzp_f16_ptr[2];
 
