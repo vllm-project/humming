@@ -129,7 +129,7 @@ def popen_and_reap(cmd, **kwargs):
 
 
 def hash_to_hex(s: str) -> str:
-    md5 = hashlib.md5()
+    md5 = hashlib.md5(usedforsecurity=False)
     md5.update(s.encode("utf-8"))
     return md5.hexdigest()
 
