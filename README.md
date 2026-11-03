@@ -75,26 +75,7 @@ pip install git+https://github.com/vllm-project/humming.git
 ```
 
 
-### Using Humming in vLLM
-
-Starting with vLLM 0.29.0, CUDA builds of vLLM include Humming, so you don't need to install it separately. Select it as the dense and/or MoE backend:
-
-```bash
-vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-    --tensor-parallel-size 8 \
-    --linear-backend humming --moe-backend humming
-```
-
-Override the activation type (for example, run MXFP4 MoE weights with MXFP8 activations):
-
-```bash
-vllm serve openai/gpt-oss-20b --moe-backend humming --quantization-config.moe.activation mxfp8
-```
-
-`--quantization humming` is a compatibility path for formats vLLM does not support natively, such as GPTQ INT3.
-
-
-### Standalone Usage Example
+### Usage Example
 
 
 ```python
