@@ -199,13 +199,26 @@ class Sm90Heuristics(Sm80Heuristics):
         is_tile_aligned = layer_config.shape_n % 128 == 0 and layer_config.shape_k % 64 == 0
         can_use_small_mma = gemm_type == GemmType.DENSE and not use_f16_accum and not use_batch_invariant
         if is_wna16 and has_short_reduction and is_tile_aligned and can_use_small_mma:
-            # A short reduction cannot amortize a producer warpgroup or Stream-K
-            # fixups. Two K warps let MMA dequantize while keeping the M tile small.
+            # A short reduction cannot amortize a producer warpgroup or Stream-K fixups.
             block_m = 8 if shape_m <= 8 else 16
+            has_supported_activation = layer_config.a_dtype in (dtypes.float16, dtypes.bfloat16)
+            has_matching_output = layer_config.c_dtype == layer_config.a_dtype
+            has_four_bit_integer_weight = layer_config.b_dtype.num_bits == 4
+            has_four_bit_integer_weight &= layer_config.b_dtype.is_integer_type
+            has_profitable_k_tile = layer_config.shape_k >= 512 and layer_config.shape_k % 128 == 0
+            use_wide_k_tile = (
+                has_supported_activation
+                and has_matching_output
+                and has_four_bit_integer_weight
+                and has_profitable_k_tile
+            )
+            # Wider K stages halve the short mainloop iteration count without reducing N parallelism.
+            block_k = 128 if use_wide_k_tile else 64
+            warp_k = 64 if use_wide_k_tile else 32
             return {
                 "mma_type": MmaType.MMA.value,
-                "block_shape": (block_m, 128, 64),
-                "warp_shape": (block_m, 32, 32),
+                "block_shape": (block_m, 128, block_k),
+                "warp_shape": (block_m, 32, warp_k),
                 "num_stages": 4,
                 "num_ctas_per_sm": 1,
                 "use_stream_k": False,

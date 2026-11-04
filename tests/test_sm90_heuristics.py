@@ -22,6 +22,8 @@ def _layer(
     *,
     num_experts: int = 12,
     a_dtype=dtypes.float8e4m3,
+    b_dtype=dtypes.float4e2m1,
+    c_dtype=dtypes.bfloat16,
     as_dtype=dtypes.float32,
     bs_dtype=dtypes.float8e8m0,
     input_scale_group_size: int = 128,
@@ -34,13 +36,35 @@ def _layer(
         shape_k=shape_k,
         num_experts=num_experts,
         a_dtype=a_dtype,
-        b_dtype=dtypes.float4e2m1,
-        c_dtype=dtypes.bfloat16,
+        b_dtype=b_dtype,
+        c_dtype=c_dtype,
         as_dtype=as_dtype,
         bs_dtype=bs_dtype,
         input_scale_group_size=input_scale_group_size,
         weight_scale_group_size=weight_scale_group_size,
         use_packed_k_layout=use_packed_k_layout,
+    )
+
+
+def _dense_short_k_layer(
+    shape_n: int,
+    shape_k: int,
+    a_dtype=dtypes.bfloat16,
+    b_dtype=dtypes.int4,
+    c_dtype=None,
+) -> LayerConfig:
+    c_dtype = c_dtype or a_dtype
+    return _layer(
+        shape_n,
+        shape_k,
+        num_experts=0,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        as_dtype=None,
+        bs_dtype=a_dtype,
+        c_dtype=c_dtype,
+        input_scale_group_size=0,
+        weight_scale_group_size=128,
     )
 
 
@@ -257,6 +281,106 @@ def test_short_k_does_not_leave_warp_k_larger_than_block_k():
 
     assert config["block_shape"][2] == 64
     assert config["warp_shape"][2] == 64
+
+
+@pytest.mark.parametrize(
+    "a_dtype",
+    [dtypes.float16, dtypes.bfloat16],
+)
+@pytest.mark.parametrize(
+    ("shape_n", "shape_k", "shape_m", "block_m"),
+    [
+        (512, 512, 1, 8),
+        (2048, 640, 16, 16),
+        (8192, 768, 8, 8),
+        (14336, 1024, 32, 16),
+    ],
+)
+def test_dense_w4a16_short_k_uses_wide_k_tile(a_dtype, shape_n, shape_k, shape_m, block_m):
+    layer = _dense_short_k_layer(shape_n, shape_k, a_dtype=a_dtype)
+
+    config = Sm90Heuristics.get_config(
+        layer,
+        shape_m=shape_m,
+        gemm_type=GemmType.DENSE,
+    )
+
+    assert config["mma_type"] == "mma"
+    assert config["block_shape"] == (block_m, 128, 128)
+    assert config["warp_shape"] == (block_m, 32, 64)
+    tuning_values = {key: value for key, value in config.items() if key in TuningConfig.get_field_names()}
+    tuning = TuningConfig(**tuning_values)
+    assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
+
+
+@pytest.mark.parametrize(
+    ("shape_n", "shape_k"),
+    [
+        (512, 128),
+        (4096, 256),
+        (4096, 384),
+        (8192, 448),
+    ],
+)
+def test_dense_w4a16_short_k_keeps_compact_tile_at_regressions(shape_n, shape_k):
+    layer = _dense_short_k_layer(shape_n, shape_k)
+
+    config = Sm90Heuristics.get_config(
+        layer,
+        shape_m=8,
+        gemm_type=GemmType.DENSE,
+    )
+
+    assert config["block_shape"][2] == 64
+    assert config["warp_shape"][2] == 32
+
+
+def test_dense_w6a16_short_k_keeps_compact_tile():
+    layer = _dense_short_k_layer(8192, 1024, b_dtype=dtypes.uint6)
+
+    config = Sm90Heuristics.get_config(
+        layer,
+        shape_m=16,
+        gemm_type=GemmType.DENSE,
+    )
+
+    assert config["block_shape"][2] == 64
+    assert config["warp_shape"][2] == 32
+
+
+def test_dense_w4a16_short_k_requires_matching_output_dtype():
+    layer = _dense_short_k_layer(
+        4096,
+        512,
+        a_dtype=dtypes.float16,
+        c_dtype=dtypes.bfloat16,
+    )
+
+    config = Sm90Heuristics.get_config(
+        layer,
+        shape_m=16,
+        gemm_type=GemmType.DENSE,
+    )
+
+    assert config["block_shape"][2] == 64
+    assert config["warp_shape"][2] == 32
+
+
+def test_dense_fp4_short_k_keeps_compact_tile():
+    layer = _dense_short_k_layer(
+        8192,
+        1024,
+        b_dtype=dtypes.float4e2m1,
+    )
+
+    config = Sm90Heuristics.get_config(
+        layer,
+        shape_m=16,
+        gemm_type=GemmType.DENSE,
+    )
+
+    assert config["block_shape"][2] == 64
+    assert config["warp_shape"][2] == 32
 
 
 @pytest.mark.parametrize(
