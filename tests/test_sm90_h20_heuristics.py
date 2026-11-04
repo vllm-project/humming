@@ -32,7 +32,7 @@ def _mxfp4_layer(shape_n: int, shape_k: int, a_dtype=dtypes.bfloat16) -> LayerCo
         num_experts=96,
         a_dtype=a_dtype,
         b_dtype=dtypes.float4e2m1,
-        c_dtype=dtypes.bfloat16,
+        c_dtype=a_dtype if a_dtype.num_bits == 16 else dtypes.bfloat16,
         bs_dtype=dtypes.float8e8m0,
         weight_scale_group_size=32,
         sm_version=90,
