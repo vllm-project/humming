@@ -519,7 +519,7 @@ def test_umma_architecture_selection(sm_version, a_dtype, b_dtype, small_m_backe
         shape_k=256,
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        c_dtype=dtypes.bfloat16,
+        c_dtype=a_dtype if a_dtype.num_bits == 16 else dtypes.bfloat16,
         **scale_config,
     )
     expected = MmaType.MMA if a_dtype == dtypes.int8 and sm_version in (103, 107) else MmaType.UMMA
