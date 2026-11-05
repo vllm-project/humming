@@ -24,6 +24,38 @@ WEIGHT_GROUP_SIZE = 32
 NUM_EXPERTS = 8
 
 
+@pytest.mark.parametrize("shape_k", [256, 384, 512])
+def test_sm90_short_k_indexed_token_schedule(shape_k, monkeypatch):
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    layer = LayerConfig(
+        sm_version=90,
+        shape_n=4096,
+        shape_k=shape_k,
+        num_experts=64,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        c_dtype=dtypes.bfloat16,
+        as_dtype=dtypes.float32,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_token",
+        input_scale_group_size=0,
+        weight_scale_group_size=32,
+    )
+    case = KernelTestCase(
+        name="sm90-short-k-indexed-token",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.INDEXED),
+        top_k=1,
+        seed=3131,
+    )
+    skip_if_unsupported(a_dtype=layer.a_dtype, mma_type="wgmma")
+    results = KernelTestRunner(case).run((48, 96))
+    assert_kernel_test_shape_coverage(results, (48, 96))
+    for result in results:
+        assert result.tuning_values["num_ctas_per_sm"] == 2
+        assert not result.tuning_values["use_stream_k"]
+
+
 def _layer_config(
     *,
     shape_n: int = SHAPE_N,
