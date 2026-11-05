@@ -55,6 +55,16 @@ def _find_nvrtc_lib_dir():
 _cached_binary_path = None
 
 
+def _get_nvrtc_compile_source_path():
+    return (Path(__file__).parents[1] / "csrc" / "nvrtc_compile.cpp").resolve()
+
+
+def _get_precompiled_nvrtc_compile_binary_path():
+    source_path = _get_nvrtc_compile_source_path()
+    binary_name = jit_utils.get_native_artifact_name("nvrtc_compile")
+    return jit_utils.get_precompiled_artifact_path(source_path, binary_name)
+
+
 def get_nvrtc_library_path():
     _, lib_path, _ = _find_nvrtc_lib_dir()
     if lib_path is None:
@@ -99,8 +109,7 @@ def may_build_nvrtc_compile_binary():
     if _cached_binary_path is not None:
         return _cached_binary_path
 
-    src_path = os.path.join(os.path.dirname(__file__), "..", "csrc", "nvrtc_compile.cpp")
-    src_path = os.path.abspath(src_path)
+    src_path = _get_nvrtc_compile_source_path().as_posix()
     lib_dir, lib_path, cuda_env = _find_nvrtc_lib_dir()
     if lib_dir is None:
         raise RuntimeError("Could not locate the NVRTC library in CUDA path")
@@ -146,6 +155,9 @@ def may_build_nvrtc_compile_binary():
 def build_nvrtc_compile_binary_in_bg():
     if os.getenv("HUMMING_DISABLE_PARALLEL_BUILD", "0") == "1":
         return None
+    if _get_precompiled_nvrtc_compile_binary_path() is not None:
+        return None
+
     cmd = "import humming.utils.nvrtc; humming.utils.nvrtc.may_build_nvrtc_compile_binary()"
     env = os.environ.copy()
     env["HUMMING_DISABLE_PARALLEL_BUILD"] = "1"

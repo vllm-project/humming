@@ -265,6 +265,13 @@ def init_humming_launcher():
 def build_humming_launcher_in_bg():
     if os.getenv("HUMMING_DISABLE_PARALLEL_BUILD", "0") == "1":
         return None
+    use_torch_stable_api = _resolve_use_torch_stable_api()
+    has_usable_precompiled_launcher = (
+        use_torch_stable_api and _get_precompiled_launcher_path() is not None
+    )
+    if has_usable_precompiled_launcher:
+        return None
+
     cmd = "import humming.ops.utils; humming.ops.utils.init_humming_launcher()"
     env = os.environ.copy()
     env["HUMMING_DISABLE_PARALLEL_BUILD"] = "1"

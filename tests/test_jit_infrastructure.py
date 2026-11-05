@@ -433,6 +433,78 @@ def test_precompiled_native_helpers(tmp_path):
     assert cubin.get_cubin_kernel_names(output) == ["smoke"]
 
 
+def test_background_launcher_build_skips_usable_precompiled_artifact(monkeypatch):
+    from humming.ops import utils
+
+    monkeypatch.setenv("HUMMING_DISABLE_PARALLEL_BUILD", "0")
+    monkeypatch.setattr(utils, "_resolve_use_torch_stable_api", lambda: True)
+    monkeypatch.setattr(utils, "_get_precompiled_launcher_path", lambda: Path("launcher.so"))
+
+    def fail_if_spawned(*args, **kwargs):
+        raise AssertionError("a usable precompiled launcher should skip the helper")
+
+    monkeypatch.setattr(jit_utils, "popen_and_reap", fail_if_spawned)
+
+    assert utils.build_humming_launcher_in_bg() is None
+
+
+def test_background_launcher_build_spawns_without_usable_precompiled_artifact(monkeypatch):
+    from humming.ops import utils
+
+    monkeypatch.setenv("HUMMING_DISABLE_PARALLEL_BUILD", "0")
+    monkeypatch.setattr(utils, "_resolve_use_torch_stable_api", lambda: True)
+    monkeypatch.setattr(utils, "_get_precompiled_launcher_path", lambda: None)
+    spawned = []
+    monkeypatch.setattr(jit_utils, "popen_and_reap", lambda *args, **kwargs: spawned.append(args))
+
+    utils.build_humming_launcher_in_bg()
+
+    assert len(spawned) == 1
+
+
+def test_background_launcher_build_spawns_when_stable_api_is_disabled(monkeypatch):
+    from humming.ops import utils
+
+    monkeypatch.setenv("HUMMING_DISABLE_PARALLEL_BUILD", "0")
+    monkeypatch.setattr(utils, "_resolve_use_torch_stable_api", lambda: False)
+    monkeypatch.setattr(utils, "_get_precompiled_launcher_path", lambda: Path("launcher.so"))
+    spawned = []
+    monkeypatch.setattr(jit_utils, "popen_and_reap", lambda *args, **kwargs: spawned.append(args))
+
+    utils.build_humming_launcher_in_bg()
+
+    assert len(spawned) == 1
+
+
+def test_background_nvrtc_build_skips_usable_precompiled_artifact(monkeypatch):
+    from humming.utils import nvrtc
+
+    monkeypatch.setenv("HUMMING_DISABLE_PARALLEL_BUILD", "0")
+    monkeypatch.setattr(
+        nvrtc, "_get_precompiled_nvrtc_compile_binary_path", lambda: Path("nvrtc_compile")
+    )
+
+    def fail_if_spawned(*args, **kwargs):
+        raise AssertionError("a usable precompiled NVRTC helper should skip the child process")
+
+    monkeypatch.setattr(jit_utils, "popen_and_reap", fail_if_spawned)
+
+    assert nvrtc.build_nvrtc_compile_binary_in_bg() is None
+
+
+def test_background_nvrtc_build_spawns_without_usable_precompiled_artifact(monkeypatch):
+    from humming.utils import nvrtc
+
+    monkeypatch.setenv("HUMMING_DISABLE_PARALLEL_BUILD", "0")
+    monkeypatch.setattr(nvrtc, "_get_precompiled_nvrtc_compile_binary_path", lambda: None)
+    spawned = []
+    monkeypatch.setattr(jit_utils, "popen_and_reap", lambda *args, **kwargs: spawned.append(args))
+
+    nvrtc.build_nvrtc_compile_binary_in_bg()
+
+    assert len(spawned) == 1
+
+
 @pytest.mark.skipif(not jit_utils.IS_WINDOWS, reason="requires Windows DLL loading")
 @pytest.mark.parametrize("unicode_library_path", (False, True))
 @pytest.mark.parametrize("emit_ptx", (False, True))
