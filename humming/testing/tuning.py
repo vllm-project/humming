@@ -77,7 +77,7 @@ def _is_legal_mma_type(layer_config, compute_config, mma_type):
         if sm_version != 90 or layer_config.a_dtype == dtypes.int4:
             return False
     min_sm = {
-        dtypes.float16: 75,
+        dtypes.float16: 70,
         dtypes.bfloat16: 80,
         dtypes.int8: 75,
         dtypes.int4: 75,

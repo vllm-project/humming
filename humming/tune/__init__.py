@@ -16,6 +16,7 @@ from humming.tune.sm8x import (
     Sm87Heuristics,
     Sm89Heuristics,
 )
+from humming.tune.sm70 import Sm70Heuristics
 from humming.tune.sm75 import Sm75Heuristics
 from humming.tune.sm90 import Sm90Heuristics
 from humming.tune.sm90_h20 import Sm90H20Heuristics
@@ -24,6 +25,7 @@ from humming.tune.sm120 import Sm120Heuristics
 from humming.tune.sm121 import Sm121Heuristics
 
 heuristics_map: dict[int, type[DeviceHeuristics]] = {
+    70: Sm70Heuristics,
     75: Sm75Heuristics,
     80: Sm80Heuristics,
     86: Sm86Heuristics,
