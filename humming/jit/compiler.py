@@ -202,6 +202,9 @@ class NVRTCCompiler(Compiler):
             "--ptxas-options=--register-usage-level=10",
             "--diag-suppress=39,161,174,177,940,1444",
             "-default-device",
+            # libcu++ uses 16 under NVRTC but 10 under nvcc; the larger limit adds
+            # ~0.4 s of type_list.h preprocessing to every kernel.
+            "-D_CCCL_META_UNROLL_LIMIT=10",
         ]
         if cls._get_version() >= (12, 9):
             # Humming caches CUBINs; avoid driver initialization for NVRTC's cache in each subprocess.
