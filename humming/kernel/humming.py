@@ -327,8 +327,12 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.mma_type == MmaType.MMA and self.warp_shape[0] % 16 == 8:
             mma_shape_m = 8
 
+        uses_half_m_float = not current_device.is_ppu and self.a_dtype in (dtypes.float16, dtypes.bfloat16)
         if self.mma_type == MmaType.MMA and mma_shape_m == 8:
-            mma_shape_k = mma_shape_k // 2
+            if uses_half_m_float:
+                mma_shape_n = 16
+            else:
+                mma_shape_k = mma_shape_k // 2
 
         if self.mma_type == MmaType.WGMMA:
             assert self.warp_shape[0] % mma_shape_m == 0

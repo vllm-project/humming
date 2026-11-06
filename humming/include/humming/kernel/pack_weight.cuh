@@ -58,8 +58,8 @@ __global__ void pack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, in
 
   PRAGMA_UNROLL_COUNT(32)
   for (uint32_t i = 0; i < iters; i++) {
-    uint32_t in_offset = blockIdx.x * (iters * 32 * 32) + i * 32 * 32 + threadIdx.x * 32;
-    uint32_t out_offset = blockIdx.x * (iters * 32 * kNumBits) + i * 32 * kNumBits + threadIdx.x * kNumBits;
+    size_t in_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * 32) + i * 32 * 32 + threadIdx.x * 32;
+    size_t out_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * kNumBits) + i * 32 * kNumBits + threadIdx.x * kNumBits;
 
     PRAGMA_UNROLL_COUNT(32)
     for (uint32_t i = 0; i < 32; i++) {
@@ -85,8 +85,8 @@ __global__ void unpack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, 
 
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < iters; i++) {
-    uint32_t in_offset = blockIdx.x * (iters * 32 * kNumBits) + i * 32 * kNumBits + threadIdx.x * kNumBits;
-    uint32_t out_offset = blockIdx.x * (iters * 32 * 32) + i * 32 * 32 + threadIdx.x * 32;
+    size_t in_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * kNumBits) + i * 32 * kNumBits + threadIdx.x * kNumBits;
+    size_t out_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * 32) + i * 32 * 32 + threadIdx.x * 32;
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kNumBits; i++) {

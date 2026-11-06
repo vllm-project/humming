@@ -105,13 +105,7 @@ class Fp8WeightSchema(BaseWeightSchema):
         weight_scale = tensors[self.weight_scale_key]
 
         if self.weight_block_size is None:
-            weight_scale = self._may_process_global_scale(
-                weight_scale,
-                shape_n_stacks=shape_n_stacks,
-                shape_k_stacks=shape_k_stacks,
-                num_experts=num_experts,
-                force_repeat=True,
-            ).to(param_dtype)
+            schema = self.to_humming_schema(param_dtype)
         else:
             shape_n = sum(shape_n_stacks)
             scale_block_shape_n = self.weight_block_size[0]
@@ -124,6 +118,10 @@ class Fp8WeightSchema(BaseWeightSchema):
         if "bias" in tensors:
             output_tensors["bias"] = tensors["bias"]
 
+        if self.weight_block_size is None:
+            return schema._convert_humming(
+                output_tensors, shape_n_stacks, shape_k_stacks, param_dtype, num_experts
+            )
         return schema, output_tensors
 
 

@@ -9,7 +9,7 @@ from types import ModuleType
 from filelock import FileLock
 
 import humming.utils.jit as jit_utils
-from humming.utils.cuda import find_all_cuda_paths
+from humming.utils.cuda import find_all_cuda_paths, get_cuda_library_path
 
 _extension: ModuleType | None = None
 
@@ -31,12 +31,31 @@ def _get_cuda_include_paths() -> list[str]:
 
 def build_device_info_extension(
     output_path: str | Path,
-    compiler: str = "g++",
+    compiler: str | None = None,
     cuda_library_dir: str | Path | None = None,
 ) -> str:
     source_path = Path(__file__).parents[1] / "csrc" / "device_info.cpp"
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    compiler = compiler or jit_utils.get_cpp_compiler()
+    if jit_utils.IS_WINDOWS:
+        cuda_library = (
+            Path(cuda_library_dir) / "cuda.lib"
+            if cuda_library_dir is not None
+            else get_cuda_library_path("cuda.lib")
+        )
+        return jit_utils.build_msvc_native(
+            source_path,
+            output_path,
+            compiler,
+            include_paths=[sysconfig.get_paths()["include"], *_get_cuda_include_paths()],
+            link_args=[
+                str(Path(sys.base_prefix) / "libs" / "python3.lib"),
+                str(cuda_library),
+                "delayimp.lib",
+                "/DELAYLOAD:nvcuda.dll",
+            ],
+        )
     temporary_path = output_path.with_suffix(".tmp")
     command = [
         compiler,
@@ -84,7 +103,7 @@ def _get_device_info_extension() -> ModuleType:
         return _extension
 
     source_path = Path(__file__).parents[1] / "csrc" / "device_info.cpp"
-    extension_name = "_device_info.abi3.so"
+    extension_name = jit_utils.get_native_artifact_name("device_info")
     precompiled_path = jit_utils.get_precompiled_artifact_path(source_path, extension_name)
     if precompiled_path is not None:
         _extension = _load_device_info_extension(precompiled_path)
@@ -100,7 +119,6 @@ def _get_device_info_extension() -> ModuleType:
     lock_path = jit_utils.get_humming_lock_filename("device_info_" + build_hash)
     with FileLock(lock_path):
         if not extension_path.is_file():
-            compiler = os.environ.get("CXX") or "g++"
-            build_device_info_extension(extension_path, compiler=compiler)
+            build_device_info_extension(extension_path)
     _extension = _load_device_info_extension(extension_path)
     return _extension

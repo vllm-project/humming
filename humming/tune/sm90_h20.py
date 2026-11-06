@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 
 import numpy as np
 
@@ -6,10 +7,12 @@ from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
+from humming.tune.candidate import DeviceProfile, TuningDecision, TuningProblem
 from humming.tune.sm90_policies import (
     fit_sm90_tile,
     get_sm90_specialized_config,
     select_sm90_block_m,
+    select_sm90_small_m_schedule,
 )
 from humming.utils.math import ceil_div, round_up
 from humming.utils.smem import estimate_smem_size_layer
@@ -397,6 +400,11 @@ class Sm90H20Heuristics(DeviceHeuristics):
         num_blocks_m = cls.estimate_num_blocks_m(layer_config, shape_m, block_shape_m, gemm_type)
 
         num_sms = current_device.sm_count
+        max_num_stages = 4
+        use_stream_k = layer_config.shape_k > 1024 and not use_batch_invariant
+        can_split_dense_k = not is_moe and a_dtype.num_bits == 16 and not use_f16_accum
+        can_split_dense_k &= use_stream_k
+        has_stream_k_parallelism = False
         while num_blocks_n * num_blocks_m * 2 < num_sms * num_ctas_per_sm:
             if warp_shape_n == 64:
                 warp_shape_n = warp_shape_n // 2
@@ -406,6 +414,15 @@ class Sm90H20Heuristics(DeviceHeuristics):
                     num_ctas_per_sm = 3
                 continue
             elif num_ctas_per_sm > 1:
+                if can_split_dense_k:
+                    # Reserve three pipeline turns per CTA after widening the K tile.
+                    slice_block_k = max(block_shape_k, 2 * warp_shape_k)
+                    num_k_iters = layer_config.shape_k // slice_block_k
+                    total_k_iters = num_blocks_n * num_blocks_m * num_k_iters
+                    min_slice_iters = 3 * max_num_stages
+                    if total_k_iters >= num_sms * num_ctas_per_sm * min_slice_iters:
+                        has_stream_k_parallelism = True
+                        break
                 num_ctas_per_sm = num_ctas_per_sm - 1
                 continue
             else:
@@ -420,7 +437,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
             warp_shape_k = 512 // layer_config.a_dtype.num_bits
             block_shape_k = warp_shape_k * 2
 
-        if num_warps <= 8 and block_shape_m <= 32:
+        if num_warps <= 8 and block_shape_m <= 32 and not has_stream_k_parallelism:
             if is_moe and warp_shape_n == 64:
                 warp_shape_n = warp_shape_n // 2
             else:
@@ -444,7 +461,6 @@ class Sm90H20Heuristics(DeviceHeuristics):
                 block_shape_k = block_shape_k * 2
                 warp_shape_k = warp_shape_k * 2
 
-        max_num_stages = 4
         for num_stages_new in range(num_stages + 1, max_num_stages + 1):
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
             smem_size = estimate_smem_size_layer(layer_config, block_shape, gemm_type, num_stages_new)
@@ -462,7 +478,6 @@ class Sm90H20Heuristics(DeviceHeuristics):
             warp_shape_m = block_shape_m
             num_blocks_m = math.ceil(shape_m / block_shape_m)
 
-        use_stream_k = layer_config.shape_k > 1024 and not use_batch_invariant
         if use_stream_k and num_ctas_per_sm == 1:
             factor = min(4.5, layer_config.shape_k / (3 * block_shape_k))
             # Keep at least two stage-4 turns per Stream-K slice.
@@ -583,10 +598,50 @@ class Sm90H20Heuristics(DeviceHeuristics):
         config = cls._select_config(
             layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
         )
-        return fit_sm90_tile(
+        is_moe_a16 = gemm_type != GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        has_aligned_reduction = layer_config.shape_k >= 4096 and layer_config.shape_k % 128 == 0
+        can_use_mma = is_moe_a16 and has_aligned_reduction and layer_config.shape_n % 128 == 0
+        can_use_mma &= not use_f16_accum and not use_batch_invariant and not layer_config.use_packed_k_layout
+        if can_use_mma and config["block_shape"][0] == 8:
+            problem = TuningProblem(
+                layer_config=layer_config,
+                shape_m=cls.get_shape_m_sample(layer_config, shape_m),
+                gemm_type=gemm_type,
+                device=DeviceProfile(
+                    name="sm90_h20",
+                    sm_version=cls.sm_version,
+                    num_sms=current_device.sm_count,
+                    max_smem_size=cls.max_smem_size,
+                ),
+                use_m_major_input_scale=use_m_major_input_scale,
+                expert_probability_cv=cls.expert_probability_cv,
+            )
+            selected = select_sm90_small_m_schedule(problem, config, is_h20=True)
+            config = selected.to_config() if isinstance(selected, TuningDecision) else selected
+        is_dense_a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        can_tune_transfers = is_dense_a16 and layer_config.shape_k >= 4096
+        can_tune_transfers &= not use_batch_invariant and not use_f16_accum
+        if can_tune_transfers:
+            block_shape = config["block_shape"]
+            warp_m, warp_n, warp_k = config["warp_shape"]
+            num_ctas = config.get("num_ctas_per_sm", 1)
+            num_k_warps = block_shape[2] // warp_k
+            num_math_warps = math.prod(block_shape) // math.prod(config["warp_shape"])
+            accumulator_registers = warp_m * warp_n // 32
+            resident_math_warps = num_math_warps * num_ctas
+            if num_k_warps >= 4:
+                config = config | {"use_tma": True, "use_warp_spec": True}
+            elif num_k_warps > 1 and accumulator_registers > 32:
+                config = config | {"use_tma": resident_math_warps >= 16, "use_warp_spec": False}
+            elif num_math_warps == 4 and accumulator_registers <= 64:
+                config = config | {"use_tma": True}
+                if accumulator_registers < 64:
+                    config = config | {"use_warp_spec": True}
+        config = fit_sm90_tile(
             layer_config,
             config,
             use_f16_accum,
             gemm_type=gemm_type,
             use_m_major_input_scale=use_m_major_input_scale,
         )
+        return {key: value.value if isinstance(value, Enum) else value for key, value in config.items()}

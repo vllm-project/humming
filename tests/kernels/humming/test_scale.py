@@ -8,7 +8,7 @@ from humming.config import (
     WeightScale2Type,
     WeightScaleType,
 )
-from humming.config.mma import get_default_mma_type
+from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error
 from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
@@ -60,14 +60,15 @@ SECONDARY_SCALE_TYPES = (
 
 def _output_dtype(a_dtype, bs_dtype):
     if a_dtype.num_bits == 16:
-        if bs_dtype.num_bits == 16 and bs_dtype != a_dtype:
-            return None
-        return a_dtype
-    if bs_dtype in (dtypes.float16, dtypes.bfloat16):
-        if a_dtype == dtypes.float8e5m2 and bs_dtype == dtypes.float16:
-            return None
-        return bs_dtype
-    return dtypes.bfloat16
+        c_dtype = a_dtype
+    elif bs_dtype in (dtypes.float16, dtypes.bfloat16):
+        c_dtype = bs_dtype
+    else:
+        c_dtype = dtypes.bfloat16
+
+    if get_dtype_compatibility_error(a_dtype, c_dtype, bs_dtype) is not None:
+        return None
+    return c_dtype
 
 
 def _bs2_case(bs_dtype, scale_2_type):

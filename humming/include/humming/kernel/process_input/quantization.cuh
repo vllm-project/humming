@@ -534,6 +534,9 @@ CUDA_INLINE auto quant_group(
     constexpr uint32_t kGroupLanes = kScaleSize / kValuesPerLane;
     constexpr uint32_t kSyncThreads = Context::kFusedGroupToken ? Context::kThreadsPerTask : kGroupLanes;
     float maximum = group_absmax<kValuesPerLane, kScaleSize, kNumWarps, kWarpOffset, kSyncThreads>(values, shared);
+    // Finish cross-warp reads before the token reduction reuses the same scratch.
+    if constexpr (Context::kFusedGroupToken && kGroupLanes > 32)
+      sync_slice_threads<kSyncThreads, kNumWarps, kWarpOffset>();
     float raw_scale = fmaxf(maximum / target_maximum<TargetType>(), 1e-30f);
     if constexpr (Context::kStaticTensorScale && Context::kDynamicGroupScale)
       raw_scale /= static_scale;

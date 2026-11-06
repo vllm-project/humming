@@ -105,11 +105,17 @@ def _token_tuning_candidates(problem, device, transform_size: int):
         thread_alignment = max(32, transform_lanes)
         threads_per_task = round_up(row_lanes, thread_alignment)
 
+        if dynamic_scale_mode == "group_token":
+            if values_per_thread > 32:
+                continue
+            if not is_pow_of_two(threads_per_task):
+                # Only pad warp-local group reductions, which do not use reduction scratch.
+                if problem.quant_group_size > 32 * values_per_thread:
+                    continue
+                threads_per_task = 1 << (threads_per_task - 1).bit_length()
+
         if not 32 <= threads_per_task <= 1024:
             continue
-        if dynamic_scale_mode == "group_token":
-            if values_per_thread > 32 or not is_pow_of_two(threads_per_task):
-                continue
 
         max_tokens_per_block = min(problem.num_work_rows, 1024 // threads_per_task, 16)
         for tokens_per_block in powers_of_two_up_to(max_tokens_per_block):
@@ -533,9 +539,12 @@ def _tuning_config_for_device(config: ProcessInputProblemConfig, shape_m: int, d
         tile_size = config.hadamard_block_size
 
     # Candidate enumeration must satisfy the kernel's group/transform boundaries.
+    # The last quantization group may be partial; Hadamard blocks may not.
     for size in (tile_size, config.hadamard_block_size):
         assert 0 < size <= 512 and is_pow_of_two(size)
-        assert config.hidden_size % size == 0
+    assert config.hidden_size % config.hadamard_block_size == 0
+    if not quant_mode.has_group_scale:
+        assert config.hidden_size % tile_size == 0
     if quant_mode.has_group_scale:
         assert config.quant_group_size >= 2
 
@@ -562,7 +571,7 @@ def _tuning_config_for_device(config: ProcessInputProblemConfig, shape_m: int, d
         **config.to_dict(),
         should_quantize=quant_mode.should_quantize,
         tile_size=tile_size,
-        num_tiles=config.hidden_size // tile_size,
+        num_tiles=ceil_div(config.hidden_size, tile_size),
         source_bits=config.input_dtype.num_bits,
         target_bits=target_bits,
         num_work_rows=num_work_rows,

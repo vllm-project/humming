@@ -190,7 +190,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             consumer.wait_stage((stage_id + 1) % kNumStages);
           }
           if constexpr (!Ctx::kUseWgmma) {
-            if (warp_iter_id == Ctx::kWarpIters - 1) consumer.arrive(stage_id);
+            if (warp_iter_id == Ctx::kWarpIters - 1) {
+              if constexpr (Ctx::kWarpIters > 1 && ProducerPipeline::kHasStageTmaMBarrier)
+                asm volatile("fence.acq_rel.cta;" ::: "memory");
+              consumer.arrive(stage_id);
+            }
           }
           const bool use_late_scale_prefetch = Ctx::kUseWgmmaLateScalePrefetch && warp_iter_id == Ctx::kWarpIters - 1;
           const bool has_next_fragment = warp_iter_id + 1 < Ctx::kWarpIters || slice_iter + 1 < num_slice_iters;

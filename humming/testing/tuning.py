@@ -24,6 +24,7 @@ SAMPLED_TUNING_VALUES = {
     "wgmma_use_late_as": (False, True),
     "wgmma_split_issue_wait": (False, True),
     "use_tma": (True, False, 123, 456, 789),
+    "evict_weights_first": (False, True),
     "use_warp_spec": (True, False),
     "multi_cast_size_a": (1, 2),
     "multi_cast_size_b": (1, 2),
@@ -130,7 +131,8 @@ def _is_legal_geometry(
     if warp_shape[0] % 8:
         return False
     if mma_type == MmaType.MMA and warp_shape[0] % 16:
-        return False
+        if layer_config.a_dtype.num_bits != 16 or current_device.is_ppu:
+            return False
     if mma_type == MmaType.MXMMA and warp_shape[0] % 16:
         return False
     use_wgmma = mma_type == MmaType.WGMMA
@@ -261,6 +263,7 @@ def _generate_transfer_candidates(
     candidates = []
     names = (
         "use_tma",
+        "evict_weights_first",
         "use_warp_spec",
         "multi_cast_size_a",
         "multi_cast_size_b",

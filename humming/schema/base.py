@@ -162,15 +162,20 @@ class BaseWeightSchema:
         shape_k_stacks: list[int],
         num_experts: int | None = None,
         target_group_size: int | None = None,
-        force_repeat: int = False,
+        force_repeat: bool = False,
     ):
         assert len(shape_n_stacks) == 1 or len(shape_k_stacks) == 1
 
         scale = scale.view(num_experts or 1, -1)
+        stack_size = max(len(shape_n_stacks), len(shape_k_stacks))
+        assert scale.size(1) in (1, stack_size)
 
         if (scale == scale[:, [0]]).all() and not force_repeat:
             return scale[:, 0]
-        elif len(shape_n_stacks) > 1:
+
+        # A single scale per expert is shared by all of its stacked shards.
+        scale = scale.expand(-1, stack_size)
+        if len(shape_n_stacks) > 1:
             shape_n_repeats = torch.tensor(shape_n_stacks)
             target_group_size = target_group_size or sum(shape_k_stacks)
             shape_k_repeats = torch.tensor([sum(shape_k_stacks) // target_group_size])

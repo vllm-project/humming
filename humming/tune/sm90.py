@@ -20,6 +20,7 @@ from humming.tune.sm90_policies import (
     get_sm90_specialized_config,
     select_grouped_scale,
     select_moe_a16,
+    select_sm90_small_m_schedule,
 )
 from humming.utils.smem import estimate_smem_size_layer
 
@@ -171,7 +172,7 @@ class Sm90Heuristics(Sm80Heuristics):
         )
 
     @classmethod
-    def _select_config(
+    def _select_base_config(
         cls,
         layer_config: LayerConfig,
         shape_m: int,
@@ -200,10 +201,11 @@ class Sm90Heuristics(Sm80Heuristics):
         if is_wna16 and has_short_reduction and is_tile_aligned and can_use_small_mma:
             # A short reduction cannot amortize a producer warpgroup or Stream-K
             # fixups. Two K warps let MMA dequantize while keeping the M tile small.
+            block_m = 8 if shape_m <= 8 else 16
             return {
                 "mma_type": MmaType.MMA.value,
-                "block_shape": (16, 128, 64),
-                "warp_shape": (16, 32, 32),
+                "block_shape": (block_m, 128, 64),
+                "warp_shape": (block_m, 32, 32),
                 "num_stages": 4,
                 "num_ctas_per_sm": 1,
                 "use_stream_k": False,
@@ -253,6 +255,36 @@ class Sm90Heuristics(Sm80Heuristics):
                 break
             config["num_stages"] -= 1
         return config
+
+    @classmethod
+    def _select_config(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        use_f16_accum: bool = False,
+        use_batch_invariant: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
+    ):
+        selected = cls._select_base_config(
+            layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
+        )
+        is_wna16 = layer_config.a_dtype.num_bits == 16 and layer_config.b_dtype.num_bits < 16
+        has_aligned_reduction = layer_config.shape_k >= 4096 and layer_config.shape_k % 128 == 0
+        can_use_mma = is_wna16 and has_aligned_reduction and layer_config.shape_n % 128 == 0
+        can_use_mma &= not use_f16_accum and not use_batch_invariant and not layer_config.use_packed_k_layout
+        if not can_use_mma or (gemm_type == GemmType.DENSE and shape_m > 32):
+            return selected
+        problem = cls._make_problem(
+            layer_config,
+            cls.get_shape_m_sample(layer_config, shape_m),
+            use_f16_accum,
+            use_batch_invariant,
+            gemm_type,
+            include_grid_size=True,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        return select_sm90_small_m_schedule(problem, selected)
 
     @classmethod
     def get_config(

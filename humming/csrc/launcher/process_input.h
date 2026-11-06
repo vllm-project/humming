@@ -306,7 +306,7 @@ inline std::optional<Tensor> prepare_process_input_group_scales(
     ASSERT_CHECK(!scales.has_value(), "group_scales is not used by quant_mode");
     return std::nullopt;
   }
-  int64_t groups = data.hidden_size / data.quant_group_size;
+  int64_t groups = CEIL_DIV(data.hidden_size, data.quant_group_size);
   bool packed_scales = get_dtype_num_bits(data.group_scale_dtype_id) == 8;
   int64_t stored_groups = packed_scales ? CEIL_DIV(groups, 4) : groups;
   int64_t rows = shape.num_output_rows;
@@ -553,7 +553,7 @@ inline void launch_process_input_impl(
       valid_finalizer = valid_finalizer && secondary.is_finalizer;
       valid_finalizer = valid_finalizer && secondary.quantization_phase == QuantizationPhase::Fused;
       ASSERT_CHECK(valid_finalizer, "invalid process-input secondary kernel");
-      int64_t groups = primary.hidden_size / primary.quant_group_size;
+      int64_t groups = CEIL_DIV(primary.hidden_size, primary.quant_group_size);
       Tensor intermediate = torch_empty({shape.num_output_rows * groups * 2}, ScalarType::Byte, inputs.device());
       launch_process_input_main(
           primary, primary_kernel.func, inputs, outputs, group_scales, token_scales,

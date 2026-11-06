@@ -221,7 +221,7 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             weight_scale = weight_scale.view(torch.float8_e8m0fnu)
         elif self.format.startswith("nvfp4"):
             weight_scale = weight_scale.view(torch.float8_e4m3fn)
-        else:
+        elif self.strategy != "tensor":
             weight_scale = weight_scale.to(param_dtype)
 
         if self.strategy in ["group", "tensor_group"]:
@@ -232,13 +232,6 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             weight_scale = weight_scale.repeat_interleave(self.block_structure[0], -2)
             group_size = self.block_structure[1]
         elif self.strategy == "tensor":
-            weight_scale = self._may_process_global_scale(
-                weight_scale,
-                shape_n_stacks=shape_n_stacks,
-                shape_k_stacks=shape_k_stacks,
-                num_experts=num_experts,
-                force_repeat=True,
-            ).to(param_dtype)
             group_size = 0
         else:
             assert self.strategy == "channel"
@@ -246,7 +239,7 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
 
         output_tensors = {"weight": weight, "weight_scale": weight_scale}
 
-        weight_scale_type = None
+        weight_scale_type = WeightScaleType.TENSOR if self.strategy == "tensor" else None
         weight_scale_2_type = None
         if self.format == "nvfp4-pack-quantized":
             weight_scale_2 = tensors["weight_global_scale"]
@@ -263,17 +256,20 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             if has_tensor_scale:
                 weight_scale_2_type = WeightScale2Type.TENSOR
                 output_tensors["weight_scale_2"] = weight_scale_2.float()
+            elif len(shape_n_stacks) > 1:
+                weight_scale_2_type = WeightScale2Type.CHANNEL
+                output_tensors["weight_scale_2"] = weight_scale_2.squeeze(-1).to(param_dtype)
             else:
                 weight_scale = weight_scale.float() * weight_scale_2.float()
                 output_tensors["weight_scale"] = weight_scale.to(param_dtype)
 
-        bs_dtype = None
+        bs_dtype = dtypes.float32 if self.strategy == "tensor" else None
         if self.format in ["int-quantized", "float-quantized", "naive-quantized"]:
             assert self.num_bits == 8
             b_dtype = dtypes.uint8 if self.type == "int" else dtypes.float8e4m3
         elif "nvfp4" in self.format:
             b_dtype = dtypes.float4e2m1
-            bs_dtype = dtypes.float8e4m3 if has_tensor_scale else None
+            bs_dtype = dtypes.float8e4m3 if weight_scale_2_type is not None else None
         elif "mxfp4" in self.format:
             b_dtype = dtypes.float4e2m1
             bs_dtype = dtypes.float8e8m0
@@ -298,6 +294,10 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             has_zero_point=not self.symmetric,
         )
 
+        if self.strategy == "tensor":
+            return schema._convert_humming(
+                output_tensors, shape_n_stacks, shape_k_stacks, param_dtype, num_experts
+            )
         return schema, output_tensors
 
 

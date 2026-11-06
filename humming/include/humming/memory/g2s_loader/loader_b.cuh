@@ -21,7 +21,7 @@ private:
   static constexpr uint32_t kMultiCastSizeB = Ctx::kMultiCastSizeB;
   // M-grouped traversal reuses B immediately across neighboring CTAs. Avoid
   // retaining streamed weights at the expense of A's reuse across N tiles.
-  static constexpr bool kEvictWeightsFirst = Ctx::kUseUmmaSplitLoads && Ctx::kRasterGroupM > 1;
+  static constexpr bool kEvictWeightsFirst = (Ctx::kUseUmmaSplitLoads && Ctx::kRasterGroupM > 1) || Ctx::kEvictWeightsFirst;
 
   static constexpr uint32_t kWeightShapeN = Ctx::kWeightShapeN;
   static constexpr uint32_t kWeightShapeK = Ctx::kWeightShapeK;
@@ -84,7 +84,7 @@ public:
       if constexpr (Ctx::kUseFlatWeight) {
         constexpr uint32_t kWarpN = Ctx::kUseWgmmaSs ? Ctx::WarpShape::N : 16;
         if (cluster_rank == 0)
-          tma_load_5d<kMultiCastSizeB>(tensor_map_ptr, smem_ptr, mbar_ptr,
+          tma_load_5d<kMultiCastSizeB, kEvictWeightsFirst>(tensor_map_ptr, smem_ptr, mbar_ptr,
               0, col_offset / kWarpN, 0, row_offset * ElementQB::kBits / 128, expert_index);
       } else if constexpr (Ctx::kUseRawWeight) {
         constexpr uint32_t kCoordinateBits = SharedStorage::kExpandUmmaWeight ? 1 : 32 / ElementQB::kBits;
@@ -160,7 +160,7 @@ public:
         legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + row * kGlobalRowInt4s + col,
             smem_ptr + swizzled_offset, valid, (BlockShape::N * kRowInt4s) % kNumLoadThreads == 0 || row < BlockShape::N);
       } else {
-        legacy_load_pred<kUseCpAsync>(gmem_ptr + row * kGlobalRowInt4s + col,
+        legacy_load_pred<kUseCpAsync, int4, 0, kEvictWeightsFirst>(gmem_ptr + row * kGlobalRowInt4s + col,
             smem_ptr + swizzled_offset, row < BlockShape::N);
       }
     }
@@ -197,7 +197,7 @@ public:
         bool valid = valid_n && valid_k;
         legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + offset, valid, kNumInt4s % kNumLoadThreads == 0 || index < kNumInt4s);
       } else {
-        legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + offset, index < kNumInt4s);
+        legacy_load_pred<kUseCpAsync, int4, 0, kEvictWeightsFirst>(gmem_ptr + gmem_offset, smem_ptr + offset, index < kNumInt4s);
       }
     }
   }
@@ -233,7 +233,7 @@ public:
       }
     } else {
       legacy_load_2d<kUseCpAsync, kNumInt4s, kNumLoadThreads,
-          kGmemStride, kSmemStride, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+          kGmemStride, kSmemStride, kLoadThreadOffset, int4, kEvictWeightsFirst>(gmem_ptr, smem_ptr);
     }
   }
 

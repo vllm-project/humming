@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from humming.config import GemmType
+from humming.utils.math import ceil_div
 
 
 def generate_random_tensor(
@@ -19,9 +20,10 @@ def generate_random_tensor(
     assert std_scale > 0, "std_scale must be positive"
 
     group_size = group_size or shape_k
-    assert group_size > 0 and shape_k % group_size == 0
+    assert group_size > 0
 
-    num_groups = shape_k // group_size
+    # A partial last group is generated whole and trimmed below.
+    num_groups = ceil_div(shape_k, group_size)
     grouped_shape = (*shape[:-1], num_groups, group_size)
     stat_shape = (*shape[:-1], num_groups, 1)
 
@@ -29,7 +31,7 @@ def generate_random_tensor(
     val = 256 / max(group_size, 256)
     group_mean = torch.empty(stat_shape, dtype=dtype, device=values.device).uniform_(-val, val)
     group_std = torch.empty(stat_shape, dtype=dtype, device=values.device).uniform_(0.9, 1.1)
-    values = ((values + group_mean) * group_std).view(shape)
+    values = ((values + group_mean) * group_std).flatten(-2)[..., :shape_k].contiguous()
 
     target_std_center = std_scale / (shape_k**0.25)
     target_std = torch.empty((*shape[:-1], 1), dtype=dtype, device=values.device)

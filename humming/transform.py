@@ -21,6 +21,7 @@ def prepare_layer_config(
     has_bias: bool = False,
     torch_dtype: torch.dtype | None = None,
     device: int | torch.device | None = None,
+    tensors: dict[str, torch.Tensor] | None = None,
 ) -> LayerConfig:
     info = DeviceInfo(device)
     sm_version = info.sm_version
@@ -34,10 +35,25 @@ def prepare_layer_config(
     pad_shape_k = round_up(shape_k, pad_k_to_multiple) - shape_k
 
     if input_schema is None:
-        input_schema = HummingInputSchema(input_dtype=f16_dtype)
+        input_schema = HummingInputSchema(a_dtype=f16_dtype)
 
     assert isinstance(input_schema, HummingInputSchema)
     assert isinstance(weight_schema, HummingWeightSchema)
+
+    b_dtype = weight_schema.b_dtype
+    a_dtype = input_schema.a_dtype or f16_dtype
+    is_e0m_weight = b_dtype.is_floating_point_type and b_dtype.exponent_bits == 0
+    if a_dtype.is_integer_type and is_e0m_weight:
+        if tensors is None:
+            raise ValueError("tensors are required to prepare E0M weights for integer activations")
+        midpoint = 1 << (b_dtype.num_bits - 1)
+        weight = ops.unpack_weight(tensors["weight"], b_dtype.num_bits)
+        magnitude = weight & (midpoint - 1)
+        signed_weight = torch.where(weight & midpoint != 0, -magnitude, magnitude)
+        tensors["weight"] = ops.pack_weight(signed_weight + midpoint, b_dtype.num_bits)
+        if weight_schema.has_zero_point:
+            tensors["zero_point"] = tensors["zero_point"] + midpoint
+        b_dtype = dtypes.IntegerType(num_bits=b_dtype.num_bits)
 
     use_channel_scale_2 = (
         input_schema.a_dtype == dtypes.int8
@@ -52,7 +68,7 @@ def prepare_layer_config(
     return LayerConfig(
         sm_version=sm_version,
         a_dtype=input_schema.a_dtype or f16_dtype,
-        b_dtype=weight_schema.b_dtype,
+        b_dtype=b_dtype,
         bs_dtype=weight_schema.bs_dtype or f16_dtype,
         as_dtype=input_schema.input_scale_dtype,
         input_quant_mode=input_schema.input_quant_mode,
@@ -71,6 +87,36 @@ def prepare_layer_config(
         has_zero_point=weight_schema.has_zero_point,
         is_fp_zero_point=weight_schema.is_fp_zero_point,
     )
+
+
+def prepare_and_transform_humming_tensors(
+    tensors: dict[str, torch.Tensor],
+    shape_n: int,
+    shape_k: int,
+    weight_schema: HummingWeightSchema,
+    input_schema: HummingInputSchema | None = None,
+    num_experts: int | None = None,
+    pad_n_to_multiple: int = 1,
+    pad_k_to_multiple: int = 1,
+    has_bias: bool = False,
+    torch_dtype: torch.dtype | None = None,
+    device: int | torch.device | None = None,
+) -> tuple[LayerConfig, dict[str, torch.Tensor]]:
+    tensors = tensors.copy()
+    config = prepare_layer_config(
+        shape_n=shape_n,
+        shape_k=shape_k,
+        weight_schema=weight_schema,
+        input_schema=input_schema,
+        num_experts=num_experts,
+        pad_n_to_multiple=pad_n_to_multiple,
+        pad_k_to_multiple=pad_k_to_multiple,
+        has_bias=has_bias,
+        torch_dtype=torch_dtype,
+        device=device,
+        tensors=tensors,
+    )
+    return config, transform_humming_tensors(config, tensors)
 
 
 def check_and_pad_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

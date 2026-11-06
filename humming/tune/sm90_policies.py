@@ -18,6 +18,7 @@ from humming.tune.candidate import (
     fit_pipeline_stages,
     get_problem_rejection_reasons,
 )
+from humming.tune.raster import get_moe_raster_group_m
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -155,6 +156,95 @@ def fit_sm90_tile(
         config["warp_shape"] = (smaller_m, warp_n, warp_k)
 
 
+def select_sm90_small_m_schedule(
+    problem: TuningProblem,
+    selected: TuningDecision | dict,
+    *,
+    is_h20: bool = False,
+) -> TuningDecision | dict:
+    layer = problem.layer_config
+    config = selected.to_config() if isinstance(selected, TuningDecision) else selected
+    num_sms = problem.device.num_sms
+    assert num_sms is not None
+    block_m, block_n, block_k = config["block_shape"]
+    weight_bits = layer.b_dtype.num_bits
+    is_power_of_two_weight = weight_bits & (weight_bits - 1) == 0
+    warp_n, warp_k = (64, 32) if is_power_of_two_weight else (32, 64)
+    mma_m = 8 if block_m <= 8 else math.ceil(block_m / 16) * 16
+    mma_k = 128
+    num_stages = 4
+    num_weight_tiles = (layer.shape_n // 128) * (layer.shape_k // 128)
+    reason = None
+    proposal = None
+
+    if problem.gemm_type == GemmType.DENSE:
+        has_two_cta_work = num_weight_tiles >= num_sms * 2 * num_stages * 2
+        has_small_accumulator = mma_m * warp_n <= 1024
+        num_ctas = 2 if has_two_cta_work and has_small_accumulator else 1
+        has_pipeline_work = num_weight_tiles >= num_sms * num_stages
+        has_small_m = problem.shape_m <= 16
+        has_decode_work = problem.shape_m <= 32 and weight_bits >= 4 and has_two_cta_work
+        has_decode_work &= mma_m == block_m
+        if has_pipeline_work and (has_small_m or has_decode_work):
+            reason = "selected MMA with CTA residency fitted to K work and accumulator size"
+    elif mma_m == 8:
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
+        if is_h20 and num_output_tiles > num_sms:
+            return selected
+        mma_k = 64
+        num_ctas = 4
+        reason = "selected MMA for eight-row expert tiles"
+    elif mma_m <= 32:
+        # Halving an indexed K tile adds loads without removing producer overhead.
+        if problem.gemm_type == GemmType.INDEXED and block_k > 128:
+            return selected
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
+        num_base_tiles = problem.estimate_num_blocks_m(block_m) * (layer.shape_n // block_n)
+        has_short_grid = num_output_tiles <= num_sms * 5 / 4
+        has_extra_k_parallelism = block_k <= 64 and num_output_tiles <= num_sms * 9 / 4
+        has_no_extra_padding = mma_m == block_m and num_output_tiles <= num_sms * 2
+        can_round_m = block_m <= 16 and (has_short_grid or has_extra_k_parallelism or has_no_extra_padding)
+        # Rounding 24-row expert tiles to 32 regresses with skewed routing.
+        if can_round_m:
+            num_ctas = 2 if mma_m == 16 and num_output_tiles >= num_sms / 2 else 1
+            reason = "selected MMA for a short expert grid with bounded row padding"
+        elif block_m < 32 and block_k >= 128 and num_base_tiles <= num_sms:
+            if config.get("use_tma", False) or config.get("use_warp_spec", False):
+                proposal = config | {"use_tma": False, "use_warp_spec": False}
+                reason = "removed producer and TMA overhead from a short expert grid"
+
+    if reason is None:
+        return selected
+    if proposal is None:
+        proposal = {
+            "mma_type": MmaType.MMA.value,
+            "block_shape": (mma_m, 128, mma_k),
+            "warp_shape": (mma_m, warp_n, warp_k),
+            "num_stages": num_stages,
+            "num_ctas_per_sm": num_ctas,
+            "use_stream_k": True,
+            "use_tma": False,
+            "use_warp_spec": False,
+        }
+    candidate = ScheduleCandidate.from_config("sm90_small_m", proposal)
+    analysis = analyze_candidate(problem, candidate)
+    if not analysis.legal:
+        return selected
+    if isinstance(selected, TuningDecision):
+        considered = selected.considered
+    else:
+        base_config = {key: value for key, value in config.items() if key != "num_sms"}
+        base = ScheduleCandidate.from_config("sm90_small_m_base", base_config)
+        considered = (analyze_candidate(problem, base),)
+    return TuningDecision(
+        problem=problem,
+        family="sm90_small_m",
+        selected=candidate,
+        considered=(*considered, analysis),
+        reason=reason,
+    )
+
+
 def get_sm90_specialized_config(
     layer_config: LayerConfig,
     shape_m: int,
@@ -166,6 +256,19 @@ def get_sm90_specialized_config(
     use_m_major_input_scale: bool = False,
     expert_probability_cv: float = DeviceHeuristics.expert_probability_cv,
 ) -> dict | None:
+    def finalize_config(config: dict | None) -> dict | None:
+        if config is None or gemm_type == GemmType.DENSE or not config.get("use_stream_k", False):
+            return config
+        block_m, block_n, _ = config["block_shape"]
+        counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
+        num_m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1).mean()
+        num_output_tiles = num_m_tiles * math.ceil(layer_config.shape_n / block_n)
+        resident_ctas = current_device.sm_count * config.get("num_ctas_per_sm", 1)
+        # Large grids amortize the tail imbalance without splitting the K reduction.
+        if num_output_tiles >= 16 * resident_ctas:
+            return config | {"use_stream_k": False}
+        return config
+
     compact_config = get_compact_scaled_moe_config(
         layer_config,
         shape_m,
@@ -177,7 +280,7 @@ def get_sm90_specialized_config(
         expert_probability_cv=expert_probability_cv,
     )
     if compact_config is not None:
-        return compact_config
+        return finalize_config(compact_config)
     short_config = get_short_k_config(
         layer_config,
         shape_m,
@@ -188,7 +291,7 @@ def get_sm90_specialized_config(
         use_m_major_input_scale=use_m_major_input_scale,
     )
     if short_config is not None:
-        return short_config
+        return finalize_config(short_config)
     block_scaled_config = get_block_scaled_moe_config(
         layer_config,
         shape_m,
@@ -199,7 +302,22 @@ def get_sm90_specialized_config(
         expert_probability_cv=expert_probability_cv,
     )
     if block_scaled_config is not None:
-        return block_scaled_config
+        return finalize_config(block_scaled_config)
+    scaled_config = get_scaled_a8_config(
+        layer_config,
+        shape_m,
+        gemm_type,
+        use_f16_accum,
+        use_batch_invariant,
+        is_h20=is_h20,
+        use_m_major_input_scale=use_m_major_input_scale,
+        expert_probability_cv=expert_probability_cv,
+    )
+    is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
+    is_moe = is_grouped or gemm_type == GemmType.INDEXED
+    if is_moe and scaled_config is not None:
+        if scaled_config.get("num_ctas_per_sm", 1) > 1 and not scaled_config["use_warp_spec"]:
+            return finalize_config(scaled_config)
     overlap_config = get_overlap_config(
         layer_config,
         shape_m,
@@ -211,7 +329,7 @@ def get_sm90_specialized_config(
         expert_probability_cv=expert_probability_cv,
     )
     if overlap_config is not None:
-        return overlap_config
+        return finalize_config(overlap_config)
     packed_config = get_packed_wna8_config(
         layer_config,
         shape_m,
@@ -223,17 +341,8 @@ def get_sm90_specialized_config(
         expert_probability_cv=expert_probability_cv,
     )
     if packed_config is not None:
-        return packed_config
-    return get_scaled_a8_config(
-        layer_config,
-        shape_m,
-        gemm_type,
-        use_f16_accum,
-        use_batch_invariant,
-        is_h20=is_h20,
-        use_m_major_input_scale=use_m_major_input_scale,
-        expert_probability_cv=expert_probability_cv,
-    )
+        return finalize_config(packed_config)
+    return finalize_config(scaled_config)
 
 
 def get_compact_scaled_moe_config(
@@ -297,7 +406,7 @@ def get_compact_scaled_moe_config(
         "num_ctas_per_sm": 3 if is_h20 and has_narrow_n else 2,
         "use_tma": use_warp_spec,
         "use_warp_spec": use_warp_spec,
-        "use_stream_k": has_narrow_n,
+        "use_stream_k": True,
         "smem_reuse_mode": "none" if use_warp_spec else "all_stages",
         "producer_stage_unroll": 2 if use_warp_spec else 3,
         "wgmma_split_issue_wait": use_warp_spec,
@@ -328,7 +437,12 @@ def get_compact_moe_config(
 
     block_m, block_n, block_k = config["block_shape"]
     has_single_warpgroup = tuple(config["warp_shape"]) == (block_m, block_n // 4, block_k)
-    if block_m > 32 or block_k != 64 or not has_single_warpgroup:
+    has_two_warpgroups = tuple(config["warp_shape"]) == (block_m, block_n // 8, block_k)
+    is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
+    can_compact_single = has_single_warpgroup and block_m <= 32
+    has_grouped_warpgroups = is_grouped and (has_single_warpgroup or has_two_warpgroups)
+    can_compact_grouped = has_grouped_warpgroups and not can_compact_single
+    if block_k != 64 or not (can_compact_single or can_compact_grouped):
         return config
 
     num_ctas = max(2, config.get("num_ctas_per_sm", 1))
@@ -337,10 +451,15 @@ def get_compact_moe_config(
         "use_warp_spec": False,
         "use_tma": False,
         "use_tma_c": False,
-        "smem_reuse_mode": "all_stages",
-        "producer_stage_unroll": config["num_stages"],
-        "wgmma_split_issue_wait": False,
     }
+    if can_compact_grouped:
+        candidate["num_stages"] = max(6, config["num_stages"])
+    else:
+        candidate |= {
+            "smem_reuse_mode": "all_stages",
+            "producer_stage_unroll": config["num_stages"],
+            "wgmma_split_issue_wait": False,
+        }
     candidate = fit_sm90_tile(
         layer_config,
         candidate,
@@ -350,7 +469,8 @@ def get_compact_moe_config(
     keeps_tile = tuple(candidate["block_shape"]) == tuple(config["block_shape"])
     keeps_warp = tuple(candidate["warp_shape"]) == tuple(config["warp_shape"])
     keeps_residency = candidate["num_ctas_per_sm"] == num_ctas
-    return candidate if keeps_tile and keeps_warp and keeps_residency else config
+    keeps_pipeline = not can_compact_grouped or candidate["num_stages"] >= config["num_stages"]
+    return candidate if keeps_tile and keeps_warp and keeps_residency and keeps_pipeline else config
 
 
 def get_overlap_config(
@@ -406,6 +526,8 @@ def get_overlap_config(
         if full_tiles.mean() < num_sms:
             return None
 
+    can_widen_unpacked = is_unpacked_a8 and not is_dense and not layer.is_group_input_scale
+    can_widen_grouped_a16 = can_overlap_a16 and not is_h20 and gemm_type != GemmType.INDEXED
     configs = []
     costs = []
     for block_n in (128, 256):
@@ -422,26 +544,34 @@ def get_overlap_config(
                 max_m = min(max_m, 64 if layer.is_group_input_scale else 96)
         else:
             max_m = 64 if is_h20 or layer.is_group_input_scale else 96
+            if can_widen_grouped_a16 and shape_m > layer.num_experts * max_m:
+                max_m = 176
             if can_overlap_packed:
                 max_m = 160 if block_n == 128 else 48
+            if can_widen_unpacked:
+                max_m = 176 if block_n == 128 else 128
+                if gemm_type == GemmType.INDEXED:
+                    max_m = min(max_m, 160)
             if is_h20 and gemm_type == GemmType.INDEXED and layer.a_dtype.is_integer_type:
                 max_m = 32
         for block_m in range(16, max_m + 1, 8):
             if layer.a_dtype.is_integer_type and block_m > 32 and block_m % 16:
                 continue
+            use_indexed_overlap = gemm_type == GemmType.INDEXED and block_m <= 32
+            use_indexed_overlap &= is_unpacked_a8 or can_overlap_packed
             config = {
                 "mma_type": MmaType.WGMMA.value,
                 "block_shape": (block_m, block_n, block_k),
                 "warp_shape": (block_m, warp_n, block_k),
                 "num_stages": 4,
-                "num_ctas_per_sm": 1,
+                "num_ctas_per_sm": 2 if use_indexed_overlap else 1,
                 "use_warp_spec": True,
                 "use_tma": True,
                 "use_stream_k": False,
                 "smem_reuse_mode": "none",
                 "producer_stage_unroll": 1,
                 "wgmma_split_issue_wait": True,
-                "wgmma_use_late_as": layer.is_group_input_scale and block_m > 96,
+                "wgmma_use_late_as": layer.is_group_input_scale and (block_m > 96 or use_indexed_overlap),
                 "raster_group_m": 1,
             }
             fitted = fit_sm90_tile(
@@ -464,19 +594,24 @@ def get_overlap_config(
                 mma_type=MmaType.WGMMA,
                 use_m_major_input_scale=use_m_major_input_scale,
             )
-            if smem_size > 227 * 1024:
+            if smem_size * config["num_ctas_per_sm"] > 227 * 1024:
                 continue
             tiles = [
                 ((rows + block_m - 1) // block_m).sum(axis=1) * (layer.shape_n // block_n)
                 for rows in distributions
             ]
             has_short_grid = is_dense and tiles[0].mean() < num_sms * 2 / 3
-            config["use_stream_k"] = bool(has_short_grid and layer.shape_k >= 2048)
+            config["use_stream_k"] = bool(not is_dense or (has_short_grid and layer.shape_k >= 2048))
             wide_efficiency = 1.1 if block_n == 256 else 1.0
-            weight_cost = 64 if layer.shape_k > 4096 and not is_h20 else 32
+            if gemm_type == GemmType.INDEXED and can_widen_unpacked and block_n == 256:
+                wide_efficiency = 1.15
+            has_grouped_weight_conversion = can_widen_unpacked and gemm_type != GemmType.INDEXED
+            has_weight_conversion_cost = layer.shape_k > 4096 or has_grouped_weight_conversion
+            weight_cost = 64 if not is_h20 and has_weight_conversion_cost else 32
             tile_cost = (block_m + weight_cost) * block_n / 128 / wide_efficiency
-            waves = [np.ceil(count / num_sms).mean() for count in tiles]
-            if config["use_stream_k"]:
+            resident_ctas = config["num_ctas_per_sm"]
+            waves = [np.ceil(count / (num_sms * resident_ctas)).mean() * resident_ctas for count in tiles]
+            if is_dense and config["use_stream_k"]:
                 waves = [max(0.65, count.mean() / num_sms) for count in tiles]
                 tile_cost *= 1.15
             configs.append(config)
@@ -488,8 +623,24 @@ def get_overlap_config(
     scores = relative_work.mean(axis=1)
     config = configs[int(np.argmin(scores))]
     block_m, block_n, _ = config["block_shape"]
-    if not is_dense and block_m >= 48 and block_n == 256:
+    use_a16_raster = can_overlap_a16 and gemm_type != GemmType.INDEXED
+    use_wide_raster = gemm_type == GemmType.GROUPED_CONTIGUOUS and block_m >= 48 and block_n == 256
+    if use_a16_raster or use_wide_raster:
         config["raster_group_m"] = 4
+    is_fp8 = layer.a_dtype in (dtypes.float8e4m3, dtypes.float8e5m2)
+    if can_overlap_block and is_fp8 and not is_dense:
+        config["raster_group_m"] = get_moe_raster_group_m(shape_m, layer.num_experts, block_m)
+    can_widen_indexed_a16 = is_a16 and gemm_type == GemmType.INDEXED and block_n < 512
+    if can_widen_indexed_a16 and layer.shape_n % 512 == 0:
+        wide_config = config | {
+            "block_shape": (block_m, 512, block_k),
+            "warp_shape": (block_m, 32, block_k),
+        }
+        wide_m_tiles = ((distributions[1] + block_m - 1) // block_m).sum(axis=1).mean()
+        wide_output_tiles = wide_m_tiles * (layer.shape_n // 512)
+        fitted = fit_sm90_tile(layer, wide_config, gemm_type=gemm_type)
+        if wide_output_tiles >= num_sms and fitted == wide_config:
+            config = wide_config
     return config
 
 
@@ -574,7 +725,8 @@ def get_block_scaled_moe_config(
     has_fp8_operands = layer_config.a_dtype in fp8_dtypes and layer_config.b_dtype == layer_config.a_dtype
     has_block_scales = layer_config.is_block_weight_scale
     is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
-    if not (has_fp8_operands and has_block_scales and is_grouped):
+    has_short_indexed_reduction = is_h20 and gemm_type == GemmType.INDEXED and layer_config.shape_k <= 1024
+    if not (has_fp8_operands and has_block_scales and (is_grouped or has_short_indexed_reduction)):
         return None
     if use_f16_accum or use_batch_invariant or not layer_config.num_experts:
         return None
@@ -591,15 +743,29 @@ def get_block_scaled_moe_config(
     block_m, block_n, warp_n = (48, 128, 16) if is_h20 else (80, 256, 32)
     stages, resident_ctas = (3, 2) if is_h20 else (4, 1)
     use_warp_spec = True
-    use_stream_k = False
+    use_stream_k = True
     short_k = shape_k <= 512
+    has_long_narrow_reduction = is_h20 and shape_n <= 1024 and shape_k >= 4096
     if short_k:
         block_m = 64 if is_h20 else 96
         stages = 3
-    elif is_h20 and shape_n <= 1024 and shape_k >= 4096 and shape_n % 256 == 0:
-        block_m, block_n, warp_n = 64, 256, 32
-        resident_ctas = 1
-        use_stream_k = True
+    elif has_long_narrow_reduction:
+        resident_config = fit_sm90_tile(
+            layer_config,
+            {
+                "block_shape": (64, 128, 128),
+                "warp_shape": (64, 16, 128),
+                "num_stages": stages,
+                "num_ctas_per_sm": 3,
+                "use_tma": True,
+                "use_warp_spec": True,
+                "smem_reuse_mode": "none",
+            },
+            gemm_type=gemm_type,
+        )
+        block_m, block_n, _ = resident_config["block_shape"]
+        warp_n = resident_config["warp_shape"][1]
+        stages, resident_ctas = resident_config["num_stages"], resident_config["num_ctas_per_sm"]
     elif is_h20 and shape_k <= 2048:
         stages = 4
 
@@ -613,7 +779,17 @@ def get_block_scaled_moe_config(
     # Account for per-expert padding and incomplete waves before using larger tiles.
     counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
     resident_blocks = current_device.sm_count * resident_ctas
-    block_m_candidates = (80, 96) if block_m == 96 else (block_m,)
+    if short_k:
+        block_m_candidates = (80, 96) if block_m == 96 else (block_m,)
+    else:
+        # Preserve the pipeline crossover while comparing its M tiles.
+        base_m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
+        base_utilization = counts.sum(axis=1) / (base_m_tiles * block_m)
+        if base_utilization.mean() < 2 / 3:
+            return None
+        base_output_tiles = base_m_tiles * (shape_n // block_n)
+        has_large_grid = base_output_tiles.mean() >= 16 * resident_blocks
+        block_m_candidates = tuple(range(8, block_m + 1, 8)) if has_large_grid else (block_m,)
     best = None
     for candidate_m in block_m_candidates:
         m_tiles = ((counts + candidate_m - 1) // candidate_m).sum(axis=1)
@@ -630,6 +806,8 @@ def get_block_scaled_moe_config(
         return None
     block_m = best[1]
 
+    raster_group_m = get_moe_raster_group_m(shape_m, layer_config.num_experts, block_m)
+
     config = {
         "mma_type": MmaType.WGMMA.value,
         "block_shape": (block_m, block_n, 128),
@@ -642,9 +820,11 @@ def get_block_scaled_moe_config(
         "use_tma_c": use_warp_spec and not short_k,
         "smem_reuse_mode": "none",
         "wgmma_split_issue_wait": not use_warp_spec,
-        "raster_group_m": 1,
+        "raster_group_m": raster_group_m,
     }
-    if short_k or use_stream_k:
+    if gemm_type == GemmType.INDEXED:
+        config.update(use_tma_a=False, use_tma_c=False)
+    if short_k or has_long_narrow_reduction:
         config["producer_stage_unroll"] = 2
         config["consumer_stage_unroll"] = 2 if short_k else 1
 
@@ -657,6 +837,7 @@ def get_block_scaled_moe_config(
         smem_reuse_mode="none",
         use_tma=True,
         use_warp_spec=use_warp_spec,
+        raster_group_m=raster_group_m,
     )
     if smem_size * resident_ctas > 227 * 1024:
         return None
@@ -942,13 +1123,12 @@ def select_grouped_scale(
             legal,
             key=lambda analysis: (analysis.waves or math.inf) * math.prod(analysis.candidate.block_shape[:2]),
         )
-        candidate = selected.candidate.with_updates(
-            use_stream_k=selected.candidate.use_stream_k
-            and selected.num_output_tiles < problem.device.num_sms
-        )
-        final_analysis = analyze_candidate(problem, candidate)
-        analyses = tuple(final_analysis if analysis is selected else analysis for analysis in analyses)
-        selected = final_analysis
+        resident_ctas = problem.device.num_sms * selected.candidate.get("num_ctas_per_sm", 1)
+        if selected.num_output_tiles >= 16 * resident_ctas:
+            candidate = selected.candidate.with_updates(use_stream_k=False)
+            final_analysis = analyze_candidate(problem, candidate)
+            analyses = tuple(final_analysis if analysis is selected else analysis for analysis in analyses)
+            selected = final_analysis
         reason = "selected a legal MoE schedule using routed tiles, residency and padded work per wave"
 
     return TuningDecision(
@@ -987,7 +1167,8 @@ def get_scaled_a8_config(
     if gemm_type != GemmType.DENSE and not layer_config.num_experts:
         return None
     is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
-    if is_grouped and layer_config.is_block_weight_scale:
+    has_grouped_block_scale = is_grouped and layer_config.is_block_weight_scale
+    if has_grouped_block_scale and is_h20:
         return None
     if layer_config.shape_n % 128 or layer_config.shape_k % 128:
         return None
@@ -1074,13 +1255,13 @@ def get_scaled_a8_config(
 
     counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
     is_indexed = gemm_type == GemmType.INDEXED
-    if is_h20 and is_indexed and layer_config.shape_k < 4096:
+    if is_h20 and is_indexed and not has_unpacked_weights and layer_config.shape_k < 4096:
         full_tiles = (counts // 32).sum(axis=1) * (layer_config.shape_n // 256)
         if short_k or full_tiles.mean() < num_sms:
             return None
     candidates = []
     max_block_m = 64 if is_h20 else 80
-    if is_h20 and is_indexed:
+    if is_h20 and is_indexed and not has_unpacked_weights:
         max_block_m = 32
     for block_m in range(8, max_block_m + 1, 8):
         if layer_config.a_dtype.is_integer_type and block_m > 32 and block_m % 16:
@@ -1090,8 +1271,7 @@ def get_scaled_a8_config(
         use_wide_tile = layer_config.shape_n % 256 == 0 and wide_tiles.mean() >= num_sms * 2 / 3
         block_n = 256 if use_wide_tile else 128
         tiles = m_tiles * (layer_config.shape_n // block_n)
-        use_stream_k = tiles.mean() < num_sms * 2 / 3 and layer_config.shape_k >= 2048
-        config = make_config(block_m, block_n, block_n // 8, True, use_stream_k, stages=3 if short_k else 4)
+        config = make_config(block_m, block_n, block_n // 8, True, True, stages=3 if short_k else 4)
         if fits_resources(config):
             score = float(np.ceil(tiles / num_sms).mean() * (block_m + 32) * block_n / 128)
             candidates.append((score, config))
@@ -1099,10 +1279,58 @@ def get_scaled_a8_config(
         return None
     config = min(candidates, key=lambda item: item[0])[1]
     block_m, block_n, _ = config["block_shape"]
-    if is_h20 and is_indexed and block_n == 256 and block_m <= 16:
+    if is_h20 and is_indexed and not has_unpacked_weights and block_n == 256 and block_m <= 16:
         full_tiles = (counts // block_m).sum(axis=1) * (layer_config.shape_n // block_n)
         if full_tiles.mean() < num_sms:
             return None
+    if has_unpacked_weights and (is_grouped or is_indexed) and block_m <= 32:
+        synchronous = make_config(block_m, block_n, block_n // 8, False, True, stages=3, ctas=2)
+        synchronous["wgmma_split_issue_wait"] = True
+        can_widen_tile = not is_indexed or block_m <= 16
+        if is_h20 and can_widen_tile and layer_config.shape_n % 512 == 0:
+            wider = make_config(block_m, 512, 64, False, True, stages=3, ctas=2)
+            wider["wgmma_split_issue_wait"] = True
+            if fits_resources(wider):
+                synchronous = wider
+        if fits_resources(synchronous):
+            block_n = synchronous["block_shape"][1]
+            tiles = ((counts + block_m - 1) // block_m).sum(axis=1) * (layer_config.shape_n // block_n)
+            has_short_indexed_grid = is_h20 and is_indexed and tiles.mean() < num_sms * 4
+            if has_short_indexed_grid and layer_config.shape_k <= 4096:
+                return None
+            if not is_h20 and tiles.mean() < num_sms:
+                return config
+            three_ctas = synchronous | {"num_ctas_per_sm": 3}
+            warp_m, warp_n, warp_k = synchronous["warp_shape"]
+            math_threads = math.prod(synchronous["block_shape"]) // math.prod(synchronous["warp_shape"]) * 32
+            register_budget = 65536 // (math_threads * 3) // 8 * 8
+            operand_registers = warp_m * warp_k // 128
+            accumulator_registers = warp_m * warp_n // 32
+            if not layer_config.use_fused_e8m0_scale and layer_config.is_group_weight_scale:
+                accumulator_registers *= 2
+            has_register_headroom = operand_registers + accumulator_registers + 32 <= register_budget
+            two_cta_work = np.ceil(tiles / (num_sms * 2)).mean() * 2
+            three_cta_work = np.ceil(tiles / (num_sms * 3)).mean() * 3
+            if has_register_headroom and three_cta_work < two_cta_work and fits_resources(three_ctas):
+                synchronous = three_ctas
+            has_short_grid = tiles.mean() < num_sms * 2
+            if is_indexed and not has_short_grid:
+                overlap = config | {"num_ctas_per_sm": 2, "producer_stage_unroll": 1}
+                overlap["wgmma_split_issue_wait"] = True
+                if is_h20:
+                    if block_m > 16 and fits_resources(overlap):
+                        return overlap
+                else:
+                    single_cta_work = np.ceil(tiles / num_sms).mean()
+                    if two_cta_work > single_cta_work * 1.1:
+                        return config
+                    has_short_reduction = layer_config.shape_k <= 4096
+                    if block_m > 16 and has_short_reduction and has_register_headroom:
+                        if fits_resources(three_ctas):
+                            return three_ctas
+                    if fits_resources(overlap):
+                        return overlap
+            return synchronous
     return config
 
 
@@ -1182,8 +1410,13 @@ def get_packed_wna8_config(
         warp_n = 32 if block_n == 256 else 16
         can_use_warp_spec = gemm_type != GemmType.INDEXED or has_indexed_weight_groups
         use_warp_spec = not is_h20 and not is_small_tile and can_use_warp_spec
-        resident_ctas = 1 if use_warp_spec else 2
-        stages = 3 if is_small_tile else (5 if is_h20 else 4)
+        can_overlap_indexed = not is_h20 or 16 < block_m <= 32
+        use_indexed_overlap = gemm_type == GemmType.INDEXED and can_overlap_indexed and block_m <= 64
+        use_warp_spec |= use_indexed_overlap
+        resident_ctas = 1 if use_warp_spec and not use_indexed_overlap else 2
+        stages = 3 if is_small_tile and not use_warp_spec else (5 if is_h20 else 4)
+        if use_indexed_overlap:
+            stages = 4
         config = {
             "mma_type": MmaType.WGMMA.value,
             "block_shape": (block_m, block_n, 128),
@@ -1192,14 +1425,14 @@ def get_packed_wna8_config(
             "num_ctas_per_sm": resident_ctas,
             "use_tma": use_warp_spec,
             "use_warp_spec": use_warp_spec,
-            "use_stream_k": False,
+            "use_stream_k": gemm_type != GemmType.DENSE,
             "wgmma_use_late_as": layer_config.is_group_input_scale,
             "wgmma_split_issue_wait": not (use_warp_spec and has_indexed_weight_groups),
             "smem_reuse_mode": "none" if use_warp_spec else "all_stages",
             "raster_group_m": 1,
         }
         if use_warp_spec:
-            config["producer_stage_unroll"] = 2
+            config["producer_stage_unroll"] = 1 if is_h20 and use_indexed_overlap else 2
         fitted = fit_sm90_tile(
             layer_config,
             config,
@@ -1253,7 +1486,7 @@ def get_packed_wna8_config(
         block_m, block_n, _ = best_config["block_shape"]
         # Preserve the existing Stream-K decode schedules when little work can
         # amortize a full packed stage or the indexed row-gathering setup.
-        if gemm_type == GemmType.INDEXED and block_m < 32:
+        if is_h20 and gemm_type == GemmType.INDEXED and block_m <= 16:
             return None
         if is_h20 and block_m == 8 and block_n == 256:
             return None

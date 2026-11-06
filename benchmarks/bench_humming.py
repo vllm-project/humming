@@ -81,8 +81,6 @@ def bench_humming(
                 inputs,
                 m_major_scale=m_major,
             )
-            if token_scales is not None:
-                token_scales = token_scales.unsqueeze(-1)
             input_scale = group_scales if group_scales is not None else token_scales
             assert input_scale is not None
 

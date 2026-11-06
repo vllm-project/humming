@@ -2,7 +2,7 @@ import pytest
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig
-from humming.config.mma import get_default_mma_type, get_mma_b_dtype
+from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error, get_mma_b_dtype
 from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
@@ -109,9 +109,7 @@ def _make_cases() -> list[KernelTestCase]:
         for b_dtype_str in B_DTYPES:
             for c_dtype_str in C_DTYPES:
                 c_dtype = dtypes.DataType.from_str(c_dtype_str)
-                if a_dtype.num_bits == 16 and a_dtype != c_dtype:
-                    continue
-                if a_dtype == dtypes.float8e5m2 and c_dtype == dtypes.float16:
+                if get_dtype_compatibility_error(a_dtype, c_dtype, c_dtype) is not None:
                     continue
                 b_dtype = dtypes.DataType.from_str(b_dtype_str)
                 if not _is_compatible(a_dtype, b_dtype):

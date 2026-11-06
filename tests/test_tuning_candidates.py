@@ -416,6 +416,7 @@ def test_sampled_backends_match_fixed_layout(
     configs = tuning.sample_test_tuning_configs(layer, compute, sample_size=20)
     assert len(configs) == 20
     assert {config["mma_type"] for config in configs} == expected
+    assert {config["evict_weights_first"] for config in configs} == {False, True}
     assert "mma_type" not in layer.to_dict()
     for config in configs:
         # Exercise the real kernel validators and code generation without compiling.
@@ -423,6 +424,7 @@ def test_sampled_backends_match_fixed_layout(
         kernel = HummingKernel(**(layer.to_dict() | compute.to_dict() | tuning_values))
         assert kernel.mma_type.value == config["mma_type"]
         assert kernel.use_raw_weight == layer.use_raw_weight
+        assert kernel.evict_weights_first == config["evict_weights_first"]
 
 
 @pytest.mark.parametrize("sample_size", (None, 32))
@@ -453,6 +455,7 @@ def test_sampled_umma_covers_cooperative_and_dequant_options(sample_size):
     for name in ("umma_cta_group_size", "umma_num_dequant_warpgroups", "output_chunk_rows"):
         assert {config[name] for config in umma_configs} == set(tuning.SAMPLED_TUNING_VALUES[name])
     assert {config["use_tma_b"] for config in umma_configs} == {False, True}
+    assert {config["evict_weights_first"] for config in umma_configs} == {False, True}
     assert any(config["block_shape"][2] == 32 for config in umma_configs)
     assert {3, 5} <= {config["num_stages"] for config in umma_configs}
     for config in configs:
@@ -516,7 +519,7 @@ def test_umma_architecture_selection(sm_version, a_dtype, b_dtype, small_m_backe
         shape_k=256,
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        c_dtype=dtypes.bfloat16,
+        c_dtype=a_dtype if a_dtype.num_bits == 16 else dtypes.bfloat16,
         **scale_config,
     )
     expected = MmaType.MMA if a_dtype == dtypes.int8 and sm_version in (103, 107) else MmaType.UMMA

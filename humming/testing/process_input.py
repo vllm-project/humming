@@ -3,7 +3,7 @@ import torch
 from humming import dtypes, ops
 from humming.config import ActivationType, InputQuantizationMode, ProcessInputLayoutType
 from humming.config.mma import UNDOCUMENTED_FP_DTYPES, supports_undocumented_fp_dtypes
-from humming.utils.math import is_pow_of_two, round_up
+from humming.utils.math import ceil_div, is_pow_of_two, round_up
 
 ACTIVATION_TYPE_IMPL_TEST_MAP = {
     ActivationType.None_: {
@@ -198,7 +198,9 @@ def quant_input_ref(
         quantized_inputs = tensor_round_to(inputs * static_tensor_scale.reciprocal(), dtype=quant_dtype)
         return quantized_inputs, None, static_tensor_scale
 
-    inputs = inputs.reshape(-1, quant_group_size)
+    # Zero-pad a partial last group; zeros do not change its absmax.
+    pad_columns = -hidden_size % quant_group_size
+    inputs = torch.nn.functional.pad(inputs, (0, pad_columns)).reshape(-1, quant_group_size)
     absmax_val = inputs.abs().max(1)[0]
     dtype_max_val = QUANT_DTYPE_MAX_VAL_MAP[quant_dtype]
     scale = (absmax_val / dtype_max_val).clamp_min(1e-30)
@@ -235,6 +237,9 @@ def quant_input_ref(
         token_scales = scale
 
     quantized_inputs = quantized_inputs.view(shape_m, -1)
+    # Drop the padded columns of a partial last group (int4 values are packed).
+    packed_width = quantized_inputs.size(1) * hidden_size // (hidden_size + pad_columns)
+    quantized_inputs = quantized_inputs[:, :packed_width]
     if group_scales is not None:
         group_scales = group_scales.view(shape_m, -1)
         group_scales = apply_scale_layout_ref(group_scales, use_m_major_input_scale)
@@ -435,7 +440,7 @@ def assert_process_input_close(
 
     if quant_mode.has_group_scale:
         assert quant_group_size is not None
-        num_groups = hidden_size // quant_group_size
+        num_groups = ceil_div(hidden_size, quant_group_size)
         assert actual_group_scales.shape == expected_group_scales.shape
         assert actual_group_scales.dtype == expected_group_scales.dtype
         actual_group_scales = unpack_group_scales(

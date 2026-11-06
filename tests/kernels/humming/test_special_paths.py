@@ -197,12 +197,14 @@ SPECIAL_WEIGHT_CASES = (
 
 
 @pytest.mark.filterwarnings(r"ignore:`torch\.jit\.script_method` is deprecated\. ")
-def test_forward_fullgraph():
-    """Catch graph breaks in the forward path and reuse the graph across token counts."""
+@pytest.mark.parametrize("a_dtype", [dtypes.bfloat16, dtypes.int8], ids=str)
+def test_forward_fullgraph(a_dtype):
+    """Catch graph breaks in the forward path, including input quantization, and
+    reuse the graph across token counts."""
     torch._dynamo.reset()
-    skip_if_unsupported(a_dtype=dtypes.bfloat16)
+    skip_if_unsupported(a_dtype=a_dtype)
     config = _layer_config(
-        a_dtype=dtypes.bfloat16,
+        a_dtype=a_dtype,
         b_dtype=dtypes.uint4,
         bs_dtype=dtypes.bfloat16,
     )

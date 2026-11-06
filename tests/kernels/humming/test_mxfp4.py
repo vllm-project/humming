@@ -7,7 +7,7 @@ import torch
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig
-from humming.config.mma import get_default_mma_type
+from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error
 from humming.schema.compressed_tensors import CompressedTensorsInputSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 from humming.testing import (
@@ -232,7 +232,14 @@ def test_fp4_weight_schema_compatibility(
     has_supported_scales = True
     if a_dtype == "float8e3m4" and sm_version in (100, 103):
         has_supported_scales = group_size == 32 and bs_dtype == "float8e8m0"
-    is_supported = has_supported_groups and has_supported_dtype and has_supported_scales
+    resolved_bs_dtype = dtypes.DataType.from_str(bs_dtype) if bs_dtype is not None else dtypes.bfloat16
+    dtype_error = get_dtype_compatibility_error(activation_dtype, dtypes.bfloat16, resolved_bs_dtype)
+    is_supported = all([
+        has_supported_groups,
+        has_supported_dtype,
+        has_supported_scales,
+        dtype_error is None
+    ])
     assert inputs.is_compatible_with(weight, torch.bfloat16) == is_supported
 
 
@@ -266,4 +273,5 @@ def test_undocumented_weight_schema_compatibility(sm_version, a_dtype, monkeypat
     inputs = HummingInputSchema(a_dtype=a_dtype)
     weight = HummingWeightSchema(b_dtype=dtypes.float8e3m4, weight_scale_group_size=32)
     # Wider activations use software dequantization, so no undocumented hardware operand is required.
-    assert inputs.is_compatible_with(weight, torch.bfloat16)
+    output_dtype = dtypes.float16 if a_dtype == "float16" else dtypes.bfloat16
+    assert inputs.is_compatible_with(weight, dtypes.torch_dtype_map[output_dtype])

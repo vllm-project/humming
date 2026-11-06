@@ -3,7 +3,8 @@ import math
 import numpy as np
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig
+from humming.config import GemmType, LayerConfig, TuningConfig
+from humming.config.mma import get_register_budget_error
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
 from humming.utils.smem import estimate_smem_size_layer
@@ -57,10 +58,18 @@ class PPUSm80Heuristics(DeviceHeuristics):
             block_shape_k = block_shape_k // 2
             num_warps_k = num_warps_k // 2
 
-        # for small block_shape_m, allow 16 warps per cta
+        # A second set of K warps halves the per-thread register budget at the
+        # target CTA residency. Group-scaled INT8 tiles also need an extra
+        # accumulator, so only expand K parallelism when both CTAs still fit.
         if block_shape_m <= 64 and layer_config.shape_k % (block_shape_k * 2) == 0:
-            block_shape_k = block_shape_k * 2
-            num_warps_k = num_warps_k * 2
+            expanded_config = TuningConfig(
+                block_shape=(block_shape_m, block_shape_n, block_shape_k * 2),
+                warp_shape=(block_shape_m, warp_shape_n, warp_shape_k),
+                num_ctas_per_sm=num_ctas_per_sm,
+            )
+            if get_register_budget_error(layer_config, expanded_config, use_f16_accum) is None:
+                block_shape_k = block_shape_k * 2
+                num_warps_k = num_warps_k * 2
 
         # if smem is large enough, try double warp_shape_k and block_shape_k
         if layer_config.shape_k % (block_shape_k * 2) == 0:

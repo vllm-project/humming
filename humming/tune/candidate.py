@@ -310,9 +310,10 @@ def get_problem_rejection_reasons(
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     input_group_size = layer_config.input_scale_group_size
-    unpadded_shape_k = layer_config.shape_k - layer_config.pad_shape_k
-    if input_group_size and layer_config.shape_k != input_group_size and unpadded_shape_k % input_group_size:
-        msg = f"unpadded shape_k={unpadded_shape_k} is not divisible by input scale group={input_group_size}"
+    # A partial last input-scale group is allowed once K is padded to whole groups.
+    is_padded_k_misaligned = bool(input_group_size) and layer_config.shape_k % input_group_size != 0
+    if is_padded_k_misaligned and layer_config.shape_k != input_group_size:
+        msg = f"shape_k={layer_config.shape_k} is not divisible by input scale group={input_group_size}"
         reasons.append(msg)
     mma_type = mma_type or get_default_mma_type(layer_config)
     if mma_type != MmaType.WGMMA:

@@ -37,7 +37,8 @@ private:
   static_assert(!kUseRowMajorTma || SharedStorage::kUseUmmaRowMajorSmemInputScale);
   static constexpr uint32_t kGroupSize = kIsGroupScale ? Ctx::kInputScaleGroupSize : ProblemShape::K;
 
-  static_assert(ProblemShape::K == kGroupSize || (ProblemShape::K - PadShape::K) % kGroupSize == 0);
+  // The unpadded K may end in a partial group; columns past it are zero-filled.
+  static_assert(ProblemShape::K == kGroupSize || ProblemShape::K % kGroupSize == 0);
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K - PadShape::K, kGroupSize);
   static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);
@@ -59,7 +60,22 @@ private:
       kIsIndexedGemm && kIsGroupScale && !kUseMxScale && Ctx::kWgmmaUseLateAS && !Ctx::kUseMBarrier &&
       !Ctx::kUseStreamK && kNumGroups == 1 && kProblemNumGroups % 4 == 0;
 
-  using LoadType = typename LoadTypeChooser<kNumGroups * 4>::Type;
+  // Each vector must also fit the unpadded scale row's alignment.
+  static constexpr uint32_t kLoadBytes = MIN(get_max_load_bytes(kNumGroups * 4), get_max_load_bytes(kProblemNumGroups * 4));
+  using LoadType = typename LoadTypeChooser<kLoadBytes>::Type;
+
+  template <typename T>
+  CUDA_INLINE void load_scale(const T *source, T *destination, bool is_valid_column, bool is_valid_row) {
+    // GEMM traverses padded K, but input scales cover only the original input.
+    if constexpr (PadShape::K != 0 && kIsGroupScale) {
+      if constexpr (kUseCpAsync)
+        legacy_load_zfill_pred<true>(source, destination, is_valid_column, is_valid_row);
+      else if (is_valid_row)
+        legacy_load_zfill<false>(source, destination, is_valid_column);
+    } else {
+      legacy_load_pred<kUseCpAsync>(source, destination, is_valid_row);
+    }
+  }
 
 public:
   Ctx &ctx;
@@ -128,7 +144,8 @@ public:
       auto *destination = reinterpret_cast<RowLoadType *>(slot_words);
       PRAGMA_UNROLL
       for (uint32_t part = 0; part < kRowLoads; part++) {
-        legacy_load_pred<kUseCpAsync>(source + part, destination + part, is_valid_row);
+        uint32_t word = col_offset / 4 - source_shift + part * kLoadWords;
+        load_scale(source + part, destination + part, word * 4 < kProblemNumGroups, is_valid_row);
       }
     }
   }
@@ -155,7 +172,8 @@ public:
       uint32_t row_bound = kIsIndexedGemm ? shape_m : block_shape_m;
       uint32_t pred = logical_offset < kNumInts && gmem_row < row_bound;
 
-      legacy_load_pred<kUseCpAsync>(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, pred);
+      bool is_valid_column = (col_offset / 4 + gmem_col) * 4 < kProblemNumGroups;
+      load_scale(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, is_valid_column, pred);
     } else {
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kNumRows; i++) {
@@ -168,7 +186,8 @@ public:
           uint32_t row_bound = kIsIndexedGemm ? shape_m : block_shape_m;
           uint32_t pred = gmem_row < row_bound;
 
-          legacy_load_pred<kUseCpAsync>(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, pred);
+          bool is_valid_column = (col_offset / 4 + i) * 4 < kProblemNumGroups;
+          load_scale(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, is_valid_column, pred);
         }
       }
     }
@@ -188,9 +207,10 @@ public:
         uint32_t m_vec = i * kNumLoadThreads + thread_id;
         uint32_t gmem_offset = r * total_shape_m_vecs + m_vec;
         uint32_t smem_offset = r * kScaleBlockMVecs + m_vec;
-        legacy_load_pred<kUseCpAsync>(
+        load_scale(
             gmem_ptr_load + gmem_offset,
             smem_ptr_load + smem_offset,
+            (col_offset / 4 + r) * 4 < kProblemNumGroups,
             m_vec < kScaleBlockMVecs && m_vec * kScaleMAlignment < load_shape_m);
       }
     }
@@ -239,8 +259,13 @@ public:
       uint32_t row = i * kNumLoadThreads + thread_id;
       uint32_t source_row = load_row_index[i];
       if (row < BlockShape::M && source_row < shape_m) {
-        if (component == 0)
-          indexed_scale_cache[i] = *reinterpret_cast<const uint4 *>(gmem_ptr + source_row * kProblemNumGroups);
+        if (component == 0) {
+          const auto *source = reinterpret_cast<const uint4 *>(gmem_ptr + source_row * kProblemNumGroups);
+          if constexpr (PadShape::K != 0)
+            indexed_scale_cache[i] = col_offset < kProblemNumGroups ? *source : uint4{};
+          else
+            indexed_scale_cache[i] = *source;
+        }
         const uint4 v = indexed_scale_cache[i];
         smem_ptr_load[row] = component == 0 ? v.x : component == 1 ? v.y : component == 2 ? v.z : v.w;
       }
@@ -264,7 +289,8 @@ public:
             uint32_t global_row = load_row_offset + m_vec * kScaleMAlignment;
             uint32_t gmem_offset = m_vec + (kMMajorInputScale ? g * total_shape_m_vecs : 0);
             uint32_t smem_offset = g * kScaleBlockMVecs + m_vec;
-            legacy_load_pred<kUseCpAsync>(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, global_row < total_shape_m);
+            load_scale(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset,
+                col_offset + g < kProblemNumGroups, global_row < total_shape_m);
           }
         }
       }
@@ -286,7 +312,8 @@ public:
           const LoadType *gmem_ptr_load = reinterpret_cast<const LoadType *>(gmem_ptr);
           LoadType *smem_ptr_load = reinterpret_cast<LoadType *>(smem_ptr);
           bool pred = kIsIndexedGemm ? (gmem_row < shape_m) : (smem_row < block_shape_m);
-          legacy_load_pred<kUseCpAsync>(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, pred);
+          bool is_valid_column = col_offset + smem_col * (sizeof(LoadType) / 4) < kProblemNumGroups;
+          load_scale(gmem_ptr_load + gmem_offset, smem_ptr_load + smem_offset, is_valid_column, pred);
         }
       }
     }

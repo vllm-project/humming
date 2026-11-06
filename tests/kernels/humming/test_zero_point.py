@@ -4,7 +4,7 @@ import pytest
 
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig
-from humming.config.mma import get_default_mma_type, get_mma_b_dtype
+from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error, get_mma_b_dtype
 from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
@@ -31,11 +31,12 @@ C_DTYPES = ("float16", "bfloat16")
 
 
 def _output_dtypes(a_dtype):
-    if a_dtype == dtypes.float16:
-        return (dtypes.float16,)
-    if a_dtype == dtypes.bfloat16 or a_dtype == dtypes.float8e5m2:
-        return (dtypes.bfloat16,)
-    return tuple(dtypes.DataType.from_str(dtype) for dtype in C_DTYPES)
+    output_dtypes = tuple(dtypes.DataType.from_str(dtype) for dtype in C_DTYPES)
+    return tuple(
+        c_dtype
+        for c_dtype in output_dtypes
+        if get_dtype_compatibility_error(a_dtype, c_dtype, c_dtype) is None
+    )
 
 
 def _supports_integer_zero_point(a_dtype, b_dtype) -> bool:

@@ -1,4 +1,5 @@
 import ctypes
+import functools
 import glob
 import json
 import os
@@ -170,7 +171,8 @@ class NVRTCCompiler(Compiler):
         return names, sources
 
     @classmethod
-    def signature(cls):
+    @functools.lru_cache(maxsize=1)
+    def _get_version(cls):
         # The subprocess uses the toolkit library, which can differ from the
         # library selected by cuda-python's bindings.
         library = ctypes.CDLL(get_nvrtc_library_path())
@@ -180,7 +182,12 @@ class NVRTCCompiler(Compiler):
         version.restype = ctypes.c_int
         if version(ctypes.byref(major), ctypes.byref(minor)) != 0:
             raise RuntimeError("Could not query the NVRTC compiler version")
-        return f"nvrtc+{major.value}.{minor.value}"
+        return major.value, minor.value
+
+    @classmethod
+    def signature(cls):
+        major, minor = cls._get_version()
+        return f"nvrtc+{major}.{minor}"
 
     @classmethod
     def get_flags(cls, sm_version, disable_fast_math=False):
@@ -195,7 +202,13 @@ class NVRTCCompiler(Compiler):
             "--ptxas-options=--register-usage-level=10",
             "--diag-suppress=39,161,174,177,940,1444",
             "-default-device",
+            # libcu++ uses 16 under NVRTC but 10 under nvcc; the larger limit adds
+            # ~0.4 s of type_list.h preprocessing to every kernel.
+            "-D_CCCL_META_UNROLL_LIMIT=10",
         ]
+        if cls._get_version() >= (12, 9):
+            # Humming caches CUBINs; avoid driver initialization for NVRTC's cache in each subprocess.
+            flags.append("-no-cache")
         for d in cls._get_include_dirs():
             flags.append(f"-I{d}")
         if disable_fast_math:
@@ -268,6 +281,8 @@ class NVCCCompiler(Compiler):
             "-fopenmp",
             "-lgomp",
         ]
+        if jit_utils.IS_WINDOWS:
+            cxx_flags = ["/O2"]
 
         flags = [
             "-std=c++17",

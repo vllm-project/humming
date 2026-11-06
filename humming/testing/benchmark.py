@@ -37,7 +37,7 @@ def save_benchmark_result(result, args, packages: list[str] | None = None) -> No
     use_f16_accum = kwargs.get("use_f16_accum", False)
 
     data = {
-        "problem": vars(args),
+        "problem": kwargs,
         "device": {
             "device_name": current_device.name,
             "memory_gbps": current_device.memory_bandwidth_gbps,

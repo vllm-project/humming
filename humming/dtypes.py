@@ -12,10 +12,15 @@ class DataType:
     is_floating_point_type: bool = False
     exponent_bits: int = 0
     mantissa_bits: int = 0
+    dtype_str: str = dataclasses.field(init=False, repr=False, compare=False, default="")
 
     def __post_init__(self):
         assert self.__class__ is not DataType
         assert self.is_integer_type or self.is_floating_point_type
+        # Cache the textual form: torch.compile traces ``str(dtype)`` in the
+        # forward path, and tracing a dataclass integer field as a symbolic
+        # int is not supported by Dynamo.
+        self.dtype_str = self.to_str()
 
     @classmethod
     def from_str(cls, s):
@@ -61,7 +66,7 @@ class DataType:
         return str(self) == str(other)
 
     def __repr__(self):
-        return self.to_str()
+        return self.dtype_str
 
     def id(self):
         raise NotImplementedError
@@ -121,6 +126,7 @@ class FloatingPointType(DataType):
         self.sign_bits = self.num_bits - self.exponent_bits - self.mantissa_bits
         assert self.sign_bits in (0, 1)
         self.is_signed = self.sign_bits != 0
+        super().__post_init__()
 
     @classmethod
     def from_str(cls, s):

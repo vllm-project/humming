@@ -8,6 +8,7 @@ from humming.config.mma import get_register_budget_error
 from humming.device import DeviceInfo
 from humming.tune import _get_heuristics_config
 from humming.tune.sm90 import Sm90Heuristics
+from humming.tune.sm90_h20 import Sm90H20Heuristics
 
 
 @pytest.fixture(autouse=True)
@@ -288,7 +289,11 @@ def test_mxfp4_a16_indexed_preserves_warp_k_and_fits_grid(
 
 
 @pytest.mark.parametrize("shape_k", [512, 256])
-def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k):
+@pytest.mark.parametrize(
+    ("shape_m", "block_m", "block_n", "num_ctas"),
+    [(6144, 32, 512, 2), (8192, 40, 512, 1), (10240, 48, 256, 2), (12288, 64, 256, 2)],
+)
+def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k, shape_m, block_m, block_n, num_ctas):
     layer = _layer(
         6144,
         shape_k,
@@ -298,21 +303,17 @@ def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k):
         input_scale_group_size=0,
     )
 
-    small = Sm90Heuristics.get_config(
+    config = Sm90Heuristics.get_config(
         layer,
-        shape_m=6144,
-        gemm_type=GemmType.INDEXED,
-    )
-    large = Sm90Heuristics.get_config(
-        layer,
-        shape_m=8192,
+        shape_m=shape_m,
         gemm_type=GemmType.INDEXED,
     )
 
-    assert small["block_shape"] == (32, 512, 64)
-    assert small["num_ctas_per_sm"] == 2
-    assert large["block_shape"] == (48, 256, 64)
-    assert large["num_ctas_per_sm"] == 2
+    assert config["block_shape"] == (block_m, block_n, 64)
+    assert config["num_ctas_per_sm"] == num_ctas
+    tuning_fields = TuningConfig.get_field_names()
+    tuning = TuningConfig(**{key: value for key, value in config.items() if key in tuning_fields})
+    assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
 
 
 def test_nvfp4_a16_uses_narrow_first_wave_only():
@@ -406,3 +407,110 @@ def test_grouped_w4a8_ranges_match_direct_selection(monkeypatch, device_name, nu
         for shape_m in (lower + 1, min(upper, lower + num_experts * 2048)):
             assert select(layer, shape_m=shape_m, **kwargs) == config
         previous_upper = upper
+
+
+@pytest.mark.parametrize("gemm_type", [GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS])
+@pytest.mark.parametrize("routed_m", [8, 256, 1024])
+def test_small_a16_expert_tiles_use_mma_without_padding(gemm_type, routed_m):
+    layer = _layer(
+        1024,
+        7168,
+        num_experts=256,
+        a_dtype=dtypes.bfloat16,
+        as_dtype=None,
+        bs_dtype=dtypes.float8e4m3,
+        input_scale_group_size=0,
+        weight_scale_group_size=16,
+    )
+    config = Sm90Heuristics.get_config(layer, routed_m, gemm_type=gemm_type)
+
+    assert config["mma_type"] == "mma"
+    assert config["block_shape"][0] == config["warp_shape"][0] == 8
+    assert config["use_stream_k"] is True
+    assert not config.get("use_tma", False)
+    assert not config.get("use_warp_spec", False)
+
+
+@pytest.mark.parametrize("num_experts", [64, 256])
+def test_token_scaled_grouped_selects_residency_from_expert_tiles(num_experts):
+    layer = _layer(1536, 3072, num_experts=num_experts, input_scale_group_size=0)
+    config = Sm90Heuristics.get_config(
+        layer, shape_m=256, gemm_type=GemmType.GROUPED_CONTIGUOUS, use_m_major_input_scale=True
+    )
+    assert not layer.use_packed_k_layout
+    assert not config["use_warp_spec"]
+    assert not config["use_tma"]
+    assert config["num_ctas_per_sm"] == (3 if num_experts == 64 else 2)
+    tuning_values = {key: value for key, value in config.items() if key in TuningConfig.get_field_names()}
+    tuning = TuningConfig(**tuning_values)
+    assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
+
+
+def test_token_scaled_grouped_keeps_overlap_for_short_grid():
+    layer = _layer(4096, 7168, num_experts=256, input_scale_group_size=0)
+    config = Sm90Heuristics.get_config(layer, shape_m=8, gemm_type=GemmType.GROUPED_CONTIGUOUS)
+    assert config["num_ctas_per_sm"] == 1
+    assert config["use_warp_spec"]
+
+
+def test_token_scaled_grouped_can_reuse_weights_across_large_m_tile():
+    layer = _layer(4096, 7168, num_experts=256, input_scale_group_size=0)
+    config = Sm90Heuristics.get_config(
+        layer, shape_m=32768, gemm_type=GemmType.GROUPED_CONTIGUOUS, use_m_major_input_scale=True
+    )
+    assert config["block_shape"][0] > 128
+    assert config["use_warp_spec"]
+    assert not config["wgmma_use_late_as"]
+    tuning_values = {key: value for key, value in config.items() if key in TuningConfig.get_field_names()}
+    tuning = TuningConfig(**tuning_values)
+    assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
+
+
+@pytest.mark.parametrize("input_scale_group_size", [0, 128])
+@pytest.mark.parametrize("shape_n,shape_k", [(1536, 3072), (2816, 1792), (3072, 6144)])
+@pytest.mark.parametrize("routed_m", [192, 2560, 32768])
+def test_indexed_a8_residency_fits_registers(input_scale_group_size, shape_n, shape_k, routed_m):
+    layer = _layer(shape_n, shape_k, num_experts=64, input_scale_group_size=input_scale_group_size)
+    config = Sm90Heuristics.get_config(layer, routed_m, gemm_type=GemmType.INDEXED)
+    tuning_values = {key: value for key, value in config.items() if key in TuningConfig.get_field_names()}
+    tuning = TuningConfig(**tuning_values)
+    assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
+
+
+def test_indexed_token_scale_keeps_residency_when_an_extra_wave_dominates():
+    layer = _layer(1536, 3072, num_experts=64, input_scale_group_size=0)
+    config = Sm90Heuristics.get_config(layer, shape_m=256, gemm_type=GemmType.INDEXED)
+    assert config["num_ctas_per_sm"] == 1
+    assert config["use_warp_spec"]
+
+
+@pytest.mark.parametrize("heuristics,num_sms", [(Sm90Heuristics, 132), (Sm90H20Heuristics, 78)])
+@pytest.mark.parametrize(
+    "gemm_type", [GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED]
+)
+@pytest.mark.parametrize("input_scale_group_size", [0, 128])
+@pytest.mark.parametrize("shape_n", [4096, 4224])
+@pytest.mark.parametrize("routed_m,use_stream_k", [(8, True), (65536, False)])
+def test_long_k_moe_stream_k_depends_on_grid_size(
+    monkeypatch, heuristics, num_sms, gemm_type, input_scale_group_size, shape_n, routed_m, use_stream_k
+):
+    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: num_sms))
+    layer = _layer(shape_n, 7168, num_experts=256, input_scale_group_size=input_scale_group_size)
+    config = heuristics.get_config(layer, routed_m, gemm_type=gemm_type, use_m_major_input_scale=True)
+    assert config["use_stream_k"] is use_stream_k
+
+
+@pytest.mark.parametrize("heuristics,num_sms", [(Sm90Heuristics, 132), (Sm90H20Heuristics, 78)])
+@pytest.mark.parametrize("gemm_type", [GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS])
+@pytest.mark.parametrize("shape_n", [4096, 4224])
+@pytest.mark.parametrize("routed_m", [16384, 65536])
+def test_large_token_scaled_moe_considers_wider_m_tiles(
+    monkeypatch, heuristics, num_sms, gemm_type, shape_n, routed_m
+):
+    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: num_sms))
+    layer = _layer(shape_n, 2048, num_experts=256, input_scale_group_size=0)
+    config = heuristics.get_config(layer, routed_m, gemm_type=gemm_type, use_m_major_input_scale=True)
+    assert config["block_shape"][0] > 64
+    assert not config["use_stream_k"]
+    tuning_values = {key: value for key, value in config.items() if key in TuningConfig.get_field_names()}
+    assert get_register_budget_error(layer, TuningConfig(**tuning_values), registers_per_sm=65536) is None

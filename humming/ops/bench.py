@@ -5,7 +5,7 @@ from humming.device import current_device
 from humming.kernel.tops_bench import TopsBenchKernel
 
 
-def tops_bench(dtype: str, mma_type: str | None = None, use_f16_accum: bool = False) -> int:
+def tops_bench(dtype: str, mma_type: str | None = None, use_f16_accum: bool = False) -> float:
     if mma_type is None:
         mma_type = "wgmma" if current_device.sm_major == 9 else "mma"
 
@@ -16,8 +16,8 @@ def tops_bench(dtype: str, mma_type: str | None = None, use_f16_accum: bool = Fa
         dtype_bits = dtypes.DataType.from_str(dtype).num_bits
         mma_shape_k = mma_k_bits // dtype_bits
     else:
-        mma_shape_m = 64
-        mma_shape_n = 256
+        mma_shape_m = 256
+        mma_shape_n = 64
         mma_shape_k = 256 // dtypes.DataType.from_str(dtype).num_bits
 
     if "float" in dtype:

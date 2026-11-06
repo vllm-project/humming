@@ -450,13 +450,16 @@ class QuarkWeightSchema(BaseWeightSchema):
                     shape_n_stacks,
                     shape_k_stacks,
                     num_experts or None,
-                    target_group_size=schema.weight_scale_group_size or None,
+                    target_group_size=schema.weight_scale_group_size if len(shape_k_stacks) > 1 else None,
                 )
                 is_group_scale = schema.weight_scale_type == WeightScaleType.GROUP
                 keep_scale_2 = schema.bs_dtype is not None and is_group_scale
                 if keep_scale_2 and scale_2.numel() == (num_experts or 1):
                     schema.weight_scale_2_type = WeightScale2Type.TENSOR
                     result["weight_scale_2"] = scale_2.reshape(num_experts or 1).float()
+                elif keep_scale_2 and len(shape_n_stacks) > 1:
+                    schema.weight_scale_2_type = WeightScale2Type.CHANNEL
+                    result["weight_scale_2"] = scale_2.squeeze(-1).to(param_dtype)
                 else:
                     if scale_2.numel() == (num_experts or 1):
                         scale_2 = scale_2.reshape(-1, 1, 1) if num_experts else scale_2.reshape(())

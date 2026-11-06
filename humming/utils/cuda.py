@@ -5,6 +5,9 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+import humming.utils.jit as jit_utils
 
 
 def _parse_major_minor(s):
@@ -36,10 +39,11 @@ def _read_cuda_system_version(cuda_home):
         except OSError:
             pass
 
-    nvcc_path = os.path.join(cuda_home, "bin/nvcc")
+    nvcc_name = "nvcc.exe" if jit_utils.IS_WINDOWS else "nvcc"
+    nvcc_path = os.path.join(cuda_home, "bin", nvcc_name)
     if os.path.exists(nvcc_path):
         try:
-            output = subprocess.check_output(["nvcc", "-V"]).decode()
+            output = subprocess.check_output([nvcc_path, "-V"]).decode()
             m = re.search(r"release (\d+)\.(\d+),", output)
             if m:
                 return int(m.group(1)), int(m.group(2))
@@ -77,6 +81,8 @@ _COMMON_BINARIES = ("nvcc", "ptxas", "cuobjdump", "nvdisasm", "compute-sanitizer
 
 
 def _find_binary(root, name):
+    if jit_utils.IS_WINDOWS:
+        name += ".exe"
     candidates = [
         os.path.join(root, "bin", name),
         os.path.join(root, "cuda_nvcc", "bin", name),
@@ -85,6 +91,27 @@ def _find_binary(root, name):
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c
     return None
+
+
+def get_cuda_arch_directory_names() -> tuple[str, ...]:
+    return ("arm64",) if jit_utils.get_native_arch() == "aarch64" else ("x64", "x86_64")
+
+
+def get_cuda_library_path(name: str) -> Path:
+    environment = filter_cuda_paths()
+    root = Path(environment["path"])
+    arch_names = get_cuda_arch_directory_names()
+    candidates = [
+        *[root / "lib" / arch for arch in arch_names],
+        root / "lib",
+        *[directory for arch in arch_names for directory in sorted(root.glob(f"*/lib/{arch}"))],
+        *sorted(root.glob("*/lib")),
+    ]
+    for directory in candidates:
+        library = directory / name
+        if library.is_file():
+            return library.resolve()
+    raise RuntimeError(f"Could not locate {name} in CUDA environment {root}")
 
 
 def _collect_binaries(root):
@@ -149,6 +176,8 @@ def filter_cuda_paths(
     if target_version is None:
         import torch
 
+        if torch.version.cuda is None:
+            raise RuntimeError("CUDA-enabled PyTorch is required to select a CUDA environment")
         target_major, _ = _parse_major_minor(torch.version.cuda)
         target_minor = None
     else:
@@ -210,6 +239,8 @@ def find_all_cuda_paths():
         candidates.append(os.path.join(os.environ["PPU_SDK"], "CUDA_SDK"))
     if "CUDA_HOME" in os.environ:
         candidates.append(os.environ["CUDA_HOME"])
+    if "CUDA_PATH" in os.environ:
+        candidates.append(os.environ["CUDA_PATH"])
 
     for path in candidates:
         if not os.path.isdir(path):

@@ -15,7 +15,7 @@ from filelock import FileLock
 from torch._subclasses.fake_tensor import FakeTensor
 
 import humming.utils.jit as jit_utils
-from humming.utils.cuda import filter_cuda_paths
+from humming.utils.cuda import filter_cuda_paths, get_cuda_library_path
 
 _libs = {}
 _launcher_inited = False
@@ -195,7 +195,8 @@ def _get_precompiled_launcher_path() -> Path | None:
 
     humming_dir = Path(__file__).parents[1]
     csrc_dir = humming_dir / "csrc" / "launcher"
-    return jit_utils.get_precompiled_artifact_path(csrc_dir, "libhumming_launcher.so")
+    artifact_name = jit_utils.get_native_artifact_name("launcher")
+    return jit_utils.get_precompiled_artifact_path(csrc_dir, artifact_name)
 
 
 def init_humming_launcher():
@@ -229,14 +230,30 @@ def init_humming_launcher():
         )
 
         extra_cflags = ["-O3", f"-DUSE_TORCH_STABLE_API={int(USE_TORCH_STABLE_API)}"]
+        extra_ldflags = ["-lcuda", "-lc10_cuda", "-ltorch_cuda"]
+        if jit_utils.IS_WINDOWS:
+            extra_cflags = [
+                "/O2",
+                "/DNOMINMAX",
+                f"/DUSE_TORCH_STABLE_API={int(USE_TORCH_STABLE_API)}",
+            ]
+            torch_lib_dir = Path(torch.__file__).parent / "lib"
+            extra_ldflags = [
+                str(get_cuda_library_path("cuda.lib")),
+                str(torch_lib_dir / "c10_cuda.lib"),
+                str(torch_lib_dir / "torch_cuda.lib"),
+                "delayimp.lib",
+                "/DELAYLOAD:nvcuda.dll",
+            ]
         if USE_TORCH_STABLE_API:
-            extra_cflags.append("-DTORCH_TARGET_VERSION=0x020B000000000000")
+            define_flag = "/D" if jit_utils.IS_WINDOWS else "-D"
+            extra_cflags.append(f"{define_flag}TORCH_TARGET_VERSION=0x020B000000000000")
 
         torch.utils.cpp_extension.load(
             name="humming_launcher",
             sources=[filename],
             extra_include_paths=list(cuda_env["include_paths"]),
-            extra_ldflags=["-lcuda", "-lc10_cuda", "-ltorch_cuda"],
+            extra_ldflags=extra_ldflags,
             extra_cflags=extra_cflags,
             build_directory=build_dir,
             is_python_module=False,
@@ -248,6 +265,13 @@ def init_humming_launcher():
 def build_humming_launcher_in_bg():
     if os.getenv("HUMMING_DISABLE_PARALLEL_BUILD", "0") == "1":
         return None
+    use_torch_stable_api = _resolve_use_torch_stable_api()
+    has_usable_precompiled_launcher = (
+        use_torch_stable_api and _get_precompiled_launcher_path() is not None
+    )
+    if has_usable_precompiled_launcher:
+        return None
+
     cmd = "import humming.ops.utils; humming.ops.utils.init_humming_launcher()"
     env = os.environ.copy()
     env["HUMMING_DISABLE_PARALLEL_BUILD"] = "1"

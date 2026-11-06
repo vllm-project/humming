@@ -57,6 +57,7 @@ public:
   // Tile-wide dependencies are handled at the epilogue's entry/exit boundaries.
   static constexpr uint32_t kWarpgroupColumns = WarpShape::N * 4;
   static constexpr bool kUseWarpgroupEpilogue = SharedStorage::kUseWarpgroupOutput;
+  static constexpr bool kHasNativeAtomicAdd = Ctx::kSmVersion >= 90 || !std::is_same<ElementC, BFloat16>::value;
 
   Ctx &ctx;
   ArithClass &arith;
@@ -165,7 +166,7 @@ public:
         uint32_t gmem_offset = gmem_row * ((ProblemShape::N - PadShape::N) / 8) + gmem_col;
         if (!kUseStreamK || slice_count == 1 || slice_id == 0) {
           gmem_ptr[gmem_offset] = val;
-        } else if (slice_count > 3) {
+        } else if (kHasNativeAtomicAdd && slice_count > 3) {
           atomic_reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);
         } else {
           gmem_ptr[gmem_offset] = reduce_add_f162<scalar_t2>(val, gmem_ptr[gmem_offset]);

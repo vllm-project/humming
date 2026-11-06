@@ -1,13 +1,15 @@
 import pytest
 import torch
 
-from humming.config import InputQuantizationMode
+from humming import dtypes
+from humming.config import InputQuantizationMode, ProcessInputProblemConfig
 from humming.ops.input import process_input
 from humming.testing.process_input import (
     assert_process_input_close,
     process_input_ref,
     skip_if_process_input_unsupported,
 )
+from humming.utils.math import ceil_div
 
 
 @pytest.mark.parametrize("use_pdl", [False, True])
@@ -31,6 +33,15 @@ from humming.testing.process_input import (
         (3, 768, 128, "static_tensor_dynamic_group", "float8e8m0", False),
         (3, 768, 128, "dynamic_group_token", "float8e4m3", False),
         (129, 32768, 512, "dynamic_group_token", "float8e4m3", True),
+        # Partial last group, e.g. a TP-split MoE intermediate (2304 / 4 = 576).
+        (3, 576, 128, "dynamic_group", "float32", False),
+        (3, 576, 128, "dynamic_group", "float32", True),
+        (129, 288, 128, "dynamic_group", "float32", False),
+        (2049, 2880, 128, "dynamic_group", "float32", False),
+        (3, 576, 128, "dynamic_group", "float8e8m0", False),
+        (3, 576, 128, "dynamic_group", "float8e4m3", True),
+        (3, 576, 128, "static_tensor_dynamic_group", "float32", False),
+        (3, 576, 128, "dynamic_group_token", "float8e4m3", False),
     ],
 )
 def test_quantization_scales(
@@ -46,13 +57,13 @@ def test_quantization_scales(
     skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
     torch.manual_seed(0)
 
-    num_groups = hidden_size // quant_group_size
+    num_groups = ceil_div(hidden_size, quant_group_size)
     inputs = torch.randn(shape_m, num_groups, quant_group_size, device="cuda")
 
     group_exponents = torch.arange(num_groups, device="cuda") % 5 - 2
     group_amplitudes = torch.exp2(group_exponents.float())
     inputs *= group_amplitudes[None, :, None]
-    inputs = inputs.flatten(1)
+    inputs = inputs.flatten(1)[:, :hidden_size].contiguous()
     inputs[0] = 0
 
     quant_mode = InputQuantizationMode(quant_mode)
@@ -115,3 +126,50 @@ def test_group_token_scales_with_cold_inputs():
         expected = process_input_ref(inputs, **options)
 
         assert_process_input_close(actual, expected, **options)
+
+
+@pytest.mark.parametrize("use_m_major_input_scale", [False, True])
+@pytest.mark.parametrize(
+    "hidden_size,quant_mode,quant_dtype,quant_group_size,group_scale_dtype",
+    [
+        (2880, "dynamic_group", "float8e4m3", 32, "float8e8m0"),
+        (2880, "dynamic_group", "float4e2m1", 32, "float8e8m0"),
+        (2880, "dynamic_group", "int8", 32, "float8e4m3"),
+        (2848, "dynamic_group_token", "float4e2m1", 16, "float8e4m3"),
+        (32800, "dynamic_group_token", "float4e2m1", 16, "float8e4m3"),
+    ],
+)
+def test_packed_group_scale_padding_is_zeroed(
+    hidden_size,
+    quant_mode,
+    quant_dtype,
+    quant_group_size,
+    group_scale_dtype,
+    use_m_major_input_scale,
+):
+    """8-bit scales are packed four groups per word, and GEMMs with padded K read the unused groups of the
+    last word. Start from a NaN-filled buffer so stale bytes cannot pass as zero."""
+    skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
+    torch.manual_seed(0)
+
+    shape_m = 5
+    num_groups = hidden_size // quant_group_size
+    assert num_groups % 4 != 0
+    inputs = torch.randn(shape_m, hidden_size, device="cuda")
+    options = dict(
+        quant_mode=quant_mode,
+        quant_dtype=quant_dtype,
+        quant_group_size=quant_group_size,
+        group_scale_dtype=group_scale_dtype,
+        use_m_major_input_scale=use_m_major_input_scale,
+    )
+
+    problem = ProcessInputProblemConfig(input_dtype=dtypes.float32, hidden_size=hidden_size, **options)
+    group_scales = torch.full(problem.get_group_scale_shape(shape_m), -1, dtype=torch.int32, device="cuda")
+    actual = process_input(inputs, group_scales=group_scales, **options)
+    expected = process_input_ref(inputs, **options)
+    assert_process_input_close(actual, expected, **options)
+
+    packed_rows = group_scales.T if use_m_major_input_scale else group_scales
+    scale_bytes = packed_rows.contiguous().view(torch.uint8)[:shape_m]
+    assert torch.all(scale_bytes[:, num_groups:] == 0)

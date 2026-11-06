@@ -5,8 +5,8 @@ import os
 import numpy as np
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType, SmemReuseMode
-from humming.config.mma import get_default_mma_type, get_mma_b_dtype
+from humming.config import GemmType, LayerConfig, MmaType, SmemReuseMode, TuningConfig
+from humming.config.mma import get_default_mma_type, get_mma_b_dtype, get_register_budget_error
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
 from humming.tune.sm8x import Sm80Heuristics
@@ -91,8 +91,8 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         if block_m != warp_m:
             return config
 
-        # Small M needs little math parallelism. Use four warps per CTA and
-        # two resident CTAs instead of expanding K to fill a single CTA.
+        # Small M needs little math parallelism. Use four warps per CTA
+        # instead of expanding K to fill a single CTA.
         # Start from the existing M/N grid and Stream-K policy for dense and MoE.
         warp_n = min(64, block_n // 2)
         n_warps = block_n // warp_n
@@ -128,12 +128,62 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         )
         if smem_size * 2 > cls.max_smem_size:
             return config
-        return config | {
+        config = config | {
             "block_shape": block_shape,
             "warp_shape": warp_shape,
             "num_ctas_per_sm": 2,
             "num_stages": num_stages,
         }
+        if not layer_config.num_experts or layer_config.a_dtype.num_bits != 16:
+            return config
+
+        # More resident CTAs hide memory latency across small expert tiles.
+        num_stages = max(num_stages, min(4, layer_config.shape_k // block_k))
+        if config["use_stream_k"]:
+            m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
+            output_tiles = m_tiles * (layer_config.shape_n // block_n)
+            k_iters = layer_config.shape_k // block_k
+            slice_iters = math.ceil(output_tiles * k_iters / (config["num_sms"] * 4))
+            if min(slice_iters, k_iters) < 2 * num_stages:
+                return config
+        candidate = config | {"num_ctas_per_sm": 4, "num_stages": num_stages}
+        candidates = [candidate]
+        can_widen_indexed_tile = gemm_type == GemmType.INDEXED and block_m <= 16 and block_n < 256
+        has_aligned_wide_tile = layer_config.shape_n % 256 == 0 and layer_config.shape_k % warp_k == 0
+        if can_widen_indexed_tile and has_aligned_wide_tile:
+            m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
+            wide_output_tiles = m_tiles * (layer_config.shape_n // 256)
+            resident_ctas = config["num_sms"] * candidate["num_ctas_per_sm"]
+            if wide_output_tiles >= resident_ctas:
+                wide_candidate = candidate | {
+                    "block_shape": (block_m, 256, warp_k),
+                    "warp_shape": (warp_m, 64, warp_k),
+                }
+                candidates.insert(0, wide_candidate)
+
+        for candidate in candidates:
+            tuning = TuningConfig(
+                mma_type=MmaType.MMA,
+                block_shape=candidate["block_shape"],
+                warp_shape=candidate["warp_shape"],
+                num_ctas_per_sm=4,
+                num_stages=num_stages,
+                use_warp_spec=config.get("use_warp_spec", False),
+            )
+            smem_size = estimate_smem_size_layer(
+                layer_config,
+                candidate["block_shape"],
+                gemm_type,
+                num_stages,
+                mma_type=MmaType.MMA,
+                warp_shape=candidate["warp_shape"],
+                output_chunk_rows=config["output_chunk_rows"],
+                mma_accum_bits=16 if use_f16_accum else 32,
+            )
+            fits_registers = get_register_budget_error(layer_config, tuning, use_f16_accum) is None
+            if smem_size * 4 <= cls.max_smem_size and fits_registers:
+                return candidate
+        return config
 
 
 class Sm100UmmaHeuristics(DeviceHeuristics):
@@ -142,6 +192,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
     b16_allowed_dtypes = [dtypes.float16, dtypes.bfloat16]
     b8_allowed_dtypes = [dtypes.int8, dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e3m4]
     b4_allowed_dtypes = [dtypes.float4e2m1, dtypes.float4e0m3]
+
+    @staticmethod
+    def _has_mixed_raw_weight(layer_config):
+        return layer_config.use_raw_weight and layer_config.a_dtype.num_bits != layer_config.b_dtype.num_bits
 
     @staticmethod
     def _get_tmem_columns(layer_config, block_shape, num_stages, num_ctas_per_sm, cta_group_size=1):
@@ -325,8 +379,19 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                 break
             block_m = candidate_m
 
+        m_tiles = math.ceil(shape_m / block_m)
+        has_sparse_grid = m_tiles * n_blocks * 4 < num_sms
+        has_repeated_weights = m_tiles >= 3 and shape_m <= 128
+        has_long_stream_k = k_iters >= 48 and config["use_stream_k"]
+        should_stream_k = has_long_stream_k and (has_sparse_grid or has_repeated_weights)
+        if cls._has_mixed_raw_weight(layer_config) and should_stream_k:
+            return config
+
         # Short stages leave the tensor cores idle between loads: double K when four stages fit.
-        for block_k, num_stages in ((2 * stage_k, 4), (stage_k, 4), (stage_k, 3), (stage_k, 2)):
+        stage_choices = [(2 * stage_k, 4), (stage_k, 4), (stage_k, 3), (stage_k, 2)]
+        if cls._has_mixed_raw_weight(layer_config):
+            stage_choices.insert(0, (2 * stage_k, 5))
+        for block_k, num_stages in stage_choices:
             if layer_config.shape_k % block_k:
                 continue
             block_shape = (block_m, 128, block_k)
@@ -403,6 +468,158 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                     "num_stages": num_stages,
                 }
         return config
+
+    @classmethod
+    def _get_deepest_stages(
+        cls, layer_config, block_shape, cta_group_size, max_stages, use_m_major_input_scale
+    ):
+        output_chunk_rows = 32 if cta_group_size == 2 or block_shape[0] > 32 else 0
+        for num_stages in range(max_stages, 1, -1):
+            fits_resources = cls._fits_resources(
+                layer_config,
+                block_shape,
+                num_stages,
+                1,
+                cta_group_size=cta_group_size,
+                output_chunk_rows=output_chunk_rows,
+                use_m_major_input_scale=use_m_major_input_scale,
+            )
+            if fits_resources:
+                return num_stages
+        return 0
+
+    @classmethod
+    def _select_mixed_raw_m_tile(cls, layer_config, shape_m, config, use_m_major_input_scale=False):
+        if not cls._has_mixed_raw_weight(layer_config) or not 32 < shape_m <= 256:
+            return config
+        stage_k = 1024 // layer_config.a_dtype.num_bits
+        shape_n, shape_k = layer_config.shape_n, layer_config.shape_k
+        if shape_n % 128 or shape_k % stage_k:
+            return config
+        num_sms = current_device.sm_count
+        can_pair = shape_n % 256 == 0
+
+        if not config["use_stream_k"]:
+            block_m, block_n, _ = config["block_shape"]
+            if block_m < 96 or block_n != 128 or not can_pair:
+                return config
+            # Each CTA needs eight-row alignment; size resources after aligning the pair.
+            block_m = round_up(block_m, 16)
+            use_stream_k = False
+            cta_group_size = 2
+        else:
+            has_wide_n = shape_n // 128 > num_sms
+            if has_wide_n and shape_m < 64:
+                return config
+            block_m = round_up(shape_m, 16 if has_wide_n else 32)
+            k_iters = shape_k // stage_k
+            half_m = round_up(math.ceil(shape_m / 2), 32)
+            half_pairs = 2 * (shape_n // 256)
+            fills_pair_wave = can_pair and 0.8 * (num_sms // 2) <= half_pairs <= num_sms // 2
+            if block_m > 128 and half_m >= 128 and fills_pair_wave and k_iters < 96:
+                block_m = half_m
+            cta_group_size = 2 if block_m >= 128 and can_pair else 1
+
+        block_shape = (block_m, 128, 2 * stage_k)
+        num_stages = 0
+        if cta_group_size == 2 and block_m <= 128 and shape_k % (2 * stage_k) == 0:
+            num_stages = cls._get_deepest_stages(
+                layer_config, block_shape, cta_group_size, 4, use_m_major_input_scale
+            )
+        if num_stages < 4:
+            block_shape = (block_m, 128, stage_k)
+            num_stages = cls._get_deepest_stages(
+                layer_config, block_shape, cta_group_size, 7, use_m_major_input_scale
+            )
+        if not num_stages:
+            return config
+        if config["use_stream_k"]:
+            block_k = block_shape[2]
+            k_iters = shape_k // block_k
+            resident_ctas = num_sms // cta_group_size
+            output_tiles = math.ceil(shape_m / block_m) * (shape_n // (128 * cta_group_size))
+            data_parallel_work = math.ceil(output_tiles / resident_ctas) * k_iters
+            stream_k_work = cls._get_stream_k_work(
+                layer_config, output_tiles, k_iters, block_k, num_stages, resident_ctas
+            )
+            use_stream_k = stream_k_work + 2 * num_stages < data_parallel_work
+
+        return config | {
+            "block_shape": block_shape,
+            "warp_shape": (block_m, 32, block_shape[2]),
+            "num_stages": num_stages,
+            "num_ctas_per_sm": 1,
+            "use_stream_k": use_stream_k,
+            "use_tma": True,
+            "use_tma_a": True,
+            "use_tma_c": True,
+            "umma_cta_group_size": cta_group_size,
+            "output_chunk_rows": 32 if cta_group_size == 2 or block_m > 32 else 0,
+        }
+
+    @staticmethod
+    def _has_costly_dequant(layer_config):
+        b_dtype = layer_config.b_dtype
+        has_wide_integer = b_dtype.is_integer_type and b_dtype.num_bits > layer_config.a_dtype.mantissa_bits
+        return layer_config.has_zero_point or has_wide_integer
+
+    @classmethod
+    def _select_converted_weight_tile(cls, layer_config, shape_m, config):
+        if layer_config.use_raw_weight or layer_config.a_dtype.num_bits != 16:
+            return config
+        stage_k = 1024 // layer_config.a_dtype.num_bits
+        shape_n, shape_k = layer_config.shape_n, layer_config.shape_k
+        if shape_n % 128 or shape_k % (2 * stage_k):
+            return config
+        num_sms = current_device.sm_count
+        wide_k_iters = shape_k // (2 * stage_k)
+        can_split_m = not cls._has_costly_dequant(layer_config) and wide_k_iters < 96
+        min_split_m = 32 if wide_k_iters < 48 else 96
+
+        m_blocks = math.ceil(shape_m / 256)
+        selected_tile = None
+        for m_splits in range(1, 5):
+            block_m = round_up(math.ceil(shape_m / (m_blocks * m_splits)), 16)
+            if m_splits > 1 and (not can_split_m or block_m < min_split_m):
+                break
+            cta_group_size = 2 if block_m >= 96 and shape_n % 256 == 0 else 1
+            resident_ctas = num_sms // cta_group_size
+            output_tiles = math.ceil(shape_m / block_m) * (shape_n // (128 * cta_group_size))
+            if m_splits > 1 and output_tiles > resident_ctas:
+                break
+            if m_splits == 1 or output_tiles >= 0.75 * resident_ctas:
+                selected_tile = (block_m, cta_group_size, output_tiles, resident_ctas)
+        block_m, cta_group_size, output_tiles, resident_ctas = selected_tile
+
+        is_short_tile = block_m <= 128
+        block_k = 2 * stage_k if is_short_tile else stage_k
+        k_iters = shape_k // block_k
+        block_shape = (block_m, 128, block_k)
+        max_stages = 8 if is_short_tile else 6
+        num_stages = cls._get_deepest_stages(layer_config, block_shape, cta_group_size, max_stages, False)
+        if num_stages < 2:
+            return config
+        data_parallel_work = math.ceil(output_tiles / resident_ctas) * k_iters
+        stream_k_work = cls._get_stream_k_work(
+            layer_config, output_tiles, k_iters, block_k, num_stages, resident_ctas
+        )
+        candidate = config | {
+            "block_shape": block_shape,
+            "warp_shape": (block_m, 32, block_k),
+            "num_stages": num_stages,
+            "num_ctas_per_sm": 1,
+            "use_stream_k": stream_k_work + 2 * num_stages < data_parallel_work,
+            "use_tma": True,
+            "use_tma_a": True,
+            "use_tma_c": True,
+            "umma_cta_group_size": cta_group_size,
+            "output_chunk_rows": 32 if cta_group_size == 2 or block_m > 32 else 0,
+        }
+        candidate.pop("umma_num_dequant_warpgroups", None)
+        candidate = cls._select_dequant_warpgroups(layer_config, shape_m, candidate)
+        if get_register_budget_error(layer_config, TuningConfig(**candidate)) is not None:
+            return config
+        return candidate
 
     @classmethod
     def _select_stream_k(cls, layer_config, shape_m, config):
@@ -487,6 +704,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                     # With one CTA, wider N provides more work per stage.
                     output_groups = block_n // 128
                     target_stages = 5 - output_groups - (num_ctas_per_sm - 1)
+                    if cls._has_mixed_raw_weight(layer_config):
+                        if num_ctas_per_sm == 2:
+                            continue
+                        target_stages = 8 if output_groups == 1 else 5
                     target_stages = min(target_stages, max(2, k_iters))
                     for num_stages in range(target_stages, 1, -1):
                         fits_resources = cls._fits_resources(
@@ -538,18 +759,87 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                             config = cls._select_low_bit_m_tile(
                                 layer_config, shape_m, config, use_m_major_input_scale
                             )
+                            config = cls._select_mixed_raw_m_tile(
+                                layer_config, shape_m, config, use_m_major_input_scale
+                            )
                         config = cls._select_cooperative_ctas(
                             layer_config, shape_m, config, use_m_major_input_scale
                         )
                         config = cls._select_stream_k(layer_config, shape_m, config)
-                        return cls._select_dequant_warpgroups(layer_config, shape_m, config)
+                        config = cls._select_dequant_warpgroups(layer_config, shape_m, config)
+                        if not use_batch_invariant:
+                            config = cls._select_converted_weight_tile(layer_config, shape_m, config)
+                        return config
 
         raise ValueError("no resource-feasible dense UMMA tile for this layer")
 
     @classmethod
+    def _select_grouped_epilogue(
+        cls, layer_config, shape_m, config, gemm_type, use_m_major_input_scale=False
+    ):
+        is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
+        has_native_low_bit_weights = layer_config.use_raw_weight and layer_config.a_dtype.num_bits <= 8
+        if is_grouped and has_native_low_bit_weights:
+            k_iters = layer_config.shape_k // config["block_shape"][2]
+            if k_iters <= config["num_stages"] + 1:
+                return config | {"use_tma_c": False}
+
+        is_grouped_a16 = gemm_type == GemmType.GROUPED_CONTIGUOUS and layer_config.a_dtype.num_bits == 16
+        if not is_grouped_a16 or layer_config.use_raw_weight or layer_config.use_flat_weight:
+            return config
+
+        block_m, block_n, block_k = config["block_shape"]
+        num_stages = config["num_stages"]
+        num_ctas = config["num_ctas_per_sm"]
+        is_short_reduction = layer_config.shape_k // block_k <= 3 * num_stages
+        m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
+        output_tiles = m_tiles * (layer_config.shape_n // block_n)
+        has_persistent_work = output_tiles >= 2 * current_device.sm_count * num_ctas
+        if not is_short_reduction or not has_persistent_work:
+            return config
+
+        output_chunk_rows = 32
+        if not cls._fits_resources(
+            layer_config,
+            config["block_shape"],
+            num_stages,
+            num_ctas,
+            gemm_type,
+            output_chunk_rows=output_chunk_rows,
+            use_m_major_input_scale=use_m_major_input_scale,
+        ):
+            return config
+
+        # Small output chunks release accumulators sooner and shorten register live ranges.
+        config = config | {
+            "output_chunk_rows": output_chunk_rows,
+            "producer_stage_unroll": 1,
+            "consumer_stage_unroll": 1,
+        }
+        # Wider N amortizes tile transitions when the reduction has few pipeline turns.
+        wider_n = 2 * block_n
+        if layer_config.shape_n % wider_n == 0:
+            wider_shape = (block_m, wider_n, block_k)
+            if cls._fits_resources(
+                layer_config,
+                wider_shape,
+                num_stages,
+                num_ctas,
+                gemm_type,
+                output_chunk_rows=output_chunk_rows,
+                use_m_major_input_scale=use_m_major_input_scale,
+            ):
+                config = config | {"block_shape": wider_shape}
+        return config
+
+    @classmethod
     @functools.lru_cache(maxsize=64)
     def _get_moe_candidates(
-        cls, layer_config: LayerConfig, gemm_type: GemmType, use_m_major_input_scale: bool = False
+        cls,
+        layer_config: LayerConfig,
+        gemm_type: GemmType,
+        use_m_major_input_scale: bool = False,
+        use_output_chunks: bool = False,
     ) -> tuple:
         candidates = []
         indexed = gemm_type == GemmType.INDEXED
@@ -569,12 +859,17 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                     )
                     max_block_m = min(256, 512 // (output_groups * num_ctas) - 2 * operand_columns)
                     min_stages = min(3, max(2, k_iters))
+                    is_native_a8 = layer_config.use_raw_weight and layer_config.a_dtype.num_bits == 8
+                    if is_native_a8 and num_ctas == 1:
+                        min_stages = min(4, max(2, k_iters))
                     max_stages = min(5 if layer_config.use_raw_weight else 4, max(2, k_iters))
                     can_cooperate = layer_config.use_raw_weight and num_ctas == 1
                     can_cooperate &= layer_config.shape_n % (2 * block_n) == 0
                     for cta_group_size in (1, 2) if can_cooperate else (1,):
                         for block_m in range(8 * cta_group_size, max_block_m + 1, 8 * cta_group_size):
-                            use_chunks = layer_config.use_raw_weight and (block_m > 32 or cta_group_size == 2)
+                            use_chunks = use_output_chunks and layer_config.a_dtype.num_bits == 16
+                            use_chunks |= layer_config.use_raw_weight
+                            use_chunks &= block_m > 32 or cta_group_size == 2
                             output_chunk_rows = 32 if use_chunks else 0
                             shape = (block_m, block_n, block_k)
                             for stages in range(max_stages, min_stages - 1, -1):
@@ -605,12 +900,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                                     "use_stream_k": False,
                                     "use_pdl": False,
                                     "raster_group_m": 1,
+                                    "output_chunk_rows": output_chunk_rows,
                                 }
                                 if layer_config.use_raw_weight:
-                                    config.update(
-                                        umma_cta_group_size=cta_group_size,
-                                        output_chunk_rows=output_chunk_rows,
-                                    )
+                                    config["umma_cta_group_size"] = cta_group_size
                                 candidates.append(config)
                                 # Use the deepest legal pipeline for each tile.
                                 break
@@ -635,15 +928,20 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         # The launcher selects grouped kernels using valid_shape_m when supplied.
         counts = cls._sample_expert_rows(shape_m, layer_config.num_experts, cls.expert_probability_cv)
         num_sms = current_device.sm_count
-        typical_expert_rows = float(np.median(counts))
+        activation_columns_per_expert = counts.sum(axis=1) / np.count_nonzero(counts, axis=1)
+        activation_columns_per_expert *= layer_config.a_dtype.num_bits / layer_config.b_dtype.num_bits
+        issue_headroom = np.maximum(0, 32 - activation_columns_per_expert)
+        # Sparse TMA output grids cannot amortize multiple stores per tile.
+        minimum_m_tiles = ((counts + 255) // 256).sum(axis=1).mean()
+        minimum_output_tiles = minimum_m_tiles * math.ceil(layer_config.shape_n / 256)
+        use_output_chunks = gemm_type == GemmType.INDEXED or minimum_output_tiles >= 4 * num_sms
         best_by_residency = {}
-        for config in cls._get_moe_candidates(layer_config, gemm_type, use_m_major_input_scale):
+        candidates = cls._get_moe_candidates(
+            layer_config, gemm_type, use_m_major_input_scale, use_output_chunks
+        )
+        for config in candidates:
             block_m, block_n, block_k = config["block_shape"]
             num_ctas = config["num_ctas_per_sm"]
-            if layer_config.use_raw_weight and num_ctas == 1 and typical_expert_rows < block_m:
-                # Give up the second resident CTA only when a typical expert
-                # fills the wider M tile, rather than mostly padding it.
-                continue
             cta_group_size = config.get("umma_cta_group_size", 1)
             resident_ctas = (num_sms // cta_group_size) * num_ctas
             m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
@@ -673,11 +971,25 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                 if use_stream_k:
                     work = stream_work
 
-            # Each tile pays shared activation/synchronization work in addition
-            # to N-dependent conversion. A wider N amortizes that fixed cost.
-            tile_rounds = work / k_iters * (block_n + 32)
-            padded_work = tile_rounds * num_ctas * block_m
-            score = float(np.sqrt(tile_rounds * padded_work).mean())
+            # Cooperative CTAs share the issue overhead of one wider output tile.
+            tile_overhead = np.full(waves.shape, 32.0)
+            if cls._has_mixed_raw_weight(layer_config) and not config["use_tma_a"]:
+                # Only repeated tiles pay handoff costs; short K amortizes them poorly.
+                tile_handoff_fraction = (waves - 1) / waves
+                tile_overhead += issue_headroom * stages / k_iters * tile_handoff_fraction
+            tile_rounds = work / k_iters * (block_n + tile_overhead / cta_group_size)
+            # Narrow native tiles still pay fixed issue, scale-copy and barrier costs.
+            has_native_scales = layer_config.use_raw_weight and layer_config.use_block_scaled_mma
+            compute_rows = max(block_m, 32) if has_native_scales else block_m
+            padded_work = tile_rounds * num_ctas * compute_rows
+            operand_work = tile_rounds
+            if layer_config.use_raw_weight and layer_config.a_dtype.num_bits == 8:
+                # Replace the fixed A/issue allowance once valid A rows exceed it.
+                activation_columns = counts.sum(axis=1) / m_tiles
+                activation_columns *= layer_config.a_dtype.num_bits / layer_config.b_dtype.num_bits
+                activation_columns = np.maximum(tile_overhead, activation_columns) / cta_group_size
+                operand_work = work / k_iters * (block_n + activation_columns)
+            score = float(np.sqrt(operand_work * padded_work).mean())
             pipeline_penalty = 1 + 1 / stages
             score *= pipeline_penalty
             config = config | {"use_stream_k": use_stream_k}
@@ -692,7 +1004,9 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             best = single_cta
         if best is None:
             raise ValueError("no resource-feasible UMMA MoE tile for this layer")
-        return best[1]
+        return cls._select_grouped_epilogue(
+            layer_config, shape_m, best[1], gemm_type, use_m_major_input_scale
+        )
 
 
 class Sm100Heuristics(Sm100MmaHeuristics):

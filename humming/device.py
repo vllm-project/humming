@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -18,17 +18,28 @@ def get_device_index(device: int | torch.device | None = None) -> int:
 
 class DeviceInfo:
     __slots__ = ("_index", "_value")
+    _index: int
+    _value: Any
+    _instances: ClassVar[dict[int, "DeviceInfo"]] = {}
 
-    def __init__(self, index: int | torch.device | None = None) -> None:
-        if isinstance(index, torch.device):
-            if index.type != "cuda":
-                raise ValueError(f"expected a CUDA device, got {index}")
-            index = index.index if index.index is not None else torch.cuda.current_device()
-        self._index = index
-        self._value = None
-        if index != -1:
-            self._value = _get_device_info_extension()._DeviceInfo(index)
-            self._index = self._value.index
+    def __new__(cls, index: int | torch.device | None = None) -> "DeviceInfo":
+        if isinstance(index, torch.device) and index.type != "cuda":
+            raise ValueError(f"expected a CUDA device, got {index}")
+        if index == -1:
+            instance = super().__new__(cls)
+            instance._index = -1
+            instance._value = None
+            return instance
+
+        # Share one instance per device: torch.compile cannot trace the
+        # extension constructor, but can read an existing instance.
+        index = get_device_index(index)
+        if index not in cls._instances:
+            instance = super().__new__(cls)
+            instance._index = index
+            instance._value = _get_device_info_extension()._DeviceInfo(index)
+            cls._instances[index] = instance
+        return cls._instances[index]
 
     def _get_value(self) -> Any:
         if self._value is None:
@@ -36,7 +47,12 @@ class DeviceInfo:
         return self._value
 
     def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
         return getattr(self._get_value(), name)
+
+    def __reduce__(self) -> tuple[type["DeviceInfo"], tuple[int]]:
+        return type(self), (self._index,)
 
     def __repr__(self) -> str:
         return f"DeviceInfo(index={self._index})"

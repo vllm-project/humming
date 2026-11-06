@@ -76,15 +76,16 @@ def may_process_input(
     if should_quantize:
         assert config.as_dtype is not None
         quant_mode = config.input_quant_mode.value
-        quant_dtype = str(config.a_dtype)
+        quant_dtype = config.a_dtype.dtype_str
         quant_group_size = config.input_scale_group_size or None
-        group_scale_dtype = str(config.as_dtype)
+        group_scale_dtype = config.as_dtype.dtype_str
 
     should_transform = hadamard_block_size is not None and hadamard_block_size > 1
     has_activation = activation_type != "none"
     should_scatter = layout == "scatter"
+    should_zero_invalid = layout == "grouped_mask" and zero_invalid
     should_process = should_quantize or should_transform or has_activation or should_scatter
-    should_process = should_process or num_valid_tokens is not None
+    should_process = should_process or num_valid_tokens is not None or should_zero_invalid
     if not should_process:
         if outputs is not None and outputs is not inputs:
             outputs.copy_(inputs)
