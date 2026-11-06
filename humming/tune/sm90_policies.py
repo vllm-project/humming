@@ -848,12 +848,13 @@ def get_block_scaled_moe_config(
 class Sm90CandidatePolicy:
     max_indexed_threads_for_two_ctas: int = 256
     max_indexed_threads_for_three_ctas: int = 256
+    short_k_wna16_ctas_per_sm: int = 4
 
 
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class _MoeA16Option:
     candidate: ScheduleCandidate
-    transform: Literal["base", "half_k", "split_n_widen_k", "mma"]
+    transform: Literal["base", "half_k", "split_n_widen_k", "mma", "short_k"]
     priority: int
     parent: "_MoeA16Option | None" = None
 
@@ -1611,6 +1612,42 @@ def _split_n_widen_k_candidate(
     )
 
 
+def _short_k_wna16_candidate(
+    problem: TuningProblem,
+    base: ScheduleCandidate,
+    policy: Sm90CandidatePolicy,
+) -> CandidateAnalysis | None:
+    layer = problem.layer_config
+    is_w4a16 = layer.a_dtype.num_bits == 16 and layer.b_dtype.num_bits == 4
+    # Measured on H100: K=1024 regresses for larger routed M.
+    has_short_aligned_k = layer.shape_k <= 768 and layer.shape_k % 64 == 0
+    if not (is_w4a16 and has_short_aligned_k and layer.shape_n % 128 == 0 and base.block_shape[0] == 8):
+        return None
+
+    # A short reduction cannot hide weight-load latency within one CTA, so keep
+    # more small CTAs resident. Measured residency beats the output-tile grid
+    # limit here, including for single-token decode.
+    candidate = ScheduleCandidate.from_config(
+        "indexed_a16_short_k",
+        {
+            "block_shape": (8, 128, 64),
+            "warp_shape": (8, 32, 64),
+            "num_stages": 6,
+            "num_ctas_per_sm": 1,
+            "use_stream_k": False,
+            "use_warp_spec": False,
+            "use_tma": False,
+        },
+    )
+    analysis = analyze_candidate(problem, candidate)
+    if not analysis.legal:
+        return None
+    num_ctas = min(policy.short_k_wna16_ctas_per_sm, analysis.thread_smem_cta_limit)
+    if analysis.smem_size * num_ctas > problem.device.resident_smem_size:
+        return None
+    return analyze_candidate(problem, candidate.with_updates(num_ctas_per_sm=num_ctas))
+
+
 def select_moe_a16(
     problem: TuningProblem,
     policy: Sm90CandidatePolicy,
@@ -1725,6 +1762,16 @@ def select_moe_a16(
         if mma_analysis.legal and has_fewer_waves and mma_rows <= selected_rows:
             selected = mma_option
             eligible_reasons[selected] = "selected short-K MMA with fewer waves and no extra row padding"
+
+    short_k_analysis = None
+    if selected is not mma_option:
+        short_k_analysis = _short_k_wna16_candidate(problem, analyses[selected].candidate, policy)
+    if short_k_analysis is not None:
+        short_k_option = _MoeA16Option(short_k_analysis.candidate, "short_k", 4)
+        options.append(short_k_option)
+        analyses[short_k_option] = short_k_analysis
+        selected = short_k_option
+        eligible_reasons[selected] = "selected short-K W4A16 tiles with higher CTA residency"
 
     final_candidate = analyses[selected].candidate.with_updates(
         use_stream_k=(
