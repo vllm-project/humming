@@ -1,9 +1,11 @@
 import dataclasses
+import functools
+import warnings
 
 import torch
 
 from humming import dtypes, ops
-from humming.config import LayerConfig, WeightScale2Type, WeightScaleType
+from humming.config import InputQuantizationMode, LayerConfig, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo, current_device
 from humming.schema import HummingInputSchema, HummingWeightSchema
 from humming.utils.math import round_up
@@ -65,7 +67,7 @@ def prepare_layer_config(
     if use_channel_scale_2:
         weight_scale_2_type = WeightScale2Type.CHANNEL
 
-    return LayerConfig(
+    config_kwargs = dict(
         sm_version=sm_version,
         a_dtype=input_schema.a_dtype or f16_dtype,
         b_dtype=b_dtype,
@@ -86,6 +88,91 @@ def prepare_layer_config(
         weight_scale_2_type=weight_scale_2_type,
         has_zero_point=weight_schema.has_zero_point,
         is_fp_zero_point=weight_schema.is_fp_zero_point,
+    )
+    config = LayerConfig(**config_kwargs)
+    if config.use_fused_e8m0_scale and tensors is not None:
+        config = fit_fused_e8m0_scale_range(config, config_kwargs, weight_schema, tensors)
+    return config
+
+
+def count_fused_e8m0_lossy_blocks(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    max_range: int,
+    num_experts: int = 0,
+    per_row: bool = False,
+) -> int:
+    """Count nonzero MXFP4 blocks whose E8M0 code is more than ``max_range``
+    below the largest code of their expert (or of their row, if ``per_row``).
+    ``process_fused_e8m0_scale`` rounds or flushes these blocks."""
+    num_groups = weight_scale.size(-1)
+    codes = weight_scale.view(torch.uint8).view(num_experts or 1, -1, num_groups).short()
+    weight_bytes = weight.view(torch.uint8).view(*codes.shape, -1)
+    # 0x77 masks the sign bit of both packed E2M1 values.
+    has_value = ((weight_bytes & 0x77) != 0).any(-1)
+    reduce_dims = (-1,) if per_row else (-2, -1)
+    scale_max = codes.amax(dim=reduce_dims, keepdim=True)
+    is_lossy = has_value & (codes < scale_max - max_range)
+    return int(is_lossy.sum().item())
+
+
+def fit_fused_e8m0_scale_range(
+    config: LayerConfig,
+    config_kwargs: dict,
+    weight_schema: HummingWeightSchema,
+    tensors: dict[str, torch.Tensor],
+) -> LayerConfig:
+    """Pick the cheapest configuration that keeps every MXFP4 block exact.
+
+    The fused E8M0 path folds block scales into the FP8 (or INT8) weight
+    conversion, which only represents scales within 11 (FP8) or 3 (INT8)
+    binades of the largest scale of each tensor or row. Prefer a per-tensor
+    range, then a per-row range (an extra per-channel scale in the epilogue),
+    then 16-bit activations, which apply the E8M0 group scales as they are.
+    Explicit group scales with FP8 activations are also exact but no faster
+    than 16-bit activations on SM90, and INT8 has no such path.
+    """
+    weight = tensors["weight"]
+    weight_scale = tensors["weight_scale"]
+    has_e8m0_codes = weight_scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+    if not has_e8m0_codes or config.weight_scale_group_size_n > 1:
+        return config
+
+    is_fp8 = config.a_dtype == dtypes.float8e4m3
+    max_range = 11 if is_fp8 else 3
+    count_lossy_blocks = functools.partial(
+        count_fused_e8m0_lossy_blocks,
+        weight,
+        weight_scale,
+        max_range,
+        num_experts=config.num_experts,
+    )
+    is_channel_scale_2 = config.weight_scale_2_type == WeightScale2Type.CHANNEL
+    if not is_channel_scale_2 and count_lossy_blocks() == 0:
+        return config
+    num_lossy_blocks = count_lossy_blocks(per_row=True)
+    if num_lossy_blocks == 0:
+        if is_channel_scale_2:
+            return config
+        return LayerConfig(**{**config_kwargs, "weight_scale_2_type": WeightScale2Type.CHANNEL})
+
+    warnings.warn(
+        f"{num_lossy_blocks} MXFP4 blocks (shape_n={config.shape_n - config.pad_shape_n}, "
+        f"shape_k={config.shape_k - config.pad_shape_k}) have E8M0 scales more than "
+        f"{max_range} binades below the largest scale of their row, which fused E8M0 "
+        f"scaling with {config.a_dtype} activations would round; using {config.c_dtype} "
+        "activations.",
+        stacklevel=2,
+    )
+    return LayerConfig(
+        **{
+            **config_kwargs,
+            "a_dtype": config.c_dtype,
+            "as_dtype": None,
+            "input_quant_mode": InputQuantizationMode.Disabled,
+            "input_scale_group_size": 0,
+            "weight_scale_2_type": weight_schema.weight_scale_2_type,
+        }
     )
 
 
@@ -189,16 +276,22 @@ def check_and_pad_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor])
     for key, attrs in tensors_attrs.items():
         shape = attrs["shape"]
         tensor = tensors[key]
-        if (
-            key == "weight_scale"
-            and config.use_fused_e8m0_scale
-            and tensor.dtype == torch.float8_e8m0fnu
-            and tensor.shape[-1] < shape[-1]
-        ):
+        is_fused_e8m0_scale = (
+            key == "weight_scale" and config.use_fused_e8m0_scale and tensor.dtype == torch.float8_e8m0fnu
+        )
+        # Pad with in-range codes: 2^0 padding would raise the range that
+        # process_fused_e8m0_scale keeps above every real scale.
+        if is_fused_e8m0_scale and tensor.shape[-1] < shape[-1]:
             pad_size = shape[-1] - tensor.shape[-1]
             scale_max = tensor.view(torch.uint8).amax(-1, keepdim=True)
             scale_pad = scale_max.expand(*tensor.shape[:-1], pad_size)
             tensor = torch.cat((tensor.view(torch.uint8), scale_pad), dim=-1)
+            tensor = tensor.view(torch.float8_e8m0fnu)
+        if is_fused_e8m0_scale and tensor.shape[-2] < shape[-2]:
+            pad_size = shape[-2] - tensor.shape[-2]
+            scale_max = tensor.view(torch.uint8).amax((-2, -1), keepdim=True)
+            scale_pad = scale_max.expand(*tensor.shape[:-2], pad_size, tensor.shape[-1])
+            tensor = torch.cat((tensor.view(torch.uint8), scale_pad), dim=-2)
             tensor = tensor.view(torch.float8_e8m0fnu)
         padding: list[int] = []
         value = 0 if tensor.dtype != torch.float8_e8m0fnu else 1
