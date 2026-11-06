@@ -167,6 +167,10 @@ def humming_forward(
 
     unquantized_dtype = [torch.bfloat16, torch.float16, torch.float32]
     should_quantize = config.input_quant_mode.should_quantize
+    if not should_quantize:
+        # A schema's static input scales are unused once the layer runs 16-bit
+        # activations, e.g. after fit_fused_e8m0_scale_range.
+        input_scale = input_scale_2 = None
     is_quantized_input = inputs.dtype not in unquantized_dtype
     should_transform = hadamard_block_size is not None and hadamard_block_size > 1
     should_process = not is_quantized_input and (should_quantize or should_transform)

@@ -1,5 +1,6 @@
 """MXFP4 W4A8 coverage with grouped FP8 inputs."""
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -275,3 +276,96 @@ def test_undocumented_weight_schema_compatibility(sm_version, a_dtype, monkeypat
     # Wider activations use software dequantization, so no undocumented hardware operand is required.
     output_dtype = dtypes.float16 if a_dtype == "float16" else dtypes.bfloat16
     assert inputs.is_compatible_with(weight, dtypes.torch_dtype_map[output_dtype])
+
+
+E2M1_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+# (case, activation dtype, expected activation dtype, expected weight_scale_2 type)
+E8M0_RANGE_CASES = [
+    ("in_range", "float8e4m3", "float8e4m3", "TENSOR"),
+    ("fused_shards", "float8e4m3", "float8e4m3", "CHANNEL"),
+    ("n_padded", "float8e4m3", "float8e4m3", "TENSOR"),
+    ("zero_block", "float8e4m3", "float8e4m3", "TENSOR"),
+    ("row_spread", "float8e4m3", "bfloat16", "NONE"),
+    ("fused_shards", "int8", "int8", "CHANNEL"),
+    ("in_range", "int8", "bfloat16", "NONE"),
+]
+
+
+def _e8m0_range_weights(case: str):
+    """E2M1 codes and E8M0 scale codes whose spread stresses the fused E8M0 range."""
+    shape_n = 128 if case == "n_padded" else 512
+    shape_k = 1024
+    generator = torch.Generator().manual_seed(0)
+    codes = torch.randint(1, 16, (shape_n, shape_k), generator=generator)
+    codes[codes == 8] = 1
+    scales = torch.full((shape_n, shape_k // WEIGHT_GROUP_SIZE), 120, dtype=torch.uint8)
+    if case == "in_range":
+        scales[0, 1] = 120 - 11
+    elif case == "fused_shards":
+        scales[shape_n // 2 :] = 120 - 17
+    elif case == "n_padded":
+        scales.fill_(127 - 16)
+    elif case == "zero_block":
+        scales[0, 1] = 0
+        codes[0, WEIGHT_GROUP_SIZE : 2 * WEIGHT_GROUP_SIZE] = 0
+    elif case == "row_spread":
+        scales[3, 0] = 124
+        scales[3, 1] = 108
+    return codes, scales
+
+
+@pytest.mark.parametrize(("case", "a_dtype", "expected_a_dtype", "expected_scale_2"), E8M0_RANGE_CASES)
+def test_mxfp4_fused_e8m0_scale_range_is_exact(case, a_dtype, expected_a_dtype, expected_scale_2):
+    """Fused E8M0 scaling only covers 11 (FP8) or 3 (INT8) binades below the
+    largest scale; layers whose scales spread further must pick a config that
+    still reproduces every checkpoint weight exactly."""
+    skip_if_unsupported(a_dtype=dtypes.DataType.from_str(a_dtype), mma_type="wgmma")
+    from humming.config import InputQuantizationMode, WeightScale2Type
+    from humming.forward import humming_forward
+    from humming.transform import prepare_and_transform_humming_tensors
+
+    codes, scales = _e8m0_range_weights(case)
+    shape_n, shape_k = codes.shape
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8).contiguous()
+    weight_schema = HummingWeightSchema(
+        b_dtype=dtypes.float4e2m1,
+        bs_dtype=dtypes.float8e8m0,
+        weight_scale_group_size=WEIGHT_GROUP_SIZE,
+    )
+    input_schema = HummingInputSchema(
+        a_dtype=a_dtype,
+        input_scale_dtype=dtypes.float32,
+        input_quant_mode=InputQuantizationMode.DynamicToken,
+    )
+    tensors = {
+        "weight": packed.view(torch.int32).cuda(),
+        "weight_scale": scales.cuda().view(torch.float8_e8m0fnu),
+    }
+    with pytest.warns(UserWarning) if expected_a_dtype != a_dtype else contextlib.nullcontext():
+        config, tensors = prepare_and_transform_humming_tensors(
+            tensors=tensors,
+            shape_n=shape_n,
+            shape_k=shape_k,
+            weight_schema=weight_schema,
+            input_schema=input_schema,
+            pad_n_to_multiple=256,
+            pad_k_to_multiple=128,
+            torch_dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+        )
+    assert str(config.a_dtype) == expected_a_dtype
+    assert config.weight_scale_2_type == WeightScale2Type[expected_scale_2]
+
+    identity = torch.eye(shape_k, dtype=torch.bfloat16, device="cuda")
+    outputs = humming_forward(
+        config,
+        inputs=identity,
+        weight=tensors["weight"],
+        weight_scale=tensors.get("weight_scale"),
+        weight_scale_2=tensors.get("weight_scale_2"),
+        locks=torch.zeros(1024, dtype=torch.int32, device="cuda"),
+        compute_config={"gemm_type": "dense"},
+    )
+    group_scales = torch.exp2(scales.float() - 127).repeat_interleave(WEIGHT_GROUP_SIZE, dim=1)
+    expected = E2M1_VALUES[codes] * group_scales
+    torch.testing.assert_close(outputs[:, :shape_n].float().T.cpu(), expected, rtol=0, atol=0)
