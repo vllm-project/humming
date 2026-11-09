@@ -25,7 +25,7 @@ class DequantKernel(KernelRuntime):
         self.arg_types = (
             ctypes.c_void_p,
             ctypes.c_void_p,
-            ctypes.c_uint32,
+            ctypes.c_uint64,
             ctypes.c_uint32,
             ctypes.c_uint32,
             ctypes.c_bool,
