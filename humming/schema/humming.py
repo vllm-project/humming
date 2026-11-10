@@ -16,6 +16,8 @@ from humming.device import current_device
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.utils.weight import decode_e5m3_scale, dequantize_weight, quantize_weight
 
+_SYMMETRIC_CONVERSION_CHUNK_SIZE = 1 << 20  # Unpacked elements; 4 MiB of INT32 weights.
+
 
 @dataclasses.dataclass(kw_only=True)
 class HummingWeightSchema(BaseWeightSchema):
@@ -301,8 +303,19 @@ class HummingWeightSchema(BaseWeightSchema):
             return self, tensors
 
         # Humming integer weights use offset-binary codes, even for signed source formats.
-        weight = ops.unpack_weight(tensors["weight"], num_bits)
-        if torch.any(weight == 0):
+        packed_weight = tensors["weight"]
+        assert packed_weight.is_contiguous()
+        assert packed_weight.size(-1) % num_bits == 0
+        chunk_size = _SYMMETRIC_CONVERSION_CHUNK_SIZE // 32 * num_bits
+        packed_chunks = packed_weight.view(-1).split(chunk_size)
+
+        # Check every expert before converting: they all share one weight schema.
+        has_zero = torch.zeros((), dtype=torch.bool, device=packed_weight.device)
+        for packed_chunk in packed_chunks:
+            weight = ops.unpack_weight(packed_chunk, num_bits)
+            has_zero.logical_or_(torch.any(weight == 0))
+            del weight
+        if has_zero:
             return self, tensors
 
         midpoint = 1 << (num_bits - 1)
@@ -314,9 +327,14 @@ class HummingWeightSchema(BaseWeightSchema):
                 return self, tensors
             output_tensors["zero_point"] = centered_zero_point
 
-        weight = weight - midpoint
-        weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
-        output_tensors["weight"] = ops.pack_weight(weight, num_bits)
+        output_weight = torch.empty_like(packed_weight)
+        output_chunks = output_weight.view(-1).split(chunk_size)
+        for packed_chunk, output_chunk in zip(packed_chunks, output_chunks, strict=True):
+            weight = ops.unpack_weight(packed_chunk, num_bits) - midpoint
+            weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
+            ops.pack_weight(weight, num_bits, outputs=output_chunk)
+            del weight
+        output_tensors["weight"] = output_weight
         weight_dtype = dtypes.FloatingPointType(
             num_bits=num_bits, exponent_bits=0, mantissa_bits=num_bits - 1
         )
