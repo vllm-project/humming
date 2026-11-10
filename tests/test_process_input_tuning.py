@@ -26,6 +26,16 @@ B300 = SimpleNamespace(
     max_smem_size=232448,
     l2_cache_size=132644864,
 )
+GB10 = SimpleNamespace(
+    sm_version=121,
+    sm_major=12,
+    sm_count=48,
+    max_threads_per_sm=1536,
+    max_threads_per_block=1024,
+    default_smem_size=49152,
+    max_smem_size=101376,
+    l2_cache_size=25165824,
+)
 
 SILU_AND_MUL = "(a / (1.f + expf(-a))) * b"
 QUANT = {
@@ -97,6 +107,22 @@ def test_large_grids_use_wide_vectors(
     ],
 )
 def test_small_grids_keep_existing_selection(
+    monkeypatch, device, quant, hidden_size, num_rows, activation, expected
+):
+    assert _select(monkeypatch, device, quant, hidden_size, num_rows, activation) == expected
+
+
+@pytest.mark.parametrize(
+    ("device", "quant", "hidden_size", "num_rows", "activation", "expected"),
+    [
+        # 32 values per thread is 1.4-2x slower on GB10 for activation-free quant.
+        (GB10, "fp8_token", 2880, 8192, False, (4, 736, 1)),
+        (GB10, "mxfp8", 2880, 8192, False, (4, 736, 1)),
+        (GB10, "fp8_token", 2880, 4096, True, (16, 192, 4)),
+        (GB10, "mxfp8", 2304, 16384, True, (8, 128, 1)),
+    ],
+)
+def test_sm12x_keeps_narrow_vectors_on_large_grids(
     monkeypatch, device, quant, hidden_size, num_rows, activation, expected
 ):
     assert _select(monkeypatch, device, quant, hidden_size, num_rows, activation) == expected
