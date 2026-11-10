@@ -33,7 +33,7 @@ _MINIMUM_SM_BY_DTYPE = {
 
 def _wide_activation_elems(device) -> int:
     """Rows x hidden above which activation + group quant prefers V=16."""
-    return 1 << 22 if device.sm_major >= 10 else 1 << 25
+    return 1 << 22 if device.sm_major == 10 else 1 << 25
 
 
 def _is_pure_hadamard(problem) -> bool:
@@ -238,7 +238,7 @@ def _token_score(problem, device, tuning_config: ProcessInputTuningConfig):
 
     if prefer_single_token:
         value_error = abs(values_per_thread.bit_length() - 5)
-        if problem.num_work_rows >= 4 * device.sm_count:
+        if device.sm_major == 10 and problem.num_work_rows >= 4 * device.sm_count:
             # Wide vectors amortize per-thread setup once the grid is large.
             return -min(values_per_thread, 32), tuning_config.tokens_per_block, estimated_work, thread_error
         return estimated_work, value_error, thread_error
@@ -253,7 +253,7 @@ def _direct_group_score(problem, device, tuning_config: ProcessInputTuningConfig
     has_activation = problem.activation_type != ActivationType.None_
     large_activation_grid = (
         has_activation
-        and device.sm_major >= 9
+        and device.sm_major in (9, 10)
         and problem.num_work_rows * problem.hidden_size >= _wide_activation_elems(device)
     )
     large_grid = problem.num_work_rows >= 2 * device.sm_count
@@ -275,7 +275,7 @@ def _direct_group_score(problem, device, tuning_config: ProcessInputTuningConfig
     if prefer_full_row:
         idle_values = threads_per_block * values_per_thread - useful_columns
         value_error = abs(values_per_thread.bit_length() - 5)
-        if problem.num_work_rows >= 4 * device.sm_count:
+        if device.sm_major == 10 and problem.num_work_rows >= 4 * device.sm_count:
             # Vector width dominates per-thread cost; idle lanes in the last warp are cheap.
             value_error = abs(values_per_thread.bit_length() - 6)
             return 0, num_blocks, value_error, idle_values, threads_per_block
@@ -485,7 +485,7 @@ def _prefer_single_token_blocks(problem, device, candidates, tuning_config, scor
     """Multi-token blocks only shorten the grid; at large M one token per block streams better."""
     if problem.num_work_rows < 4 * device.sm_count or problem.hadamard_block_size > 1:
         return tuning_config
-    if device.sm_major >= 10:
+    if device.sm_major == 10:
         single = dataclasses.replace(tuning_config, tokens_per_block=1)
         return single if single in candidates else tuning_config
     if device.sm_major == 9:
