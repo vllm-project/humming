@@ -31,6 +31,11 @@ _MINIMUM_SM_BY_DTYPE = {
 }
 
 
+def _wide_activation_elems(device) -> int:
+    """Rows x hidden above which activation + group quant prefers V=16."""
+    return 1 << 22 if device.sm_major >= 10 else 1 << 25
+
+
 def _is_pure_hadamard(problem) -> bool:
     return (
         not problem.should_quantize
@@ -233,6 +238,9 @@ def _token_score(problem, device, tuning_config: ProcessInputTuningConfig):
 
     if prefer_single_token:
         value_error = abs(values_per_thread.bit_length() - 5)
+        if problem.num_work_rows >= 4 * device.sm_count:
+            # Wide vectors amortize per-thread setup once the grid is large.
+            return -min(values_per_thread, 32), tuning_config.tokens_per_block, estimated_work, thread_error
         return estimated_work, value_error, thread_error
 
     return estimated_work, -tuning_config.tokens_per_block, thread_error, values_per_thread
@@ -243,6 +251,11 @@ def _direct_group_score(problem, device, tuning_config: ProcessInputTuningConfig
     values_per_thread = tuning_config.values_per_thread
     threads_per_block = tuning_config.threads
     has_activation = problem.activation_type != ActivationType.None_
+    large_activation_grid = (
+        has_activation
+        and device.sm_major >= 9
+        and problem.num_work_rows * problem.hidden_size >= _wide_activation_elems(device)
+    )
     large_grid = problem.num_work_rows >= 2 * device.sm_count
     prefer_full_row = device.sm_major >= 10 and large_grid and not has_activation
 
@@ -262,13 +275,17 @@ def _direct_group_score(problem, device, tuning_config: ProcessInputTuningConfig
     if prefer_full_row:
         idle_values = threads_per_block * values_per_thread - useful_columns
         value_error = abs(values_per_thread.bit_length() - 5)
+        if problem.num_work_rows >= 4 * device.sm_count:
+            # Vector width dominates per-thread cost; idle lanes in the last warp are cheap.
+            value_error = abs(values_per_thread.bit_length() - 6)
+            return 0, num_blocks, value_error, idle_values, threads_per_block
         return 0, num_blocks, idle_values, value_error, threads_per_block
 
     effective_warps = num_blocks * useful_columns // (32 * values_per_thread)
     if values_per_thread > 8:
         if problem.target_bits == 4:
             effective_warps = effective_warps * 8 // values_per_thread
-        if has_activation:
+        if has_activation and not large_activation_grid:
             effective_warps = effective_warps * 8 // values_per_thread
 
     underfilled = effective_warps < device.sm_count * 32
@@ -281,6 +298,9 @@ def _direct_group_score(problem, device, tuning_config: ProcessInputTuningConfig
     if has_activation:
         preferred_values = 8
         target_threads = 128
+        if large_activation_grid:
+            preferred_values = 16
+            target_threads = min(1024, round_up(ceil_div(problem.hidden_size, 16), 32))
 
     value_error = abs(values_per_thread.bit_length() - preferred_values.bit_length())
     thread_error = abs(threads_per_block - target_threads)
@@ -461,6 +481,26 @@ def _pure_hadamard_score(problem, device, tuning_config: ProcessInputTuningConfi
     )
 
 
+def _prefer_single_token_blocks(problem, device, candidates, tuning_config, score):
+    """Multi-token blocks only shorten the grid; at large M one token per block streams better."""
+    if problem.num_work_rows < 4 * device.sm_count or problem.hadamard_block_size > 1:
+        return tuning_config
+    if device.sm_major >= 10:
+        single = dataclasses.replace(tuning_config, tokens_per_block=1)
+        return single if single in candidates else tuning_config
+    if device.sm_major == 9:
+        # SM90 also under-picks the vector width; take the widest single-stage vector.
+        max_values = 32 if problem.activation_type == ActivationType.None_ else 16
+        singles = [
+            c
+            for c in candidates
+            if c.tokens_per_block == 1 and not c.two_stage and c.values_per_thread <= max_values
+        ]
+        if singles:
+            return min(singles, key=lambda c: (-c.values_per_thread, score(c)))
+    return tuning_config
+
+
 def _select_tuning_config(problem, device) -> ProcessInputTuningConfig:
     transform_size = problem.tile_size
     if problem.hadamard_block_size > 1:
@@ -476,7 +516,8 @@ def _select_tuning_config(problem, device) -> ProcessInputTuningConfig:
         if use_token_partition:
             assert token_candidates
             score = functools.partial(_token_score, problem, device)
-            return min(token_candidates, key=score)
+            tuning_config = min(token_candidates, key=score)
+            return _prefer_single_token_blocks(problem, device, token_candidates, tuning_config, score)
 
     tile_candidates = tuple(_tile_tuning_candidates(problem, device, transform_size))
     assert tile_candidates
