@@ -65,7 +65,7 @@ def prepare_layer_config(
     if use_channel_scale_2:
         weight_scale_2_type = WeightScale2Type.CHANNEL
 
-    return LayerConfig(
+    config_kwargs = dict(
         sm_version=sm_version,
         a_dtype=input_schema.a_dtype or f16_dtype,
         b_dtype=b_dtype,
@@ -87,6 +87,41 @@ def prepare_layer_config(
         has_zero_point=weight_schema.has_zero_point,
         is_fp_zero_point=weight_schema.is_fp_zero_point,
     )
+    config = LayerConfig(**config_kwargs)
+    if config.use_fused_e8m0_scale and tensors is not None:
+        config = fit_fused_e8m0_scale_range(config, config_kwargs, tensors)
+    return config
+
+
+def fit_fused_e8m0_scale_range(
+    config: LayerConfig,
+    config_kwargs: dict,
+    tensors: dict[str, torch.Tensor],
+) -> LayerConfig:
+    """Use per-row E8M0 ranges when a per-tensor range would round blocks.
+
+    The fused E8M0 path only represents scales within 11 (FP8) or 3 (INT8)
+    binades of the largest scale of the tensor, or of each row with a channel
+    weight_scale_2. Shards of a fused projection (e.g. q, k and v) can differ
+    by more than that; a per-row range gives each shard its own range at the
+    cost of a per-channel scale in the epilogue.
+    """
+    weight_scale = tensors["weight_scale"]
+    is_channel_scale_2 = config.weight_scale_2_type == WeightScale2Type.CHANNEL
+    has_e8m0_codes = weight_scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+    if is_channel_scale_2 or not has_e8m0_codes or config.weight_scale_group_size_n > 1:
+        return config
+
+    max_range = 11 if config.a_dtype == dtypes.float8e4m3 else 3
+    num_groups = weight_scale.size(-1)
+    codes = weight_scale.view(torch.uint8).view(config.num_experts or 1, -1, num_groups).short()
+    weight_bytes = tensors["weight"].view(torch.uint8).view(*codes.shape, -1)
+    # 0x77 masks the sign bit of both packed E2M1 values.
+    has_value = ((weight_bytes & 0x77) != 0).any(-1)
+    scale_max = codes.amax(dim=(-2, -1), keepdim=True)
+    if not (has_value & (codes < scale_max - max_range)).any():
+        return config
+    return LayerConfig(**{**config_kwargs, "weight_scale_2_type": WeightScale2Type.CHANNEL})
 
 
 def prepare_and_transform_humming_tensors(
@@ -199,6 +234,19 @@ def check_and_pad_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor])
             scale_max = tensor.view(torch.uint8).amax(-1, keepdim=True)
             scale_pad = scale_max.expand(*tensor.shape[:-1], pad_size)
             tensor = torch.cat((tensor.view(torch.uint8), scale_pad), dim=-1)
+            tensor = tensor.view(torch.float8_e8m0fnu)
+        if (
+            key == "weight_scale"
+            and config.use_fused_e8m0_scale
+            and tensor.dtype == torch.float8_e8m0fnu
+            and tensor.shape[-2] < shape[-2]
+        ):
+            # Padding rows with 2^0 would raise the range that
+            # process_fused_e8m0_scale keeps above every real scale.
+            pad_size = shape[-2] - tensor.shape[-2]
+            scale_max = tensor.view(torch.uint8).amax((-2, -1), keepdim=True)
+            scale_pad = scale_max.expand(*tensor.shape[:-2], pad_size, tensor.shape[-1])
+            tensor = torch.cat((tensor.view(torch.uint8), scale_pad), dim=-2)
             tensor = tensor.view(torch.float8_e8m0fnu)
         padding: list[int] = []
         value = 0 if tensor.dtype != torch.float8_e8m0fnu else 1
