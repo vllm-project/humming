@@ -161,6 +161,8 @@ def _repack_weight_op(
 
     if should_preprocess_with_zp:
         assert zero_point is not None and zero_point.dtype == torch.int32
+        # The kernel reads the zero point as a dense row-major buffer.
+        zero_point = zero_point.contiguous()
         group_size_zp = shape_k if group_size_zp == 0 else group_size_zp
         zero_point_shape = inputs.shape[:-1] + (math.ceil(shape_k / group_size_zp),)
 
