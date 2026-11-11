@@ -329,7 +329,8 @@ def test_non_power_of_two_group_size(group_size, has_zero_point):
     ref_layer = _int4_group_layer(split_size, has_zero_point)
     ref_layer.load_from_tensors(tensors)
 
-    layer.transform()
+    with pytest.warns(UserWarning, match="not a power of two"):
+        layer.transform()
     ref_layer.transform()
     for shape_m in (1, 64):
         inputs = torch.randn(shape_m, 768, device="cuda", dtype=torch.bfloat16)

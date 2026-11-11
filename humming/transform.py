@@ -1,4 +1,5 @@
 import dataclasses
+import warnings
 
 import torch
 
@@ -23,7 +24,13 @@ def get_kernel_weight_scale_group_size(
         return group_size
     # Kernel K tiles are powers of two, so split each group into equal
     # power-of-two subgroups whose boundaries line up with every tile.
-    return group_size & -group_size
+    split_size = group_size & -group_size
+    warnings.warn(
+        f"weight scale group size {group_size} is not a power of two; splitting into groups of "
+        f"{split_size}, which uses {group_size // split_size}x more scale memory",
+        stacklevel=2,
+    )
+    return split_size
 
 
 def regroup_weight_scale_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> None:
