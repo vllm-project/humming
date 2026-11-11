@@ -1,4 +1,5 @@
 import pytest
+import torch
 
 from humming import dtypes
 from humming.config import (
@@ -10,6 +11,7 @@ from humming.config import (
 )
 from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error
 from humming.device import current_device
+from humming.layer import HummingLayer
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -297,3 +299,40 @@ def test_scale_config_case_coverage():
     for bs_dtype in GROUP_SCALE_DTYPES:
         for scale_type in SECONDARY_SCALE_TYPES:
             assert (bs_dtype, scale_type) in secondary_scale_pairs
+
+
+def _int4_group_layer(group_size: int, has_zero_point: bool) -> HummingLayer:
+    weight_config = {
+        "quant_method": "humming",
+        "dtype": "uint4",
+        "group_size": group_size,
+        "has_zero_point": has_zero_point,
+    }
+    return HummingLayer(
+        shape_n=256, shape_k=768, weight_config=weight_config, torch_dtype=torch.bfloat16
+    ).cuda()
+
+
+@pytest.mark.parametrize("has_zero_point", [False, True])
+@pytest.mark.parametrize("group_size", [48, 96, 192])
+def test_non_power_of_two_group_size(group_size, has_zero_point):
+    """Groups that straddle K tiles must match the same scales split into power-of-two groups."""
+    torch.manual_seed(2026)
+    layer = _int4_group_layer(group_size, has_zero_point)
+    layer.load_from_unquantized(torch.randn(256, 768, device="cuda", dtype=torch.bfloat16))
+
+    split_size = group_size & -group_size
+    tensors = {name: tensor.clone() for name, tensor in layer.state_dict().items()}
+    for name in ("weight_scale", "zero_point"):
+        if name in tensors:
+            tensors[name] = tensors[name].repeat_interleave(group_size // split_size, -1)
+    ref_layer = _int4_group_layer(split_size, has_zero_point)
+    ref_layer.load_from_tensors(tensors)
+
+    layer.transform()
+    ref_layer.transform()
+    for shape_m in (1, 64):
+        inputs = torch.randn(shape_m, 768, device="cuda", dtype=torch.bfloat16)
+        outputs = layer(inputs).float()
+        ref_outputs = ref_layer(inputs).float()
+        assert ((outputs - ref_outputs).norm() / ref_outputs.norm()).item() < 1e-2
