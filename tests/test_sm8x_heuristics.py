@@ -5,7 +5,8 @@ import pytest
 from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import DeviceInfo
-from humming.tune.sm8x import Sm86Heuristics, Sm89Heuristics
+from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
+from humming.tune.sm100 import Sm100MmaHeuristics
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -69,3 +70,38 @@ def test_config_fits_in_smem(heuristics_cls, a_dtype, b_dtype, weight_scale_grou
         same_type_layer = dataclasses.replace(layer_config, b_dtype=a_dtype)
         same_type_config = heuristics_cls.get_config(same_type_layer, shape_m, gemm_type=GemmType.DENSE)
         assert config == same_type_config
+
+
+def _block_fp8_moe_layer(sm_version: int) -> LayerConfig:
+    # Routed experts of one EP rank: 64 local experts, hidden 2560, intermediate 640, block FP8 weights.
+    return LayerConfig(
+        sm_version=sm_version,
+        shape_n=1280,
+        shape_k=2560,
+        num_experts=64,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.float8e4m3,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.float32,
+        weight_scale_group_size=128,
+        weight_scale_group_size_n=128,
+    )
+
+
+@pytest.mark.parametrize("heuristics_cls", [Sm80Heuristics, Sm87Heuristics])
+def test_sm80_evicts_weights_first_for_single_m_tile(heuristics_cls):
+    layer_config = _block_fp8_moe_layer(heuristics_cls.sm_version)
+
+    small = heuristics_cls.get_config(layer_config, shape_m=8, gemm_type=GemmType.INDEXED)
+    large = heuristics_cls.get_config(layer_config, shape_m=65536, gemm_type=GemmType.INDEXED)
+
+    assert small["evict_weights_first"]
+    assert not large["evict_weights_first"]
+
+
+def test_sm100_mma_keeps_default_weight_eviction():
+    layer_config = _block_fp8_moe_layer(Sm100MmaHeuristics.sm_version)
+
+    config = Sm100MmaHeuristics.get_config(layer_config, shape_m=8, gemm_type=GemmType.INDEXED)
+
+    assert not config.get("evict_weights_first", False)
