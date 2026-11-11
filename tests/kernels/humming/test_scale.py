@@ -337,3 +337,10 @@ def test_non_power_of_two_group_size(group_size, has_zero_point):
         outputs = layer(inputs).float()
         ref_outputs = ref_layer(inputs).float()
         assert ((outputs - ref_outputs).norm() / ref_outputs.norm()).item() < 1e-2
+
+
+def test_unsplittable_group_size_raises():
+    layer = _int4_group_layer(24, has_zero_point=False)
+    layer.load_from_unquantized(torch.randn(256, 768, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="below the minimum of 16"):
+        layer.transform()

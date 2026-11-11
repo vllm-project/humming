@@ -14,20 +14,26 @@ from humming.utils.weight import decode_e5m3_scale
 def get_kernel_weight_scale_group_size(
     weight_schema: HummingWeightSchema,
     input_schema: HummingInputSchema,
+    a_dtype: dtypes.DataType,
 ) -> int:
     group_size = weight_schema.weight_scale_group_size
-    if (
-        weight_schema.weight_scale_type != WeightScaleType.GROUP
-        or input_schema.input_scale_group_size > 0
-        or group_size & (group_size - 1) == 0
-    ):
+    if weight_schema.weight_scale_type != WeightScaleType.GROUP or group_size & (group_size - 1) == 0:
         return group_size
     # Kernel K tiles are powers of two, so split each group into equal
     # power-of-two subgroups whose boundaries line up with every tile.
     split_size = group_size & -group_size
+    unsupported = f"weight scale group size {group_size} is not a power of two"
+    if input_schema.input_scale_group_size > 0:
+        raise ValueError(f"{unsupported}, which group input scales do not support")
+    min_group_size = 256 // a_dtype.num_bits
+    if split_size < min_group_size:
+        raise ValueError(
+            f"{unsupported} and only splits into groups of {split_size}, "
+            f"below the minimum of {min_group_size} for {a_dtype} activations"
+        )
     warnings.warn(
-        f"weight scale group size {group_size} is not a power of two; splitting into groups of "
-        f"{split_size}, which uses {group_size // split_size}x more scale memory",
+        f"{unsupported}; splitting into groups of {split_size}, "
+        f"which uses {group_size // split_size}x more scale memory",
         stacklevel=2,
     )
     return split_size
@@ -114,7 +120,7 @@ def prepare_layer_config(
         num_experts=num_experts or 0,
         has_bias=has_bias,
         input_scale_group_size=input_schema.input_scale_group_size,
-        weight_scale_group_size=get_kernel_weight_scale_group_size(weight_schema, input_schema),
+        weight_scale_group_size=get_kernel_weight_scale_group_size(weight_schema, input_schema, a_dtype),
         weight_scale_group_size_n=weight_schema.weight_scale_group_size_n,
         weight_scale_type=weight_schema.weight_scale_type,
         weight_scale_2_type=weight_scale_2_type,
