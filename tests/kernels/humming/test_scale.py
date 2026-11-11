@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from humming import dtypes
@@ -153,6 +155,21 @@ SCALE_CASES = (
         a_dtype=dtypes.bfloat16,
         b_dtype=dtypes.uint4,
         bs_dtype=dtypes.bfloat16,
+    ),
+    # The unscaled accumulators exceed FP16's range; the scaled outputs do not.
+    *(
+        dataclasses.replace(
+            _case(
+                f"channel-float16-uint8-large-accum{'-bias' if has_bias else ''}",
+                a_dtype=dtypes.float16,
+                c_dtype=dtypes.float16,
+                b_dtype=dtypes.uint8,
+                has_bias=has_bias,
+            ),
+            input_std_scale=128.0,
+            atol=0.05 * 128.0,
+        )
+        for has_bias in (False, True)
     ),
     _case(
         "channel-e8m0-bias",
