@@ -84,6 +84,7 @@ class AutoRoundWeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         return self._delegate._convert_humming(
             tensors=tensors,
@@ -91,4 +92,5 @@ class AutoRoundWeightSchema(BaseWeightSchema):
             shape_k_stacks=shape_k_stacks,
             param_dtype=param_dtype,
             num_experts=num_experts,
+            allow_inplace=allow_inplace,
         )

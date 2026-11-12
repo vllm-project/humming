@@ -19,18 +19,23 @@ CODE_TEMPLATE = jinja2.Template("""
 class UnpackWeightKernel(KernelRuntime):
     name: ClassVar[str] = "unpack_weight"
     num_bits: int
+    target_bits: int = 32
 
     def init_kernel(self):
         self.code = CODE_TEMPLATE.render(num_bits=self.num_bits)
-        self.kernel_expr = f"unpack_weight_kernel<{self.num_bits}>"
+        assert self.target_bits in (8, 32)
+        scalar_type = "uint8_t" if self.target_bits == 8 else "uint32_t"
+        self.kernel_expr = f"unpack_weight_kernel<{self.num_bits}, {scalar_type}>"
         self.arg_types = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64)
         self.prepare()
 
     def __call__(self, inputs: torch.Tensor, outputs: torch.Tensor):
+        num_elements = outputs.nelement()
+        if num_elements == 0:
+            return outputs
         func = self.load_cubin()
         device = inputs.device
         config = cbd.CUlaunchConfig()
-        num_elements = outputs.nelement()
         config.gridDimX = math.ceil(num_elements / (32 * 32))
         config.gridDimY = 1
         config.gridDimZ = 1

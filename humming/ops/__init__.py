@@ -8,6 +8,7 @@ from humming.ops.launcher import (
     register_process_input_kernel,
 )
 from humming.ops.weight import (
+    convert_weight,
     dequant_weight,
     pack_weight,
     process_mxfp4_w4a8_weight,
@@ -22,6 +23,7 @@ __all__ = [
     "get_kernel_smem_size",
     "launch_kernel",
     "process_input",
+    "convert_weight",
     "quant_weight",
     "dequant_weight",
     "repack_weight",

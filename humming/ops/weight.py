@@ -4,6 +4,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from humming import dtypes
+from humming.kernel.convert_weight import ConvertWeightKernel
 from humming.kernel.dequant_weight import DequantKernel
 from humming.kernel.pack_weight import PackWeightKernel
 from humming.kernel.process_mxfp4 import ProcessMxfp4W4A8Kernel
@@ -17,6 +18,41 @@ from humming.ops.utils import (
     _should_use_torch_op,
     register_op,
 )
+
+
+@register_op("humming::convert_weight", mutates_args=["outputs"])
+def _convert_weight_op(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor,
+    source_dtype_str: str,
+    target_dtype_str: str,
+    check_only: bool = False,
+) -> torch.Tensor:
+    source_dtype = dtypes.DataType.from_str(source_dtype_str)
+    target_dtype = dtypes.DataType.from_str(target_dtype_str)
+    if source_dtype.num_bits != target_dtype.num_bits:
+        raise ValueError("Weight conversion requires matching bit widths")
+    if not 1 <= source_dtype.num_bits <= 32:
+        raise ValueError("Weight conversion supports bit widths from 1 to 32")
+    for dtype in (source_dtype, target_dtype):
+        is_signed_e0m = dtype.is_floating_point_type and dtype.is_signed and dtype.exponent_bits == 0
+        if not (dtype.is_integer_type or is_signed_e0m):
+            raise ValueError("Weight conversion supports only intN, uintN, and floatNe0m(N-1)")
+
+    assert inputs.is_cuda
+    assert inputs.is_contiguous()
+    assert inputs.dtype == torch.int32
+    assert inputs.ndim > 0
+    assert inputs.size(-1) * 32 % source_dtype.num_bits == 0
+    output_shape = () if check_only else inputs.shape
+    outputs, returned_outputs = _prepare_output(outputs, output_shape, torch.int32, inputs.device)
+
+    if not isinstance(inputs, FakeTensor):
+        kernel = ConvertWeightKernel(
+            source_dtype=source_dtype, target_dtype=target_dtype, check_only=check_only
+        )
+        kernel(inputs=inputs, outputs=outputs)
+    return returned_outputs
 
 
 @register_op("humming::dequant_weight", mutates_args=["outputs"])
@@ -52,13 +88,14 @@ def _pack_weight_op(inputs: torch.Tensor, outputs: torch.Tensor, num_bits: int) 
     assert inputs.is_contiguous()
     assert inputs.size(-1) % 32 == 0
     assert inputs.size(-1) * num_bits % 32 == 0
-    assert inputs.dtype == torch.int32
+    assert inputs.dtype in (torch.int8, torch.uint8, torch.int32)
+    assert 1 <= num_bits <= inputs.element_size() * 8
 
     output_shape = inputs.shape[:-1] + (inputs.size(-1) * num_bits // 32,)
     outputs, returned_outputs = _prepare_output(outputs, output_shape, torch.int32, inputs.device)
 
     if not isinstance(inputs, FakeTensor):
-        kernel = PackWeightKernel(num_bits=num_bits)
+        kernel = PackWeightKernel(num_bits=num_bits, source_bits=inputs.element_size() * 8)
         kernel(inputs=inputs, outputs=outputs)
 
     return returned_outputs
@@ -212,15 +249,17 @@ def _repack_weight_op(
 def _unpack_weight_op(inputs: torch.Tensor, outputs: torch.Tensor, num_bits: int) -> torch.Tensor:
     assert inputs.is_cuda
     assert inputs.is_contiguous()
+    assert outputs.dtype in (torch.int8, torch.uint8, torch.int32)
+    assert 1 <= num_bits <= outputs.element_size() * 8
     assert inputs.size(-1) % num_bits == 0
     assert inputs.dtype == torch.int32
 
     shape_k = inputs.size(-1) // num_bits * 32
     output_shape = inputs.shape[:-1] + (shape_k,)
-    outputs, returned_outputs = _prepare_output(outputs, output_shape, torch.int32, inputs.device)
+    outputs, returned_outputs = _prepare_output(outputs, output_shape, outputs.dtype, inputs.device)
 
     if not isinstance(inputs, FakeTensor):
-        kernel = UnpackWeightKernel(num_bits=num_bits)
+        kernel = UnpackWeightKernel(num_bits=num_bits, target_bits=outputs.element_size() * 8)
         kernel(inputs=inputs, outputs=outputs)
 
     return returned_outputs
@@ -254,6 +293,21 @@ def _process_mxfp4_w4a8_weight_op(
         kernel(inputs, outputs, delta_scale_offsets)
 
     return returned_outputs
+
+
+def convert_weight(
+    inputs: torch.Tensor,
+    source_dtype_str: str,
+    target_dtype_str: str,
+    inplace: bool = False,
+    outputs: torch.Tensor | None = None,
+    check_only: bool = False,
+) -> torch.Tensor:
+    assert not inplace or (outputs is None and not check_only)
+    outputs = inputs if inplace else _prepare_output_arg(inputs, outputs, torch.int32)
+    op = torch.ops.humming.convert_weight if _should_use_torch_op(inputs) else _convert_weight_op
+    returned_outputs = op(inputs, outputs, source_dtype_str, target_dtype_str, check_only)
+    return inputs if inplace else _select_output(outputs, returned_outputs)
 
 
 def dequant_weight(
@@ -365,8 +419,12 @@ def unpack_weight(
     inputs: torch.Tensor,
     num_bits: int,
     outputs: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    outputs = _prepare_output_arg(inputs, outputs, torch.int32)
+    if dtype is None:
+        dtype = outputs.dtype if outputs is not None else torch.int32
+    assert outputs is None or outputs.dtype == dtype
+    outputs = _prepare_output_arg(inputs, outputs, dtype)
     op = torch.ops.humming.unpack_weight if _should_use_torch_op(inputs) else _unpack_weight_op
     returned_outputs = op(inputs, outputs, num_bits)
     return _select_output(outputs, returned_outputs)
