@@ -166,6 +166,14 @@ class LayerConfig(BaseHummingConfig):
         return has_native_mixed_activation and has_native_mixed_weight and self.is_umma_supported
 
     @property
+    def supports_umma_split_async_loads(self) -> bool:
+        has_mx_operands = self.a_dtype == dtypes.float8e4m3 and self.b_dtype == dtypes.float4e2m1
+        has_mx_scales = self.as_dtype == self.bs_dtype == dtypes.float8e8m0
+        has_group_scales = self.input_scale_group_size == self.weight_scale_group_size == 32
+        has_supported_scales = has_mx_scales and has_group_scales and not self.has_input_scale_2
+        return self.use_raw_weight and has_mx_operands and has_supported_scales and not self.has_zero_point
+
+    @property
     def use_flat_weight(self):
         if self.use_ldmatrix_dequant:
             return True
@@ -542,6 +550,7 @@ class TuningConfig(BaseHummingConfig):
     num_ctas_per_sm: int = 1
     umma_num_dequant_warpgroups: int = 1
     umma_cta_group_size: int = 1
+    umma_split_async_loads: bool = False
     output_chunk_rows: int = 0
 
     use_warp_spec: bool | None = None

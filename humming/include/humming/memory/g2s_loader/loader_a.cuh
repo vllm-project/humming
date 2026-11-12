@@ -17,7 +17,8 @@ private:
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
   static constexpr bool kIsIndexedGemm = Ctx::kIsIndexedGemm;
 
-  static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
+  static constexpr bool kSplitAsyncLoads = Ctx::kUseUmmaSplitLoads && Ctx::kUseUmmaAsyncActivationLoads;
+  static constexpr uint32_t kNumLoadThreads = kSplitAsyncLoads ? 32 : Ctx::kNumLoadThreads;
   static constexpr uint32_t kMultiCastSizeA = Ctx::kMultiCastSizeA;
 
   static constexpr uint32_t kSmemStride = BlockShape::K * ElementA::kBits / 32 / 4;
@@ -30,6 +31,8 @@ private:
   static constexpr uint32_t kSwizzleBytes = BlockShape::K * ElementA::kBits == 512 ? 64 : 128;
   static constexpr uint32_t kNumTmaLoadsPerLine = CEIL_DIV(BlockShape::K * ElementA::kBits, kSwizzleBytes * 8);
   static constexpr uint32_t kLoadIters = CEIL_DIV(kNumInt4s, kNumLoadThreads);
+
+  CUDA_INLINE uint32_t get_async_load_thread_id() const { return ctx.load_thread_id() - (kSplitAsyncLoads ? 32 : 0); }
 
 public:
   Ctx &ctx;
@@ -122,7 +125,7 @@ public:
   CUDA_INLINE
   void load_legacy_swizzled_128B(int4 *smem_ptr, uint32_t stage_id) {
     static_assert(BlockShape::K * ElementA::kBits >= 1024);
-    uint32_t thread_id = ctx.load_thread_id();
+    uint32_t thread_id = get_async_load_thread_id();
     uint32_t smem_uint = offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
     uint32_t smem_base = smem_uint / 128 % 8;
 
@@ -153,7 +156,7 @@ public:
   CUDA_INLINE
   void load_legacy_swizzled_64B(int4 *smem_ptr, uint32_t stage_id) {
     static_assert(BlockShape::K * ElementA::kBits == 512);
-    uint32_t thread_id = ctx.load_thread_id();
+    uint32_t thread_id = get_async_load_thread_id();
     uint32_t smem_uint = offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
     uint32_t smem_base = smem_uint / 128 % 4;
 
@@ -205,7 +208,9 @@ public:
 
     if constexpr (kIsIndexedGemm) {
       static_assert(!kUseTma);
-      uint32_t thread_id = ctx.load_thread_id();
+      if constexpr (kSplitAsyncLoads)
+        if (ctx.load_thread_id() < 32) return;
+      uint32_t thread_id = get_async_load_thread_id();
 
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kLoadIters; i++) {

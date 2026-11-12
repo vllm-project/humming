@@ -489,6 +489,19 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
                 assert self.a_dtype in allowed_f16_dtypes
 
     def check_config(self):
+        if self.umma_split_async_loads:
+            assert self.use_umma_ss and self.gemm_type == GemmType.INDEXED, (
+                "umma_split_async_loads requires indexed UMMA SS"
+            )
+            assert self.supports_umma_split_async_loads, (
+                "umma_split_async_loads requires MXFP8 inputs and MXFP4 weights"
+            )
+            assert self.block_shape[2] % (4 * self.input_scale_group_size) == 0, (
+                "umma_split_async_loads requires whole input-scale words"
+            )
+            assert self.use_tma_b and self.use_tma_bs and not self.use_tma_a, (
+                "umma_split_async_loads requires TMA weight and scale loads and indexed input gathers"
+            )
         if self.wgmma_use_late_as:
             assert self.mma_type == MmaType.WGMMA, "wgmma_use_late_as requires WGMMA"
             assert self.is_group_input_scale, "wgmma_use_late_as requires per-group input scales"
