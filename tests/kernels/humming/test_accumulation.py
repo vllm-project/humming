@@ -123,6 +123,8 @@ def test_f16_accumulation(test_case):
     if config.use_raw_weight and config.a_dtype.num_bits != config.b_dtype.num_bits:
         pytest.skip("native mixed weight layout requires UMMA with FP32 accumulation")
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=get_default_mma_type(config).value)
+    if config.sm_version == 70:
+        pytest.skip("the Volta MMA path accumulates in FP32 only")
 
     runner = KernelTestRunner(test_case)
     results = runner.run()

@@ -131,6 +131,27 @@ public:
     smem_ptr = smem_ptr + kSmemStride * iter_id;
     const LoadType *smem_ptr_load = reinterpret_cast<const LoadType *>(smem_ptr);
     LoadType *reg_ptr_load = reinterpret_cast<LoadType *>(regs_ptr);
+#if HUMMING_VOLTA
+    if constexpr (Ctx::kVoltaNative) {
+      // Volta: this lane's weight row lives in the packed words of two Turing lanes. Load both; transform_b
+      // dequantizes them and keeps the half this lane's group covers. regs_qb holds twice the words.
+      static_assert(!kLoadHalfGroup, "Volta decode path: no half-group loads");
+      const VoltaLane vl = volta_lane();
+      const uint32_t idx_base = idx - lane_id;
+      PRAGMA_UNROLL
+      for (uint32_t src = 0; src < 2; src++) {
+        const uint32_t src_start_idx = (idx_base + (src ? vl.src1 : vl.src0)) * kLoadIters;
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < warp_weight_blocks; i++) {
+          PRAGMA_UNROLL
+          for (uint32_t j = 0; j < kLoadIters; j++) {
+            reg_ptr_load[(src * warp_weight_blocks + i) * kLoadIters + j] = smem_ptr_load[src_start_idx + 32 * kLoadIters * i + j];
+          }
+        }
+      }
+      return;
+    }
+#endif
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < warp_weight_blocks; i++) {

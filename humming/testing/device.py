@@ -13,7 +13,7 @@ _OPERAND_DTYPE_MIN_SM = {
     dtypes.float8e4m3: 89,
     dtypes.float8e5m2: 89,
     dtypes.bfloat16: 80,
-    dtypes.float16: 75,
+    dtypes.float16: 70,
 }
 
 
