@@ -1,4 +1,5 @@
 import dataclasses
+import warnings
 
 import torch
 
@@ -8,6 +9,45 @@ from humming.device import DeviceInfo, current_device
 from humming.schema import HummingInputSchema, HummingWeightSchema
 from humming.utils.math import round_up
 from humming.utils.weight import decode_e5m3_scale
+
+
+def get_kernel_weight_scale_group_size(
+    weight_schema: HummingWeightSchema,
+    input_schema: HummingInputSchema,
+    a_dtype: dtypes.DataType,
+) -> int:
+    group_size = weight_schema.weight_scale_group_size
+    if weight_schema.weight_scale_type != WeightScaleType.GROUP or group_size & (group_size - 1) == 0:
+        return group_size
+    # Kernel K tiles are powers of two, so split each group into equal
+    # power-of-two subgroups whose boundaries line up with every tile.
+    split_size = group_size & -group_size
+    unsupported = f"weight scale group size {group_size} is not a power of two"
+    if input_schema.input_scale_group_size > 0:
+        raise ValueError(f"{unsupported}, which group input scales do not support")
+    min_group_size = 256 // a_dtype.num_bits
+    if split_size < min_group_size:
+        raise ValueError(
+            f"{unsupported} and only splits into groups of {split_size}, "
+            f"below the minimum of {min_group_size} for {a_dtype} activations"
+        )
+    warnings.warn(
+        f"{unsupported}; splitting into groups of {split_size}, "
+        f"which uses {group_size // split_size}x more scale memory",
+        stacklevel=2,
+    )
+    return split_size
+
+
+def regroup_weight_scale_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> None:
+    if config.weight_scale_type != WeightScaleType.GROUP or config.use_fused_e8m0_scale:
+        return
+    num_groups = (config.shape_k - config.pad_shape_k) // config.weight_scale_group_size
+    for key in ("weight_scale", "zero_point"):
+        tensor = tensors.get(key)
+        if tensor is None or tensor.size(-1) in (0, num_groups) or num_groups % tensor.size(-1) != 0:
+            continue
+        tensors[key] = tensor.repeat_interleave(num_groups // tensor.size(-1), dim=-1)
 
 
 def prepare_layer_config(
@@ -80,7 +120,7 @@ def prepare_layer_config(
         num_experts=num_experts or 0,
         has_bias=has_bias,
         input_scale_group_size=input_schema.input_scale_group_size,
-        weight_scale_group_size=weight_schema.weight_scale_group_size,
+        weight_scale_group_size=get_kernel_weight_scale_group_size(weight_schema, input_schema, a_dtype),
         weight_scale_group_size_n=weight_schema.weight_scale_group_size_n,
         weight_scale_type=weight_schema.weight_scale_type,
         weight_scale_2_type=weight_scale_2_type,
@@ -156,6 +196,7 @@ def prepare_and_transform_humming_tensors(
 
 def check_and_pad_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     tensors = tensors.copy()
+    regroup_weight_scale_tensors(config, tensors)
     schema = HummingWeightSchema(
         b_dtype=config.b_dtype,
         bs_dtype=config.bs_dtype,
