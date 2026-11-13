@@ -54,29 +54,42 @@ __global__ void convert_weight_kernel(const uint32_t *inputs, uint32_t *outputs,
   constexpr uint32_t kValues = 32 / kDivisor;
   constexpr uint32_t kMask = static_cast<uint32_t>((uint64_t{1} << kBits) - 1);
   int64_t offset = index * kWords;
-  if (offset >= num_elements) return;
-
-  // Each thread owns complete words, including codes crossing word boundaries.
-  uint32_t input_words[kWords];
-  uint32_t output_words[kWords] = {};
-  for (uint32_t i = 0; i < kWords; ++i)
-    input_words[i] = inputs[offset + i];
-  for (uint32_t i = 0; i < kValues; ++i) {
-    uint32_t word_index = i * kBits / 32;
-    uint32_t bit_offset = i * kBits % 32;
-    uint32_t code = input_words[word_index] >> bit_offset;
-    if (bit_offset + kBits > 32) code |= input_words[word_index + 1] << (32 - bit_offset);
-    uint32_t converted = convert_weight_code<SourceType, TargetType>(code, can_convert) & kMask;
+  if (offset < num_elements) {
+    // Each thread owns complete words, including codes crossing word boundaries.
+    uint32_t input_words[kWords];
+    uint32_t output_words[kWords] = {};
+    for (uint32_t i = 0; i < kWords; ++i)
+      input_words[i] = inputs[offset + i];
+    for (uint32_t i = 0; i < kValues; ++i) {
+      uint32_t word_index = i * kBits / 32;
+      uint32_t bit_offset = i * kBits % 32;
+      uint32_t code = input_words[word_index] >> bit_offset;
+      if (bit_offset + kBits > 32) code |= input_words[word_index + 1] << (32 - bit_offset);
+      uint32_t converted = convert_weight_code<SourceType, TargetType>(code, can_convert) & kMask;
+      if constexpr (!kCheckOnly) {
+        output_words[word_index] |= converted << bit_offset;
+        if (bit_offset + kBits > 32) output_words[word_index + 1] |= converted >> (32 - bit_offset);
+      }
+    }
     if constexpr (!kCheckOnly) {
-      output_words[word_index] |= converted << bit_offset;
-      if (bit_offset + kBits > 32) output_words[word_index + 1] |= converted >> (32 - bit_offset);
+      for (uint32_t i = 0; i < kWords; ++i)
+        outputs[offset + i] = output_words[i];
     }
   }
-  if constexpr (!kCheckOnly) {
-    for (uint32_t i = 0; i < kWords; ++i)
-      outputs[offset + i] = output_words[i];
-  }
   if constexpr (kCheckOnly) {
-    if (!can_convert) atomicExch(outputs, 0u);
+    __shared__ uint32_t warp_has_unsafe_conversion[32];
+    uint32_t warp_index = threadIdx.x / 32;
+    bool has_unsafe_conversion = __any_sync(0xffffffffu, !can_convert);
+    if (threadIdx.x % 32 == 0) warp_has_unsafe_conversion[warp_index] = has_unsafe_conversion;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      for (uint32_t i = 0; i < blockDim.x / 32; ++i) {
+        if (warp_has_unsafe_conversion[i]) {
+          atomicExch(outputs, 0u);
+          break;
+        }
+      }
+    }
   }
 }

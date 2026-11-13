@@ -118,7 +118,7 @@ def test_convert_packed_weight_roundtrip(num_bits):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("num_bits", [1, 3, 4, 5, 7, 16, 31, 32])
-@pytest.mark.parametrize("num_groups", [0, 1, 257])
+@pytest.mark.parametrize("num_groups", [0, 1, 31, 32, 33, 255, 256, 257, 511, 512, 513])
 def test_convert_weight_check_boundaries(num_bits, num_groups):
     midpoint = 1 << (num_bits - 1)
     num_codes = num_groups * 32 // math.gcd(num_bits, 32)
