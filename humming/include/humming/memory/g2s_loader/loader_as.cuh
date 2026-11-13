@@ -39,10 +39,10 @@ private:
   static constexpr uint32_t kGroupSize = kIsGroupScale ? Ctx::kInputScaleGroupSize : ProblemShape::K;
 
   // The unpadded K may end in a partial group; columns past it are zero-filled.
-  static_assert(ProblemShape::K == kGroupSize || ProblemShape::K % kGroupSize == 0);
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K - PadShape::K, kGroupSize);
-  static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);
+  // Per-token scales have one value per row, even when a CTA extends beyond K.
+  static constexpr uint32_t kNumGroups = kIsGroupScale ? CEIL_DIV(BlockShape::K, kGroupSize) : 1;
   static constexpr uint32_t kMxScaleVec = kPartMmaShapeK / kGroupSize;
   static constexpr uint32_t kLoadsPerGroup = kUseMxScale ? MAX(1u, 4 / kNumGroups) : CEIL_DIV(kGroupSize, BlockShape::K);
   static constexpr uint32_t kRowLoadIters = CEIL_DIV(BlockShape::M, kNumLoadThreads);
@@ -67,8 +67,8 @@ private:
 
   template <typename T>
   CUDA_INLINE void load_scale(const T *source, T *destination, bool is_valid_column, bool is_valid_row) {
-    // GEMM traverses padded K, but input scales cover only the original input.
-    if constexpr (PadShape::K != 0 && kIsGroupScale) {
+    // The final CTA can extend beyond the input even without explicit padding.
+    if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K != 0 && kIsGroupScale) {
       if constexpr (kUseCpAsync)
         legacy_load_zfill_pred<true>(source, destination, is_valid_column, is_valid_row);
       else if (is_valid_row)
@@ -264,7 +264,7 @@ public:
       if (row < BlockShape::M && source_row < shape_m) {
         if (component == 0) {
           const auto *source = reinterpret_cast<const uint4 *>(gmem_ptr + source_row * kProblemNumGroups);
-          if constexpr (PadShape::K != 0)
+          if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K != 0)
             indexed_scale_cache[i] = col_offset < kProblemNumGroups ? *source : uint4{};
           else
             indexed_scale_cache[i] = *source;
@@ -343,7 +343,8 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t, uint32_t m_block_id, uint32_t k_block_id, uint32_t current_shape_m, uint32_t m_offset) {
-    if constexpr (kUseMxScale) counter = 0;
+    // A previous tile may end before its last scale group is complete.
+    counter = kUseMxScale ? 0 : k_block_id % kLoadsPerGroup;
     if constexpr (kIsGroupScale) {
       if constexpr (BlockShape::K >= kGroupSize) {
         col_offset = k_block_id * kNumGroups;

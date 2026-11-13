@@ -111,7 +111,18 @@ CUDA_INLINE void legacy_load_pred(const T *gmem_ptr, T *smem_ptr, bool pred) {
 template <bool use_cp_async, typename T, uint32_t cache_type = 0>
 CUDA_INLINE void legacy_load_zfill(const T *gmem_ptr, T *smem_ptr, bool pred) {
   if constexpr (!use_cp_async) {
-    smem_ptr[0] = pred ? gmem_ptr[0] : T();
+    if constexpr (sizeof(T) == sizeof(int4) && alignof(T) >= alignof(int4)) {
+      int4 value;
+      asm volatile("{ .reg .pred p; setp.ne.u32 p, %5, 0; "
+                   "mov.u32 %0, 0; mov.u32 %1, 0; mov.u32 %2, 0; mov.u32 %3, 0; "
+                   "@p ld.global.v4.u32 {%0, %1, %2, %3}, [%4]; }"
+          : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+          : "l"(gmem_ptr), "r"(uint32_t(pred))
+          : "memory");
+      reinterpret_cast<int4 *>(smem_ptr)[0] = value;
+    } else {
+      smem_ptr[0] = pred ? gmem_ptr[0] : T();
+    }
     return;
   }
 
@@ -129,8 +140,7 @@ CUDA_INLINE void legacy_load_zfill(const T *gmem_ptr, T *smem_ptr, bool pred) {
 template <bool use_cp_async, typename T, uint32_t cache_type = 0>
 CUDA_INLINE void legacy_load_zfill_pred(const T *gmem_ptr, T *smem_ptr, bool pred1, bool pred2) {
   if constexpr (!use_cp_async) {
-    const T val = {0, 0, 0, 0};
-    if (pred2) { smem_ptr[0] = pred1 ? gmem_ptr[0] : val; }
+    if (pred2) legacy_load_zfill<false, T, cache_type>(gmem_ptr, smem_ptr, pred1);
     return;
   }
 
@@ -216,6 +226,24 @@ template <uint32_t N>
 CUDA_INLINE void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 };
+
+// Offsets and bounds are measured in T elements; gmem_ptr already points to the tile.
+template <bool kUseCpAsync, uint32_t kNumElements, uint32_t kNumThreads,
+    uint32_t kGmemStride, uint32_t kSmemStride, uint32_t kThreadOffset = 0, typename T = int4>
+CUDA_INLINE void legacy_load_2d_zfill(const T *gmem_ptr, T *smem_ptr,
+    uint32_t row_offset, uint32_t col_offset, uint32_t num_rows, uint32_t num_cols) {
+  uint32_t thread_id = threadIdx.x - kThreadOffset;
+  PRAGMA_UNROLL
+  for (uint32_t i = 0; i < CEIL_DIV(kNumElements, kNumThreads); ++i) {
+    uint32_t index = i * kNumThreads + thread_id;
+    uint32_t row = index / kSmemStride;
+    uint32_t col = index % kSmemStride;
+    bool valid = row_offset + row < num_rows && col_offset + col < num_cols;
+    legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + row * kGmemStride + col, smem_ptr + index,
+        valid, index < kNumElements);
+  }
+}
+
 
 template <uint32_t kBits>
 CUDA_INLINE void aiu_load_gmem(

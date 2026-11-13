@@ -30,7 +30,7 @@ private:
   static constexpr uint32_t kGmemStride = ProblemShape::N * kNumZPBits / 32 / 4 * kNumGroupsPerMma;
   static constexpr uint32_t kProblemNumRows = CEIL_DIV(ProblemShape::K, kGroupSize) / kNumGroupsPerMma;
   static constexpr uint32_t kGmemExpertStride = kGmemStride * kProblemNumRows;
-  static constexpr uint32_t kNumRows = CEIL_DIV(BlockShape::K, kGroupSize) / kNumGroupsPerMma;
+  static constexpr uint32_t kNumRows = kIsChannel ? 1 : CEIL_DIV(BlockShape::K, kGroupSize) / kNumGroupsPerMma;
   static constexpr uint32_t kNumInt4s = kSmemStride * kNumRows;
   static constexpr uint32_t kLoadsPerGroup = kIsChannel ? 1 : CEIL_DIV(kGroupSize, BlockShape::K);
 
@@ -41,6 +41,8 @@ public:
   const int4 *gmem_ptr;
 
   uint32_t row_offset;
+  uint32_t expert_index;
+  uint32_t column_offset;
   uint32_t col_offset;
   uint32_t counter = 0;
 
@@ -64,18 +66,23 @@ public:
 
   CUDA_INLINE
   void load_tma(int4 *smem_ptr, void *mbar_ptr) {
-    if (ctx.load_thread_id() == 0) tma_load_2d<1, kEvictWeightsFirst>(tensor_map_ptr, smem_ptr, mbar_ptr, col_offset, row_offset);
+    if (ctx.load_thread_id() == 0) tma_load_3d<1, kEvictWeightsFirst>(tensor_map_ptr, smem_ptr, mbar_ptr, col_offset, row_offset - expert_index * kProblemNumRows, expert_index);
   }
 
   CUDA_INLINE
   void prefetch_tma() {
     if constexpr (kUseTma) {
-      if (ctx.load_thread_id() == 0) tma_prefetch_2d<kEvictWeightsFirst>(tensor_map_ptr, col_offset, row_offset);
+      if (ctx.load_thread_id() == 0) tma_prefetch_3d<kEvictWeightsFirst>(tensor_map_ptr, col_offset, row_offset - expert_index * kProblemNumRows, expert_index);
     }
   }
 
   CUDA_INLINE void load_legacy(int4 *smem_ptr) {
-    legacy_load_2d<kUseCpAsync, kNumInt4s, kNumLoadThreads, kGmemStride, kSmemStride, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+    if constexpr (ProblemShape::N % BlockShape::N == 0 && ProblemShape::K % BlockShape::K == 0) {
+      legacy_load_2d<kUseCpAsync, kNumInt4s, kNumLoadThreads, kGmemStride, kSmemStride, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+    } else {
+      legacy_load_2d_zfill<kUseCpAsync, kNumInt4s, kNumLoadThreads, kGmemStride, kSmemStride, kLoadThreadOffset>(
+          gmem_ptr, smem_ptr, row_offset - expert_index * kProblemNumRows, column_offset, kProblemNumRows, kGmemStride);
+    }
   }
 
   CUDA_INLINE
@@ -88,6 +95,9 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
+    counter = k_block_id % kLoadsPerGroup;
+    expert_index = expert_id;
+    column_offset = n_block_id * kSmemStride;
     row_offset = kProblemNumRows * expert_id;
     col_offset = n_block_id * (kIsFpZeroPoint ? BlockShape::N : (BlockShape::N * kNumZPBits / 32 * kNumGroupsPerMma));
 

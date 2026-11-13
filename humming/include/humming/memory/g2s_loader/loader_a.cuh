@@ -34,6 +34,20 @@ private:
 
   CUDA_INLINE uint32_t get_async_load_thread_id() const { return ctx.load_thread_id() - (kSplitAsyncLoads ? 32 : 0); }
 
+  CUDA_INLINE int4 *get_tail_smem_ptr(int4 *smem_ptr, uint32_t offset) {
+    if constexpr (Ctx::kUseMxmma && kUseCpAsync) {
+      // CUDA 13.3 ptxas can reuse the shared-base register for shape_m when
+      // rematerializing a tail-copy address across interleaved MXMMA/TMA work.
+      // Keep the base-plus-offset dependency explicit in the inline PTX.
+      uint32_t base = cast_smem_ptr_to_uint(smem_ptr);
+      uint32_t byte_offset = offset * sizeof(int4);
+      uint32_t destination;
+      asm volatile("add.u32 %0, %1, %2;" : "=r"(destination) : "r"(base), "r"(byte_offset));
+      return reinterpret_cast<int4 *>(__cvta_shared_to_generic(destination));
+    }
+    return smem_ptr + offset;
+  }
+
 public:
   Ctx &ctx;
   const CUtensorMap *tensor_map_ptr;
@@ -45,6 +59,8 @@ public:
   uint32_t load_row_index[kLoadIters];
   uint32_t row_offset;
   uint32_t col_offset;
+  // cp.async copies whole 16-byte vectors; keep the tail bound in those units.
+  int32_t remaining_k_vectors;
 
   CUDA_INLINE
   G2SMemoryLoaderA(Ctx &ctx)
@@ -141,14 +157,17 @@ public:
       uint32_t gmem_row = kIsIndexedGemm ? load_row_index[i] : (smem_row % kLoadRows);
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
-      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
+      bool pred0;
+      if constexpr (kUseCpAsync && !USE_PPU) pred0 = int32_t(gmem_col) < remaining_k_vectors;
+      else pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
 
-      if constexpr (PadShape::K == 0) {
+      if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K == 0) {
         legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred1 && pred2);
       } else {
-        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred0, pred1 && pred2);
+        int4 *destination_ptr = get_tail_smem_ptr(smem_ptr, smem_swizzled_offset);
+        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, destination_ptr, pred0, pred1 && pred2);
       }
     }
   }
@@ -173,13 +192,16 @@ public:
       uint32_t gmem_col = smem_col % 4;
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
-      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
+      bool pred0;
+      if constexpr (kUseCpAsync && !USE_PPU) pred0 = int32_t(gmem_col) < remaining_k_vectors;
+      else pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
-      if constexpr (PadShape::K == 0) {
+      if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K == 0) {
         legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred1 && pred2);
       } else {
-        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred0, pred1 && pred2);
+        int4 *destination_ptr = get_tail_smem_ptr(smem_ptr, smem_swizzled_offset);
+        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, destination_ptr, pred0, pred1 && pred2);
       }
     }
   }
@@ -188,6 +210,7 @@ public:
   void advance() {
     col_offset += BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8);
     gmem_ptr += kSmemStride;
+    if constexpr (kUseCpAsync && !kUseTma && !USE_PPU) remaining_k_vectors -= int32_t(kSmemStride);
   }
 
   CUDA_INLINE
@@ -200,6 +223,7 @@ public:
     }
     if constexpr (Ctx::kUmmaCtaGroupSize == 2) row_offset += (blockIdx.x % 2) * (BlockShape::M / 2);
     col_offset = k_block_id * (BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8));
+    if constexpr (kUseCpAsync && !kUseTma && !USE_PPU) remaining_k_vectors = int32_t(kGmemStride) - int32_t(k_block_id * kSmemStride);
     block_shape_m = row_offset < shape_m ? MIN(shape_m - row_offset, kLoadRows) : 0;
 
     uint32_t gmem_offset = k_block_id * kSmemStride;

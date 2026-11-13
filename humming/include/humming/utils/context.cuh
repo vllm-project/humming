@@ -89,6 +89,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
+  static constexpr uint32_t kNumKBlocks = CEIL_DIV(ProblemShape::K - PadShape::K, BlockShape::K);
   static_assert(!kUseWgmma || TuningConfig::kNumStages >= 3);
   static_assert(!kUseWgmma || N_WARPS % 4 == 0);
 

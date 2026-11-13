@@ -105,7 +105,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       else return false;
     }();
     constexpr uint32_t kValidK = ProblemShape::K - PadShape::K;
-    constexpr uint32_t kStaticSliceIters = kSkipPaddedK ? CEIL_DIV(kValidK, BlockShape::K) : ProblemShape::K / BlockShape::K;
+    constexpr uint32_t kStaticSliceIters = Ctx::kNumKBlocks;
     constexpr bool kHasPartialKBlock = kSkipPaddedK && kValidK % BlockShape::K != 0;
     const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
     const uint32_t num_loop_iters = num_slice_iters - (kHasPartialKBlock ? 1 : 0);
