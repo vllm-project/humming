@@ -59,6 +59,34 @@ public:
   static constexpr bool kUseWarpgroupEpilogue = SharedStorage::kUseWarpgroupOutput;
   static constexpr bool kHasNativeAtomicAdd = Ctx::kSmVersion >= 90 || !std::is_same<ElementC, BFloat16>::value;
 
+  static constexpr bool kCacheIndexedRows = Ctx::kUseUmmaSs && kIsIndexedGemm && Ctx::kOutputChunkRows == 32 && Ctx::kSmemReuseMode == SmemReuseMode::NONE;
+  uint32_t cached_row_indices[kCacheIndexedRows ? CEIL_DIV(BlockShape::M, 32) : 1];
+
+  CUDA_INLINE void cache_row_indices() {
+    if constexpr (kCacheIndexedRows) {
+      // Each warp keeps one index per lane per 32-row group. The producer can
+      // reuse the shared index slot once all output warps have taken this copy.
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, 32); i++) {
+        uint32_t row = i * 32 + ctx.lane_id();
+        cached_row_indices[i] = row < BlockShape::M ? ctx.get_wr_row_index()[row] : output_shape_m;
+      }
+      __syncwarp();
+    }
+  }
+
+  CUDA_INLINE uint32_t get_output_row_index(uint32_t row) {
+    if constexpr (kCacheIndexedRows) {
+      // Chunked writes select the same register group throughout a warp.
+      // Keep the selection unrolled instead of dynamically indexing an array.
+      uint32_t value = 0;
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, 32); i++)
+        if (row / 32 == i) value = cached_row_indices[i];
+      return __shfl_sync(0xffffffff, value, row % 32);
+    } else return ctx.get_wr_row_index()[row];
+  }
+
   Ctx &ctx;
   ArithClass &arith;
   int4 *gmem_ptr_raw;
@@ -156,7 +184,7 @@ public:
         uint32_t swizzled_col = smem_col ^ ((smem_row + smem_base) % 8);
         uint32_t smem_offset = buffer_offset + smem_row * 8 + swizzled_col;
         uint32_t gmem_row = first_row + local_row;
-        if constexpr (kIsIndexedGemm) gmem_row = ctx.get_wr_row_index()[gmem_row];
+        if constexpr (kIsIndexedGemm) gmem_row = get_output_row_index(gmem_row);
         uint32_t gmem_col = first_column / 8 + column_block * 8 + smem_col;
         bool valid_row = gmem_row < (kIsIndexedGemm ? output_shape_m : block_output_shape_m);
         bool valid_column = PadShape::N == 0 || col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N;

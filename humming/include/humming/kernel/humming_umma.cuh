@@ -56,6 +56,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   using EpilogueArith = EpilogueArithmetic<Ctx>;
   using MMA = UMMA<Ctx, MainloopArith>;
   using Epilogue = EpiloguePipeline<Ctx, MMA, EpilogueArith>;
+  using GmemWriter = EpilogueGmemWriter<Ctx, EpilogueArith>;
   using Producer = ProducerPipeline<Ctx>;
   using Consumer = ConsumerPipeline<Ctx>;
 
@@ -70,9 +71,15 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr bool kHasChannelZeroPoint = Ctx::kHasZeroPoint && Ctx::kIsChannelWeightScale;
   constexpr bool kEarlyAsyncScales = Ctx::kUseUmmaAsyncActivationLoads && Ctx::kCanPrepareScalesBeforeWeights &&
                                      (Ctx::kUmmaCtaGroupSize == 1 || Ctx::kUseUmmaCooperativeTma);
-  constexpr bool kOverlapIndexedEpilogue = Ctx::kIsIndexedGemm && MMA::kCanOverlapAccumulators;
   constexpr bool kSeparateOutputStorage = Ctx::kSmemReuseMode == SmemReuseMode::NONE;
+  // Short reductions need the next tile in flight even with eight output rows.
+  // Keep the eight-row path free of extra row-index waits for long reductions.
+  constexpr bool kShortReduction = ProblemShape::K <= 2 * BlockShape::K * kNumStages;
+  constexpr bool kOverlapFullIndexedOutput = Ctx::kUseUmmaSs && (BlockShape::M > 8 || kShortReduction) &&
+                                             !Ctx::kOutputChunkRows && kSeparateOutputStorage;
+  constexpr bool kOverlapIndexedEpilogue = Ctx::kIsIndexedGemm && (MMA::kCanOverlapAccumulators || kOverlapFullIndexedOutput);
   constexpr bool kNeedsEpilogueGate = !kSeparateOutputStorage || Consumer::kHasChannelData;
+  static_assert(!GmemWriter::kCacheIndexedRows || kOverlapIndexedEpilogue);
 
   extern __shared__ int4 shared_memory[];
   auto &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
@@ -382,6 +389,13 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         if constexpr (Ctx::kUseTmaC && !Ctx::kOutputChunkRows) tma_wait_store_group<0, true>();
         ctx.sync_math_threads();
         consumer.wait_channel();
+        if constexpr (GmemWriter::kCacheIndexedRows) {
+          // Scatter no longer needs the shared indices after the warp-local copy.
+          // Let the producer prepare the next tile while this epilogue drains.
+          epilogue.gmem_writer.cache_row_indices();
+          ctx.sync_math_threads();
+          if (ctx.math_thread_id() == 0) mbarrier_arrive(&smem.umma_row_index_free[tile_index % 2]);
+        }
 
         epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
         if (scheduler.slice_count > 1) epilogue.acquire_gmem_barrier();
@@ -408,17 +422,19 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           epilogue.smem_writer.write_umma(mma, scheduler.slice_id, scheduler.slice_count, write_chunk);
         }
 
-        if constexpr (!Ctx::kOutputChunkRows && !Ctx::kIsIndexedGemm) release_accumulator();
+        // Once the full output is in SMEM, the next tile can reuse TMEM while
+        // this tile scatters its output using its own row-index buffer.
+        if constexpr (!Ctx::kOutputChunkRows && (!Ctx::kIsIndexedGemm || kOverlapIndexedEpilogue)) release_accumulator();
         if constexpr (Ctx::kUseTmaC) tma_fence_async_shared();
         ctx.sync_math_threads();
         if constexpr (!Ctx::kOutputChunkRows)
           epilogue.gmem_writer.write(scheduler.slice_id, scheduler.slice_count, 0);
-        if constexpr (kOverlapIndexedEpilogue) {
+        if constexpr (kOverlapIndexedEpilogue && !GmemWriter::kCacheIndexedRows) {
           // Accumulators may be reused before output scatter finishes. Return
           // the row-index slot only after all epilogue threads stop reading it.
           ctx.sync_math_threads();
           if (ctx.math_thread_id() == 0) mbarrier_arrive(&smem.umma_row_index_free[tile_index % 2]);
-        } else if constexpr (Ctx::kIsIndexedGemm) release_accumulator();
+        } else if constexpr (Ctx::kIsIndexedGemm && !kOverlapIndexedEpilogue) release_accumulator();
         if (scheduler.slice_count > 1) epilogue.release_gmem_barrier();
         if constexpr (!kSeparateOutputStorage) {
           if constexpr (Ctx::kUseTmaC) tma_wait_store_group<0, true>();

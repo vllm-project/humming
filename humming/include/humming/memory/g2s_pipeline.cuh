@@ -300,11 +300,20 @@ public:
     if constexpr (Ctx::kUseUmmaCooperativeTma) {
       if (ctx.load_thread_id() == 0 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(weight_mbar, bytes * 2);
     } else if (ctx.load_thread_id() == 0) tma_expect_tx(weight_mbar, bytes);
+    // Both producer warps participate in the activation-stage arrival count.
+    // B/BS completion is tracked independently by weight_mbar.
+    if constexpr (Ctx::kUseUmmaSplitLoads && Ctx::kUseUmmaAsyncActivationLoads) commit_cp_async_load<true>(stage_id);
   }
 
   template <bool kShouldAdvance = true>
   CUDA_INLINE void load_activation_stage(uint32_t stage_id) {
     auto &stage = ctx.smem.stages[stage_id];
+    if constexpr (Ctx::kUseUmmaAsyncActivationLoads) {
+      loader_a.template load<kShouldAdvance>(stage.a, &ctx.smem.load_mbar[stage_id], stage_id);
+      if constexpr (kIsGroupInputScale) loader_as.template load<kShouldAdvance>(stage.as, &ctx.smem.load_mbar[stage_id]);
+      commit_cp_async_load<true>(stage_id);
+      return;
+    }
     auto *activation_mbar = &ctx.smem.load_mbar[stage_id];
     loader_a.template load<kShouldAdvance>(stage.a, activation_mbar, stage_id);
     uint32_t bytes = SharedStorage::kStageBytesA;

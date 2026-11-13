@@ -197,6 +197,44 @@ MOE_CASES = (
         pad_shape_k=32,
     ),
     _case(
+        "indexed-mxfp4-mxfp8",
+        GemmType.INDEXED,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float8e8m0,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_group",
+        input_scale_group_size=32,
+        weight_scale_group_size=32,
+        sm_version=BLOCK_SCALED_SM_VERSION,
+    ),
+    _case(
+        "indexed-mxfp4-mxfp8-short-k",
+        GemmType.INDEXED,
+        shape_k=256,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float8e8m0,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_group",
+        input_scale_group_size=32,
+        weight_scale_group_size=32,
+        sm_version=BLOCK_SCALED_SM_VERSION,
+    ),
+    _case(
+        "indexed-mxfp4-mxfp8-two-ring-k",
+        GemmType.INDEXED,
+        shape_k=640,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        as_dtype=dtypes.float8e8m0,
+        bs_dtype=dtypes.float8e8m0,
+        input_quant_mode="dynamic_group",
+        input_scale_group_size=32,
+        weight_scale_group_size=32,
+        sm_version=BLOCK_SCALED_SM_VERSION,
+    ),
+    _case(
         # 30 real input-scale groups leave half of the last packed word unused.
         "indexed-mxfp4-mxfp8-bias-pad-k",
         GemmType.INDEXED,
@@ -300,6 +338,46 @@ def test_moe(test_case):
     if test_case.compute_config.gemm_type == GemmType.INDEXED:
         assert all(not result.tuning_config.use_tma_as for result in results)
         assert all(not result.tuning_config.use_tma_as2 for result in results)
+    assert_kernel_test_shape_coverage(results)
+
+
+@pytest.mark.parametrize("cta_group_size", [1, 2])
+@pytest.mark.parametrize(
+    "test_case", [case for case in MOE_CASES if case.name.startswith("indexed-mxfp4-mxfp8")], ids=str
+)
+def test_moe_split_async_loads(test_case, cta_group_size, monkeypatch):
+    import humming.testing.runner as runner_module
+    from humming.tune.sm100 import Sm100UmmaHeuristics
+
+    layer = test_case.layer_config
+    skip_if_unsupported(a_dtype=layer.a_dtype, mma_type="umma")
+    if not layer.supports_umma_split_async_loads:
+        pytest.skip("Requires native MXFP8 x MXFP4 UMMA")
+
+    config = get_heuristics_config(layer, shape_m=512, gemm_type=GemmType.INDEXED)
+    block_m = 112 if cta_group_size == 2 else 32
+    stages = 8 if cta_group_size == 2 else 3
+    while not Sm100UmmaHeuristics._fits_resources(
+        layer, (block_m, 128, 128), stages, 1, GemmType.INDEXED, cta_group_size, 32
+    ):
+        stages -= 1
+        assert stages >= 2
+    config.update(
+        block_shape=(block_m, 128, 128),
+        warp_shape=(block_m, 32, 128),
+        num_stages=stages,
+        num_ctas_per_sm=1,
+        umma_cta_group_size=cta_group_size,
+        umma_split_async_loads=True,
+        use_stream_k=cta_group_size == 1,
+        output_chunk_rows=32,
+        consumer_stage_unroll=8,
+        evict_weights_first=True,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "sampled1")
+    monkeypatch.setattr(runner_module, "sample_test_tuning_configs", lambda *_args, **_kwargs: [config])
+    results = KernelTestRunner(test_case).run()
+    assert all(result.tuning_config.umma_split_async_loads for result in results)
     assert_kernel_test_shape_coverage(results)
 
 

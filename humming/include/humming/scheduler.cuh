@@ -401,6 +401,24 @@ public:
     uint32_t *rd_row_index = ctx.get_rd_row_index();
     int4 *smem_ptr_load = reinterpret_cast<int4 *>(wr_row_index);
 
+    constexpr bool kUseRegisterIndices = Ctx::kUseUmmaSs && Ctx::kOutputChunkRows == 32;
+    if constexpr (kUseRegisterIndices) {
+      // Keep activation loads in flight across output tiles. Loading the small
+      // routing table through registers avoids draining them with wait_group<0>
+      // and publishes both index tables with a single producer synchronization.
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
+        uint32_t index = i * kNumLoadThreads + ctx.load_thread_id();
+        if (index < BlockShape::M) {
+          uint32_t token = gmem_ptr[index];
+          wr_row_index[index] = token;
+          rd_row_index[index] = token / ctx.params.top_k;
+        }
+      }
+      ctx.sync_load_threads();
+      return;
+    }
+
     legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumLoadThreads, kLoadThreadOffset>(gmem_ptr_load, smem_ptr_load);
     if constexpr (kUseCpAsync) cp_async_commit_group();
     if constexpr (kUseCpAsync) cp_async_wait_group<0>();
