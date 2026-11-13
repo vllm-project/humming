@@ -36,6 +36,7 @@ def _case(
     weight_scale_group_size_n: int = 0,
     mma_type: MmaType | None = None,
     sm_version: int | None = None,
+    c_dtype=dtypes.bfloat16,
 ) -> KernelTestCase:
     return KernelTestCase(
         name=name,
@@ -46,7 +47,7 @@ def _case(
             pad_shape_k=pad_shape_k,
             a_dtype=a_dtype,
             b_dtype=b_dtype,
-            c_dtype=dtypes.bfloat16,
+            c_dtype=c_dtype,
             bs_dtype=bs_dtype,
             as_dtype=as_dtype,
             input_scale_group_size=input_scale_group_size,
@@ -67,6 +68,23 @@ PROBLEM_SHAPE_CASES = (
         shape_n=256,
         shape_k=64,
         weight_scale_group_size=64,
+    ),
+    _case(
+        "wide-short-k-w4a16",
+        shape_n=4096,
+        shape_k=512,
+        b_dtype=dtypes.int4,
+        weight_scale_group_size=128,
+    ),
+    _case(
+        "wide-short-k-w4a16-fp16",
+        shape_n=4096,
+        shape_k=512,
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.int4,
+        c_dtype=dtypes.float16,
+        bs_dtype=dtypes.float16,
+        weight_scale_group_size=128,
     ),
     _case(
         "minimum",
