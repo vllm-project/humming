@@ -46,10 +46,6 @@ def test_dequant_large_count_kernel_argument(total_size):
     torch.testing.assert_close(outputs, torch.ones_like(outputs), rtol=0, atol=0)
 
 
-@pytest.mark.skipif(
-    os.environ.get("HUMMING_TEST_LARGE_TENSORS") != "1",
-    reason="set HUMMING_TEST_LARGE_TENSORS=1 on an isolated GPU with at least 33 GiB free",
-)
 def test_dequant_more_than_uint32_elements():
     num_elements = 2**32 + 1024
     required_bytes = num_elements * 8 + 1024**3
