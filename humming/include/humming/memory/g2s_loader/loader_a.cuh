@@ -34,6 +34,20 @@ private:
 
   CUDA_INLINE uint32_t get_async_load_thread_id() const { return ctx.load_thread_id() - (kSplitAsyncLoads ? 32 : 0); }
 
+  CUDA_INLINE int4 *get_tail_smem_ptr(int4 *smem_ptr, uint32_t offset) {
+    if constexpr (Ctx::kUseMxmma && kUseCpAsync) {
+      // CUDA 13.3 ptxas can reuse the shared-base register for shape_m when
+      // rematerializing a tail-copy address across interleaved MXMMA/TMA work.
+      // Keep the base-plus-offset dependency explicit in the inline PTX.
+      uint32_t base = cast_smem_ptr_to_uint(smem_ptr);
+      uint32_t byte_offset = offset * sizeof(int4);
+      uint32_t destination;
+      asm volatile("add.u32 %0, %1, %2;" : "=r"(destination) : "r"(base), "r"(byte_offset));
+      return reinterpret_cast<int4 *>(__cvta_shared_to_generic(destination));
+    }
+    return smem_ptr + offset;
+  }
+
 public:
   Ctx &ctx;
   const CUtensorMap *tensor_map_ptr;
@@ -152,7 +166,8 @@ public:
       if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K == 0) {
         legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred1 && pred2);
       } else {
-        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred0, pred1 && pred2);
+        int4 *destination_ptr = get_tail_smem_ptr(smem_ptr, smem_swizzled_offset);
+        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, destination_ptr, pred0, pred1 && pred2);
       }
     }
   }
@@ -185,7 +200,8 @@ public:
       if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K == 0) {
         legacy_load_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred1 && pred2);
       } else {
-        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + smem_swizzled_offset, pred0, pred1 && pred2);
+        int4 *destination_ptr = get_tail_smem_ptr(smem_ptr, smem_swizzled_offset);
+        legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, destination_ptr, pred0, pred1 && pred2);
       }
     }
   }
