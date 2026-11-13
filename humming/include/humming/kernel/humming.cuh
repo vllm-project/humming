@@ -61,6 +61,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       MmaOpClass, ProblemShape, BlockShape, WarpShape, PadShape,
       ElementA, ElementQB, ElementC, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
+  constexpr uint32_t kPrefetchStages = Ctx::kPrefetchStages;
+  constexpr bool kFullStageWgmma = Ctx::kFullStageWgmma;
   using Scheduler = Scheduler<Ctx>;
   using ProducerPipeline = ProducerPipeline<Ctx>;
   using ConsumerPipeline = ConsumerPipeline<Ctx>;
@@ -127,7 +129,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       }
     }
     producer.template load_stage<true, true>(0);
-    unroll_for<1, MAX(kNumStages - 1, 2), TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
+    unroll_for<1, kPrefetchStages, TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
       producer.load_stage(stage_id, stage_id < num_slice_iters);
     });
 
@@ -151,7 +153,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if constexpr (Ctx::kWarpIters == 1) {
             // Refill a different stage; the current WGMMA stage stays live until wait.
             __syncthreads();
-            if constexpr (kNumStages > 2)
+            if constexpr (kNumStages > 2 && !kFullStageWgmma)
               producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
           }
           if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1)
@@ -165,16 +167,16 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if (use_late_scale_prefetch)
             s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
 
-          if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
+          if (!kFullStageWgmma && Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
             __syncthreads();
-            if constexpr (kNumStages > 2)
+            if constexpr (kNumStages > 2 && !kFullStageWgmma)
               producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
           }
         } else {
           if constexpr (Ctx::kWarpIters == 1) {
             run_mma(warp_iter_id);
             __syncthreads();
-            if constexpr (kNumStages > 2) {
+            if constexpr (kNumStages > 2 && !kFullStageWgmma) {
               producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
             }
           }
@@ -191,10 +193,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
             if constexpr (Ctx::kWarpIters > 1) run_mma(warp_iter_id);
           }
-          if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
+          if (!kFullStageWgmma && Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
             __syncthreads();
             if constexpr (kNumStages > 2) {
-              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+              producer.load_stage(stage_id + kPrefetchStages, remaining_iters > kPrefetchStages);
             }
           }
         }
@@ -202,7 +204,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             ((warp_iter_id + 1) % Ctx::kWarpIters) % 2,
             (warp_iter_id + 1) % Ctx::kWarpIters);
       }
-      if constexpr (kNumStages == 2) {
+      if constexpr (kFullStageWgmma) {
+        __syncthreads();
+        producer.load_stage(stage_id, remaining_iters > kNumStages);
+      } else if constexpr (kNumStages == 2) {
         producer.load_stage(stage_id, remaining_iters > kNumStages);
       }
     };

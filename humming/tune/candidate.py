@@ -74,6 +74,7 @@ class ScheduleCandidate:
     mma_type: MmaType | None = None
     wgmma_use_late_as: bool = False
     wgmma_split_issue_wait: bool = False
+    use_full_stage_prefetch: bool = False
     use_stream_k: bool = True
     use_f16_accum: bool = False
     num_stages: int = 2
@@ -137,6 +138,7 @@ class ScheduleCandidate:
             warp_shape=_positive_shape(config["warp_shape"], "warp_shape"),
             wgmma_use_late_as=_config_bool(config, "wgmma_use_late_as", False),
             wgmma_split_issue_wait=_config_bool(config, "wgmma_split_issue_wait", False),
+            use_full_stage_prefetch=_config_bool(config, "use_full_stage_prefetch", False),
             use_stream_k=_config_bool(config, "use_stream_k", True),
             use_f16_accum=_config_bool(config, "use_f16_accum", False),
             num_stages=_config_positive_int(config, "num_stages", 2),
@@ -468,6 +470,11 @@ def _analyze_execution(
         )
         if register_error is not None:
             reasons.append(register_error)
+    if schedule.use_full_stage_prefetch:
+        if schedule.num_stages < 2:
+            reasons.append("use_full_stage_prefetch requires at least two stages")
+        if mma_type not in (MmaType.MMA, MmaType.WGMMA):
+            reasons.append("use_full_stage_prefetch requires MMA or WGMMA")
     if mma_type == MmaType.WGMMA and schedule.num_stages < 3:
         reasons.append(f"WGMMA requires at least three stages, got {schedule.num_stages}")
 

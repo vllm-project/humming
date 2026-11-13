@@ -52,7 +52,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr uint32_t kNumStages = TuningConfig::kNumStages;
   constexpr bool kUsePdl = TuningConfig::kUsePdl;
   constexpr auto kSmemReuseMode = TuningConfig::kSmemReuseMode;
-  constexpr bool kCanOverlapEpilogue = kSmemReuseMode == SmemReuseMode::NONE || (kSmemReuseMode == SmemReuseMode::LAST_STAGE && kNumStages >= 3);
+  constexpr bool kCanOverlapEpilogue = kSmemReuseMode == SmemReuseMode::NONE ||
+      (kSmemReuseMode == SmemReuseMode::LAST_STAGE && kNumStages >= 3 && !TuningConfig::kUseFullStagePrefetch);
 
   using SharedStorage = SharedStorage<
       MmaOpClass, BlockShape, WarpShape, ElementA, ElementQB, ElementBS,
@@ -61,6 +62,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       MmaOpClass, ProblemShape, BlockShape, WarpShape, PadShape,
       ElementA, ElementQB, ElementC, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
+  constexpr uint32_t kPrefetchStages = Ctx::kPrefetchStages;
   using Scheduler = Scheduler<Ctx>;
   using ProducerPipeline = ProducerPipeline<Ctx, kSmemReuseMode == SmemReuseMode::NONE>;
   using ConsumerPipeline = ConsumerPipeline<Ctx, ProducerPipeline::kUseContinuousRing>;
@@ -111,7 +113,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       }
       producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
       producer.load_stage<true, true>(0);
-      unroll_for<1, MAX(kNumStages - 1, 2), TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
+      unroll_for<1, kPrefetchStages, TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
         producer.wait_stage(stage_id, ProducerPipeline::kUseContinuousRing && stage_id < slice_iters);
         producer.load_stage(stage_id, stage_id < slice_iters);
       });
@@ -122,13 +124,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         debug_kernel_timeout_check(debug_start_clock);
         const uint32_t remaining_iters = num_slice_iters - slice_iter;
         if (remaining_iters == 1) producer.load_channel();
-        const bool has_next_stage = kNumStages == 2 ? remaining_iters > kNumStages : remaining_iters >= kNumStages;
+        const bool has_next_stage = remaining_iters > kPrefetchStages;
         producer.wait_stage(stage_id, !ProducerPipeline::kUseContinuousRing || has_next_stage);
-        if constexpr (kNumStages == 2) {
-          producer.load_stage(stage_id, has_next_stage);
-        } else {
-          producer.load_stage(stage_id + kNumStages - 1, has_next_stage);
-        }
+        producer.load_stage(stage_id + kPrefetchStages, has_next_stage);
       };
 
       const uint32_t num_full_stage_cycles = num_slice_iters / kNumStages;

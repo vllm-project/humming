@@ -2,17 +2,20 @@ import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
 
-from humming import dtypes
-from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, WeightScale2Type
+from humming import dtypes, ops
+from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig, WeightScale2Type
 from humming.config.mma import get_default_mma_type
+from humming.device import current_device
 from humming.forward import humming_forward
+from humming.kernel.humming import HummingKernel
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
     assert_kernel_test_shape_coverage,
     skip_if_unsupported,
 )
-from humming.testing.data import generate_random_tensor
+from humming.testing.data import generate_random_tensor, generate_random_topk_ids
+from humming.utils.smem import fits_device_smem
 
 SHAPE_N = 1024
 SHAPE_K = 1024
@@ -24,6 +27,189 @@ SPECIAL_FEATURES = {
     "use_fused_e8m0_scale",
     "use_packed_k_layout",
 }
+
+
+@pytest.mark.parametrize(
+    "stages,iterations,shape_m,stream_k",
+    [
+        (2, 1, 1, False),  # first stage only
+        (2, 3, 17, True),  # two-stage wrap
+        (3, 2, 1, False),  # before the ring is full
+        (3, 3, 17, True),  # exactly fills the ring
+        (3, 4, 17, False),  # first steady-state refill
+        (4, 9, 1, True),  # multiple ring wraps
+    ],
+)
+def test_full_stage_prefetch_boundaries(stages, iterations, shape_m, stream_k):
+    _check_full_stage_prefetch(
+        shape_m=shape_m,
+        shape_n=256,
+        shape_k=128 * iterations,
+        stages=stages,
+        block_k=128,
+        warp_k=64,
+        stream_k=stream_k,
+    )
+
+
+def test_full_stage_prefetch_two_stage_producer():
+    skip_if_unsupported(a_dtype="int8", mma_type="mma")
+    _check_full_stage_prefetch(
+        shape_m=193,
+        shape_n=256,
+        shape_k=64 * 3,
+        stages=2,
+        block_k=64,
+        warp_k=64,
+        stream_k=False,
+        use_test_distribution=True,
+        tuning_updates=dict(
+            num_ctas_per_sm=1,
+            num_sms=2,
+        ),
+    )
+
+
+@pytest.mark.parametrize("stages,use_tma,use_warp_spec", [(33, False, True), (65, True, True)])
+def test_full_stage_prefetch_deep_barriers(stages, use_tma, use_warp_spec):
+    skip_if_unsupported(a_dtype="int8", mma_type="mma", use_tma=use_tma, use_warp_spec=use_warp_spec)
+    _check_full_stage_prefetch(
+        shape_m=193,
+        shape_n=256,
+        shape_k=64 * (2 * stages + 1),
+        stages=stages,
+        block_k=64,
+        warp_k=64,
+        stream_k=False,
+        block_n=64,
+        layer_updates={"b_dtype": "uint4"},
+        use_test_distribution=True,
+        tuning_updates=dict(
+            use_tma=use_tma,
+            use_warp_spec=use_warp_spec,
+            num_ctas_per_sm=1,
+            num_sms=2,
+            producer_stage_unroll=1,
+            consumer_stage_unroll=1,
+            warp_shape=(16, 16 if use_warp_spec else 32, 64),
+        ),
+    )
+
+
+def _check_full_stage_prefetch(
+    shape_m,
+    shape_n,
+    shape_k,
+    stages,
+    block_k,
+    warp_k,
+    stream_k,
+    *,
+    block_n=128,
+    layer_updates=None,
+    gemm_type=GemmType.DENSE,
+    use_test_distribution=False,
+    tuning_updates=None,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("full-stage prefetch requires a CUDA device")
+    layer_values = dict(
+        shape_n=shape_n,
+        shape_k=shape_k,
+        a_dtype=dtypes.int8,
+        b_dtype=dtypes.int8,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        use_packed_k_layout=False,
+    )
+    test_case = KernelTestCase(
+        name="full-stage-prefetch",
+        seed=2026,
+        rtol=0.01 if use_test_distribution else 0.02,
+        atol=0.05 if use_test_distribution else 0.1,
+        layer_config=LayerConfig(**(layer_values | (layer_updates or {}))),
+        compute_config=ComputeConfig(gemm_type=gemm_type),
+        top_k=1 if gemm_type == GemmType.DENSE else 2,
+    )
+    runner = KernelTestRunner(test_case)
+    torch.manual_seed(2026 + shape_m)
+    if use_test_distribution:
+        original = generate_random_tensor(
+            (shape_m, shape_k),
+            dtype=runner.layer_config.param_dtype,
+            group_size=runner.layer_config.input_scale_group_size,
+        )
+    else:
+        original = torch.randn((shape_m, shape_k), device="cuda", dtype=torch.bfloat16)
+    topk_ids = None
+    if gemm_type != GemmType.DENSE:
+        topk_ids = generate_random_topk_ids(shape_m, runner.layer_config.num_experts, test_case.top_k)
+    block_m = (tuning_updates or {}).get("block_shape", (16, block_n, block_k))[0]
+    problem_inputs, route_tensors, output_ids = runner._prepare_problem(shape_m, original, topk_ids, block_m)
+    inputs_ref, inputs, input_scale, input_scale_2 = runner.prepare_inputs(problem_inputs)
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        reference = runner.make_reference(inputs_ref, topk_ids, output_ids)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+    tuning = dict(
+        mma_type="mma",
+        block_shape=(16, block_n, block_k),
+        warp_shape=(16, 32, warp_k),
+        num_stages=stages,
+        num_ctas_per_sm=1 if block_k >= 512 else 2,
+        use_stream_k=stream_k,
+        use_warp_spec=False,
+        use_tma=False,
+    )
+    tuning.update(tuning_updates or {})
+    resource_tuning = TuningConfig(**{key: value for key, value in tuning.items() if key != "num_sms"})
+    if not fits_device_smem(runner.layer_config, runner.compute_config, resource_tuning):
+        pytest.skip("fixed full-stage-prefetch test configuration exceeds this device's SMEM limit")
+    has_native_atomic_add = current_device.sm_version >= 90 or runner.layer_config.c_dtype != dtypes.bfloat16
+    check_bitwise = not (stream_k and has_native_atomic_add)
+    configs_pair = HummingKernel.prepare_kernels(
+        runner.layer_config.to_str(),
+        runner.compute_config.to_str(),
+        [(0, 1 << 30, tuning | {"use_full_stage_prefetch": value}) for value in (False, True)],
+    ).reshape(-1, 4)
+    outputs, smem_sizes = [], []
+    for configs in configs_pair:
+        kernel = HummingKernel._id2kernel[configs[2].item()]
+        kernel.assert_smem_size_matches_estimate()
+        smem_sizes.append(ops.get_kernel_smem_size(kernel.kernel_id))
+        output = torch.zeros(
+            (test_case.effective_shape_m(shape_m), shape_n),
+            device=inputs.device,
+            dtype=dtypes.torch_dtype_map[runner.layer_config.c_dtype],
+        )
+        if gemm_type == GemmType.GROUPED_CONTIGUOUS:
+            output = output[: inputs.shape[0]]
+        locks = torch.zeros((2048,), dtype=torch.int32, device=inputs.device) if stream_k else None
+
+        def run(configs=configs, output=output, locks=locks):
+            return ops.launch_kernel(
+                configs=configs,
+                inputs=inputs,
+                **runner.kernel_tensors,
+                **route_tensors,
+                input_scale=input_scale,
+                input_scale_2=input_scale_2,
+                outputs=output,
+                locks=locks,
+                top_k=test_case.top_k,
+            )
+
+        for _ in range(10):
+            run()
+            runner._assert_close(output[output_ids], reference, use_stream_k=stream_k)
+            if outputs and check_bitwise:
+                torch.testing.assert_close(output[output_ids], outputs[0][output_ids], rtol=0, atol=0)
+        outputs.append(output)
+    torch.cuda.synchronize()
+    assert smem_sizes[0] == smem_sizes[1]
 
 
 def _layer_config(**kwargs) -> LayerConfig:

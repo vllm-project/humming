@@ -23,6 +23,7 @@ SAMPLED_TUNING_VALUES = {
     "producer_registers": (None, 40, 64, 96),
     "wgmma_use_late_as": (False, True),
     "wgmma_split_issue_wait": (False, True),
+    "use_full_stage_prefetch": (False, True),
     "use_tma": (True, False, 123, 456, 789),
     "evict_weights_first": (False, True),
     "use_warp_spec": (True, False),
@@ -323,6 +324,8 @@ def _generate_scheduling_candidates(
         names += ("wgmma_split_issue_wait",)
         if layer_config.is_group_input_scale:
             names += ("wgmma_use_late_as",)
+    if mma_type in (MmaType.MMA, MmaType.WGMMA):
+        names += ("use_full_stage_prefetch",)
     if mma_type == MmaType.UMMA:
         names += ("umma_num_dequant_warpgroups", "umma_cta_group_size")
     for signature in _generate_cartesian(*names):
@@ -457,6 +460,9 @@ def _try_combine_candidate(
         return None
     if mma_type == MmaType.WGMMA and config["num_stages"] < 3:
         return None
+    if config.get("use_full_stage_prefetch", False):
+        if config["num_stages"] < 2 or mma_type not in (MmaType.MMA, MmaType.WGMMA):
+            return None
     if layer_config.shape_n % (block_shape[1] * config["multi_cast_size_a"]):
         return None
     if compute_config.use_batch_invariant and (config["use_stream_k"] or block_shape[2] != warp_shape[2]):

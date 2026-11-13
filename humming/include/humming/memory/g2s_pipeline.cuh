@@ -152,7 +152,7 @@ public:
   LoaderBS2 loader_bs2;
   LoaderBZP loader_bzp;
   LoaderBias loader_bias;
-  uint32_t phase_bits = 0;
+  uint32_t phase_bits[(kNumStages + 32) / 32] = {0};
 
 private:
   uint32_t ring_stage = 0;
@@ -191,29 +191,30 @@ public:
       uint32_t thread_id = ctx.load_thread_id();
       uint32_t cluster_rank = ctx.cluster_rank();
       auto &smem = ctx.smem;
-      uint32_t count;
-      if (thread_id < kNumStages) {
-        constexpr uint32_t cp_async_thread_count = kHasStageCpAsyncMBarrier ? kNumLoadThreads : 0;
-        constexpr uint32_t tma_thread_count = kHasStageTmaMBarrier ? 1 : 0;
-        if constexpr (Ctx::kUseUmmaAsyncActivationLoads)
-          count = kNumLoadThreads + (kIsGroupInputScale && kUseTmaAS ? 1 : 0);
-        else count = Ctx::kUseUmmaCooperativeTma ? 2 : cp_async_thread_count + tma_thread_count;
-      } else if (thread_id == kNumStages) {
-        constexpr uint32_t cp_async_thread_count = kHasFirstStageCpAsyncMBarrier ? kNumLoadThreads : 0;
-        constexpr uint32_t tma_thread_count = kHasFirstStageTmaMBarrier ? 1 : 0;
-        count = cp_async_thread_count + tma_thread_count;
-      } else if (thread_id == kNumStages + 1) {
-        constexpr uint32_t cp_async_thread_count = kHasChannelCpAsyncMBarrier ? kNumLoadThreads : 0;
-        constexpr uint32_t tma_thread_count = kHasChannelTmaMBarrier ? 1 : 0;
-        count = cp_async_thread_count + tma_thread_count;
+      for (uint32_t barrier_id = thread_id; barrier_id < kNumStages + 2; barrier_id += kNumLoadThreads) {
+        uint32_t count;
+        if (barrier_id < kNumStages) {
+          constexpr uint32_t cp_async_thread_count = kHasStageCpAsyncMBarrier ? kNumLoadThreads : 0;
+          constexpr uint32_t tma_thread_count = kHasStageTmaMBarrier ? 1 : 0;
+          if constexpr (Ctx::kUseUmmaAsyncActivationLoads)
+            count = kNumLoadThreads + (kIsGroupInputScale && kUseTmaAS ? 1 : 0);
+          else count = Ctx::kUseUmmaCooperativeTma ? 2 : cp_async_thread_count + tma_thread_count;
+        } else if (barrier_id == kNumStages) {
+          constexpr uint32_t cp_async_thread_count = kHasFirstStageCpAsyncMBarrier ? kNumLoadThreads : 0;
+          constexpr uint32_t tma_thread_count = kHasFirstStageTmaMBarrier ? 1 : 0;
+          count = cp_async_thread_count + tma_thread_count;
+        } else {
+          constexpr uint32_t cp_async_thread_count = kHasChannelCpAsyncMBarrier ? kNumLoadThreads : 0;
+          constexpr uint32_t tma_thread_count = kHasChannelTmaMBarrier ? 1 : 0;
+          count = cp_async_thread_count + tma_thread_count;
+        }
+        __mbarrier_init(&smem.load_mbar[barrier_id], count);
       }
-
-      if (thread_id < kNumStages + 2) __mbarrier_init(&smem.load_mbar[thread_id], count);
-      uint32_t factor = (kMultiCastSize > 1 && cluster_rank == 0 && thread_id < SharedStorage::kNumMathMbarriers) ? kMultiCastSize : 1;
       if constexpr (Ctx::kUseWarpSpec) {
-        if (thread_id < SharedStorage::kNumMathMbarriers) {
-          uint32_t consumers = thread_id < kNumStages ? kStageConsumers : kChannelConsumers;
-          __mbarrier_init(&smem.math_mbar[thread_id], consumers * factor);
+        for (uint32_t barrier_id = thread_id; barrier_id < SharedStorage::kNumMathMbarriers; barrier_id += kNumLoadThreads) {
+          uint32_t factor = (kMultiCastSize > 1 && cluster_rank == 0) ? kMultiCastSize : 1;
+          uint32_t consumers = barrier_id < kNumStages ? kStageConsumers : kChannelConsumers;
+          __mbarrier_init(&smem.math_mbar[barrier_id], consumers * factor);
         }
       }
     }
@@ -374,11 +375,11 @@ public:
   }
 
   CUDA_INLINE uint32_t get_phase(uint32_t stage_id) {
-    return (phase_bits >> stage_id) & 1u;
+    return (phase_bits[stage_id / 32] >> (stage_id % 32)) & 1u;
   }
 
   CUDA_INLINE void advance_phase(uint32_t stage_id) {
-    phase_bits ^= 1u << stage_id;
+    phase_bits[stage_id / 32] ^= 1u << (stage_id % 32);
   }
 
   CUDA_INLINE void wait_stage(uint32_t stage_id, bool pred = true) {
@@ -441,6 +442,8 @@ private:
   static constexpr bool kHasBias = Ctx::kHasBias;
 
   static constexpr uint32_t kNumStages = Ctx::kNumStages;
+  static constexpr uint32_t kPrefetchStages = Ctx::kPrefetchStages;
+  static constexpr bool kFullStageWgmma = Ctx::kFullStageWgmma;
   static constexpr uint32_t kMultiCastSizeA = Ctx::kMultiCastSizeA;
   static constexpr uint32_t kMultiCastSizeB = Ctx::kMultiCastSizeB;
   static constexpr uint32_t kMultiCastSize = kMultiCastSizeA * kMultiCastSizeB;
@@ -467,6 +470,12 @@ public:
   ConsumerPipeline(Ctx &ctx) : ctx(ctx) {
   }
 
+  static constexpr uint32_t kWaitGroupsSteady =
+      kNumStages == 2 ? 0 : (kFullStageWgmma ? kNumStages - 2 : kPrefetchStages - 1);
+  static constexpr uint32_t kWaitGroupsFirst =
+      kFullStageWgmma ? kNumStages - 1
+                           : (kNumStages == 2 && Ctx::kUseFullStagePrefetch ? kWaitGroupsSteady + 1 : kWaitGroupsSteady);
+
   template <bool kIsFirst = false>
   CUDA_INLINE void wait_stage(uint32_t stage_id) {
     if constexpr (kUseContinuousRing) {
@@ -481,7 +490,7 @@ public:
       mbarrier_wait(&ctx.smem.load_mbar[stage_id], phases[stage_id], "Humming consumer waiting for load stage");
       phases[stage_id] ^= 1;
     } else {
-      if constexpr (kUseCpAsync) cp_async_wait_group<kNumStages - 2>();
+      if constexpr (kUseCpAsync) cp_async_wait_group<kIsFirst ? kWaitGroupsFirst : kWaitGroupsSteady>();
       __syncthreads();
     }
   }

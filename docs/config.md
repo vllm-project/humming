@@ -274,6 +274,12 @@ The number of pipeline buffer stages, generally at least `2`; WGMMA requires at 
 
 For long K dimensions, try increasing from `2` / `3` to `4` or more to hide memory latency. Prefer fewer stages for short K dimensions or when SMEM limits concurrency. Consider `block_shape_k` when determining how many iterations can actually use these buffers.
 
+#### `use_full_stage_prefetch`
+
+Defaults to `False`. By default the pipeline prepares `num_stages - 1` stages ahead and keeps one shared-memory slot spare; enabling this option fills all slots and refills each slot as soon as its data has been fully consumed, increasing the prefetch depth by one stage without additional SMEM. Requires `num_stages >= 2`.
+
+This is a tuning choice, not a guarantee of higher performance; compare both values on the target device.
+
 #### `producer_stage_unroll`, `consumer_stage_unroll`
 
 Control producer and consumer stage loop unrolling independently. `None` (default) resolves to `num_stages` when the tuning config is initialized; explicit values must be positive integers. A value of `1` disables unrolling.
