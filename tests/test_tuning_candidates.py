@@ -223,7 +223,7 @@ def test_analysis_treats_per_cta_smem_overflow_as_hard_violation():
     assert not analysis.launchable
 
 
-def test_geometry_rejects_partial_input_scale_group():
+def test_geometry_accepts_partial_input_scale_group():
     layer = _layer(
         shape_n=2880,
         shape_k=2880,
@@ -236,7 +236,33 @@ def test_geometry_rejects_partial_input_scale_group():
 
     reasons = get_problem_rejection_reasons(layer)
 
-    assert reasons
+    assert not reasons
+
+
+def test_candidate_counts_partial_nk_tiles():
+    problem = _problem(layer_config=_layer(shape_n=192, shape_k=192))
+    candidate = _candidate()
+    analysis = analyze_candidate(problem, candidate)
+    assert analysis.legal
+    assert analysis.num_output_tiles == 2 * problem.estimate_num_blocks_m(candidate.block_shape[0])
+
+
+@pytest.mark.parametrize("shape_n,expected_n", [(72, 96), (96, 96), (192, 192)])
+def test_parameter_padding_is_independent_of_cta_tiles(shape_n, expected_n):
+    layer = LayerConfig(
+        sm_version=120,
+        shape_n=shape_n,
+        shape_k=96,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+    )
+    assert layer.shape_n == expected_n
+    assert layer.shape_k == 96
+    assert layer.shape_n - layer.pad_shape_n == shape_n
+    assert layer.pad_shape_k == 0
+    assert layer.weight_shape_n == (shape_n + 63) // 64 * 64
+    assert dataclasses.replace(layer) == layer
 
 
 def test_geometry_rejects_e8m0_scales_on_wgmma():

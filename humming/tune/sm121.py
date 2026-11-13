@@ -1,5 +1,6 @@
 from humming.device import current_device
 from humming.tune.sm120 import Sm120Heuristics
+from humming.utils.math import ceil_div
 
 
 class Sm121Heuristics(Sm120Heuristics):
@@ -16,7 +17,7 @@ class Sm121Heuristics(Sm120Heuristics):
     @classmethod
     def _use_m_tile(cls, layer_config, config, gemm_type, block_m: int, shape_m: int) -> None:
         num_blocks_m = cls.estimate_num_blocks_m(layer_config, shape_m, block_m)
-        num_blocks_n = layer_config.shape_n // config["block_shape"][1]
+        num_blocks_n = ceil_div(layer_config.shape_n, config["block_shape"][1])
         if num_blocks_m * num_blocks_n >= current_device.sm_count * 2:
             block_m = min(block_m, config["block_shape"][0])
         config["use_warp_spec"] = False

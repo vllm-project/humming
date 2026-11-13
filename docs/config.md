@@ -33,7 +33,9 @@ It affects weight layout, dequantization, and available instructions. A transfor
 
 - The effective output feature count is `shape_n - pad_shape_n`.
 - The effective input feature count is `shape_k - pad_shape_k`.
-- Input and output tensors use the effective feature counts; transformed weights use the padded shapes.
+- Input and output tensors use the effective feature counts. Transformed weights use `weight_shape_n` and `weight_shape_k`, which retain only the alignment required by their storage layout.
+
+`LayerConfig` adds any padding required by scale/zero-point permutations and packed scale words, preserving the effective feature counts. N and K do not need to be divisible by the CTA's `block_shape_n` or `block_shape_k`: the final tiles are masked and out-of-range operands are zero-filled. Explicit padding remains supported, but padding to a CTA tile is unnecessary. Input/output vector alignment and weight packing constraints still apply.
 
 For example, `shape_n=1024` and `pad_shape_n=24` represent 1000 output channels.
 Padding satisfies layout and kernel alignment requirements, but also increases storage and some computation. Use the values established by weight transformation rather than changing the configuration without updating storage.

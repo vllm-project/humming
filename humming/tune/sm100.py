@@ -10,7 +10,7 @@ from humming.config.mma import get_default_mma_type, get_mma_b_dtype, get_regist
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
 from humming.tune.sm8x import Sm80Heuristics
-from humming.utils.math import round_up
+from humming.utils.math import ceil_div, round_up
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -79,8 +79,8 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         has_aligned_tile = has_aligned_tile and layer_config.shape_k % candidate_k == 0
         if config["use_stream_k"] and block_m <= 32 and has_aligned_tile:
             m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m)
-            output_tiles = m_tiles * (layer_config.shape_n // candidate_n)
-            k_iters = layer_config.shape_k // candidate_k
+            output_tiles = m_tiles * ceil_div(layer_config.shape_n, candidate_n)
+            k_iters = ceil_div(layer_config.shape_k, candidate_k)
             resident_ctas = config["num_sms"] * 2
             slice_iters = math.ceil(output_tiles * k_iters / resident_ctas)
             if min(slice_iters, k_iters) >= 2 * candidate_stages:
@@ -102,8 +102,8 @@ class Sm100MmaHeuristics(Sm80Heuristics):
 
         if config["use_stream_k"] and block_n < 128:
             m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m)
-            output_tiles = m_tiles * (layer_config.shape_n // block_n)
-            k_iters = layer_config.shape_k // block_k
+            output_tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
+            k_iters = ceil_div(layer_config.shape_k, block_k)
             resident_ctas = config["num_sms"] * 2
             slice_iters = math.ceil(output_tiles * k_iters / resident_ctas)
             if slice_iters <= num_stages and layer_config.shape_n % (2 * block_n) == 0:
@@ -138,11 +138,11 @@ class Sm100MmaHeuristics(Sm80Heuristics):
             return config
 
         # More resident CTAs hide memory latency across small expert tiles.
-        num_stages = max(num_stages, min(4, layer_config.shape_k // block_k))
+        num_stages = max(num_stages, min(4, ceil_div(layer_config.shape_k, block_k)))
         if config["use_stream_k"]:
             m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
-            output_tiles = m_tiles * (layer_config.shape_n // block_n)
-            k_iters = layer_config.shape_k // block_k
+            output_tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
+            k_iters = ceil_div(layer_config.shape_k, block_k)
             slice_iters = math.ceil(output_tiles * k_iters / (config["num_sms"] * 4))
             if min(slice_iters, k_iters) < 2 * num_stages:
                 return config
@@ -152,7 +152,7 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         has_aligned_wide_tile = layer_config.shape_n % 256 == 0 and layer_config.shape_k % warp_k == 0
         if can_widen_indexed_tile and has_aligned_wide_tile:
             m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
-            wide_output_tiles = m_tiles * (layer_config.shape_n // 256)
+            wide_output_tiles = m_tiles * ceil_div(layer_config.shape_n, 256)
             resident_ctas = config["num_sms"] * candidate["num_ctas_per_sm"]
             if wide_output_tiles >= resident_ctas:
                 wide_candidate = candidate | {
@@ -290,12 +290,12 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         num_ctas = config["num_ctas_per_sm"]
         num_sms = current_device.sm_count
         resident_ctas = num_sms * num_ctas
-        n_blocks = layer_config.shape_n // block_n
+        n_blocks = ceil_div(layer_config.shape_n, block_n)
         m_blocks = math.ceil(shape_m / block_m)
         if m_blocks * n_blocks >= resident_ctas:
             return config
 
-        k_iters = layer_config.shape_k // block_k
+        k_iters = ceil_div(layer_config.shape_k, block_k)
         # Proxy for repeated B traffic: a converted TMEM operand plus its
         # compressed input and, when present, per-K-group scales.
         weight_bits = layer_config.b_dtype.num_bits
@@ -354,7 +354,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         if a_dtype.num_bits == 16:
             return config
         stage_k = 1024 // a_dtype.num_bits
-        k_iters = layer_config.shape_k // stage_k
+        k_iters = ceil_div(layer_config.shape_k, stage_k)
         # Every M tile re-reads the weights; long K keeps the Stream-K tile.
         if layer_config.shape_k % stage_k or k_iters >= 64:
             return config
@@ -365,7 +365,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             return round_up(rows, alignment)
 
         num_sms = current_device.sm_count
-        n_blocks = layer_config.shape_n // 128
+        n_blocks = ceil_div(layer_config.shape_n, 128)
         full_m = align_m(math.ceil(shape_m / math.ceil(shape_m / 256)))
         if math.ceil(shape_m / full_m) * n_blocks >= num_sms:
             return config
@@ -430,7 +430,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
 
         # Stream-K balances partial waves across CTA pairs. Without it, retain
         # independent CTAs when cooperative output waves would be underfilled.
-        output_tiles = math.ceil(shape_m / block_m) * (layer_config.shape_n // block_n)
+        output_tiles = math.ceil(shape_m / block_m) * ceil_div(layer_config.shape_n, block_n)
         num_sms = current_device.sm_count // 2 * 2
         if not num_sms:
             return config
@@ -440,7 +440,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
 
         # Wider low-bit stages may not fit six; FP16 keeps its measured depth.
         min_stages = 4 if is_low_bit else 6
-        k_iters = layer_config.shape_k // block_k
+        k_iters = ceil_div(layer_config.shape_k, block_k)
         pipeline_iters = k_iters
         if is_low_bit and config["use_stream_k"]:
             # An underfilled Stream-K grid gives each CTA only a slice of K.
@@ -508,13 +508,13 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             use_stream_k = False
             cta_group_size = 2
         else:
-            has_wide_n = shape_n // 128 > num_sms
+            has_wide_n = ceil_div(shape_n, 128) > num_sms
             if has_wide_n and shape_m < 64:
                 return config
             block_m = round_up(shape_m, 16 if has_wide_n else 32)
-            k_iters = shape_k // stage_k
+            k_iters = ceil_div(shape_k, stage_k)
             half_m = round_up(math.ceil(shape_m / 2), 32)
-            half_pairs = 2 * (shape_n // 256)
+            half_pairs = 2 * ceil_div(shape_n, 256)
             fills_pair_wave = can_pair and 0.8 * (num_sms // 2) <= half_pairs <= num_sms // 2
             if block_m > 128 and half_m >= 128 and fills_pair_wave and k_iters < 96:
                 block_m = half_m
@@ -535,9 +535,9 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             return config
         if config["use_stream_k"]:
             block_k = block_shape[2]
-            k_iters = shape_k // block_k
+            k_iters = ceil_div(shape_k, block_k)
             resident_ctas = num_sms // cta_group_size
-            output_tiles = math.ceil(shape_m / block_m) * (shape_n // (128 * cta_group_size))
+            output_tiles = math.ceil(shape_m / block_m) * ceil_div(shape_n, 128 * cta_group_size)
             data_parallel_work = math.ceil(output_tiles / resident_ctas) * k_iters
             stream_k_work = cls._get_stream_k_work(
                 layer_config, output_tiles, k_iters, block_k, num_stages, resident_ctas
@@ -572,7 +572,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         if shape_n % 128 or shape_k % (2 * stage_k):
             return config
         num_sms = current_device.sm_count
-        wide_k_iters = shape_k // (2 * stage_k)
+        wide_k_iters = ceil_div(shape_k, 2 * stage_k)
         can_split_m = not cls._has_costly_dequant(layer_config) and wide_k_iters < 96
         min_split_m = 32 if wide_k_iters < 48 else 96
 
@@ -584,7 +584,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                 break
             cta_group_size = 2 if block_m >= 96 and shape_n % 256 == 0 else 1
             resident_ctas = num_sms // cta_group_size
-            output_tiles = math.ceil(shape_m / block_m) * (shape_n // (128 * cta_group_size))
+            output_tiles = math.ceil(shape_m / block_m) * ceil_div(shape_n, 128 * cta_group_size)
             if m_splits > 1 and output_tiles > resident_ctas:
                 break
             if m_splits == 1 or output_tiles >= 0.75 * resident_ctas:
@@ -593,7 +593,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
 
         is_short_tile = block_m <= 128
         block_k = 2 * stage_k if is_short_tile else stage_k
-        k_iters = shape_k // block_k
+        k_iters = ceil_div(shape_k, block_k)
         block_shape = (block_m, 128, block_k)
         max_stages = 8 if is_short_tile else 6
         num_stages = cls._get_deepest_stages(layer_config, block_shape, cta_group_size, max_stages, False)
@@ -628,7 +628,8 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         block_m, block_n, _ = config["block_shape"]
         cta_group_size = config.get("umma_cta_group_size", 1)
         resident_ctas = (current_device.sm_count // cta_group_size) * config["num_ctas_per_sm"]
-        output_tiles = math.ceil(shape_m / block_m) * (layer_config.shape_n // (block_n * cta_group_size))
+        n_tiles = ceil_div(layer_config.shape_n, block_n * cta_group_size)
+        output_tiles = math.ceil(shape_m / block_m) * n_tiles
         num_waves = math.ceil(output_tiles / resident_ctas)
         last_wave_tiles = output_tiles % resident_ctas or resident_ctas
         # Many waves with a nearly full tail leave Stream-K little idle time to recover.
@@ -684,14 +685,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         num_sms = current_device.sm_count
 
         for block_k in (1024 // layer_config.a_dtype.num_bits, 512 // layer_config.a_dtype.num_bits):
-            if shape_k % block_k:
-                continue
-            k_iters = shape_k // block_k
+            k_iters = ceil_div(shape_k, block_k)
             for block_n in (256, 128):
-                if shape_n % block_n:
-                    continue
                 block_shape = (block_m, block_n, block_k)
-                output_tiles = m_blocks * (shape_n // block_n)
+                output_tiles = m_blocks * ceil_div(shape_n, block_n)
                 # Narrow short-K grids need more N tiles because splitting K
                 # cannot provide enough work for all SMs.
                 can_fill_grid = output_tiles * k_iters >= num_sms * 4
@@ -780,7 +777,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
         has_native_low_bit_weights = layer_config.use_raw_weight and layer_config.a_dtype.num_bits <= 8
         if is_grouped and has_native_low_bit_weights:
-            k_iters = layer_config.shape_k // config["block_shape"][2]
+            k_iters = ceil_div(layer_config.shape_k, config["block_shape"][2])
             if k_iters <= config["num_stages"] + 1:
                 return config | {"use_tma_c": False}
 
@@ -791,9 +788,9 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         block_m, block_n, block_k = config["block_shape"]
         num_stages = config["num_stages"]
         num_ctas = config["num_ctas_per_sm"]
-        is_short_reduction = layer_config.shape_k // block_k <= 3 * num_stages
+        is_short_reduction = ceil_div(layer_config.shape_k, block_k) <= 3 * num_stages
         m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
-        output_tiles = m_tiles * (layer_config.shape_n // block_n)
+        output_tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
         has_persistent_work = output_tiles >= 2 * current_device.sm_count * num_ctas
         if not is_short_reduction or not has_persistent_work:
             return config
@@ -845,14 +842,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         candidates = []
         indexed = gemm_type == GemmType.INDEXED
         for block_n in (256, 128):
-            if layer_config.shape_n % block_n:
-                continue
             output_groups = block_n // 128
             preferred_k = 1024 // layer_config.a_dtype.num_bits
-            for block_k in (preferred_k,) if layer_config.shape_k % preferred_k == 0 else (preferred_k // 2,):
-                if layer_config.shape_k % block_k:
-                    continue
-                k_iters = layer_config.shape_k // block_k
+            for block_k in (preferred_k, preferred_k // 2):
+                k_iters = ceil_div(layer_config.shape_k, block_k)
                 residency_choices = (2, 1) if block_n == 256 or layer_config.use_raw_weight else (2,)
                 for num_ctas in residency_choices:
                     operand_columns = (
@@ -971,10 +964,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             cta_group_size = config.get("umma_cta_group_size", 1)
             resident_ctas = (num_sms // cta_group_size) * num_ctas
             m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
-            tiles = m_tiles * (layer_config.shape_n // (block_n * cta_group_size))
+            tiles = m_tiles * ceil_div(layer_config.shape_n, block_n * cta_group_size)
             waves = (tiles + resident_ctas - 1) // resident_ctas
 
-            k_iters = layer_config.shape_k // block_k
+            k_iters = ceil_div(layer_config.shape_k, block_k)
             stages = config["num_stages"]
             data_parallel_work = waves * k_iters
             if cta_group_size == 2 and data_parallel_work.mean() < 4 * stages:
@@ -1039,7 +1032,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             cooperative_config = single_cta[1]
             block_m, block_n, block_k = cooperative_config["block_shape"]
             resident_m, resident_n, _ = resident_config["block_shape"]
-            k_iters = layer_config.shape_k // block_k
+            k_iters = ceil_div(layer_config.shape_k, block_k)
             has_full_cooperative_ring = (
                 is_sm103_indexed_mx
                 and cooperative_config.get("umma_cta_group_size", 1) == 2

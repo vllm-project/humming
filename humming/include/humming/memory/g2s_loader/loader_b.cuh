@@ -7,6 +7,7 @@ template <class Ctx>
 class G2SMemoryLoaderB {
 private:
   using ProblemShape = typename Ctx::ProblemShape;
+  using PadShape = typename Ctx::PadShape;
   using SharedStorage = typename Ctx::SharedStorage;
   using BlockShape = typename Ctx::BlockShape;
   using ElementA = typename Ctx::ElementA;
@@ -25,7 +26,9 @@ private:
 
   static constexpr uint32_t kWeightShapeN = Ctx::kWeightShapeN;
   static constexpr uint32_t kWeightShapeK = Ctx::kWeightShapeK;
-  static constexpr bool kNeedsBoundsCheck = kWeightShapeN < ProblemShape::N || kWeightShapeK < ProblemShape::K;
+  static constexpr uint32_t kCoveredShapeN = CEIL_DIV(ProblemShape::N - PadShape::N, BlockShape::N) * BlockShape::N;
+  static constexpr uint32_t kCoveredShapeK = Ctx::kNumKBlocks * BlockShape::K;
+  static constexpr bool kNeedsBoundsCheck = kWeightShapeN < kCoveredShapeN || kWeightShapeK < kCoveredShapeK;
   static constexpr uint32_t kWeightSmemBits = SharedStorage::kWeightSmemBits;
   static constexpr uint32_t kSwizzleBytes = MIN(128u, SharedStorage::kWeightStageK *kWeightSmemBits / 8);
   static constexpr uint32_t kSwizzleK = kSwizzleBytes * 8 / kWeightSmemBits;
@@ -34,6 +37,12 @@ private:
   static constexpr uint32_t kGmemStride = kWeightShapeN * kPackSizeK * ElementQB::kBits / 32 / 4;
   static constexpr uint32_t kGmemExpertStride = kWeightShapeN * kWeightShapeK * ElementQB::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::K / kPackSizeK;
+  static constexpr bool kUsePackedBounds = kUseCpAsync && !kUseTma && !USE_PPU && kNeedsBoundsCheck &&
+                                           !Ctx::kUseRawWeight && !Ctx::kUseFlatWeight && kNumLoadThreads % kSmemStride == 0;
+  static constexpr uint32_t kFlatChunkRows = MIN(64u, BlockShape::N);
+  static constexpr uint32_t kFlatTileInt4s = kFlatChunkRows * BlockShape::K * ElementQB::kBits / 128;
+  static constexpr bool kUseFlatBounds = kUseCpAsync && !kUseTma && !USE_PPU && kNeedsBoundsCheck && Ctx::kUseFlatWeight &&
+                                         kNumLoadThreads % kFlatChunkRows == 0 && kFlatTileInt4s % kNumLoadThreads == 0;
 
 public:
   Ctx &ctx;
@@ -44,6 +53,11 @@ public:
   uint32_t expert_index;
   uint32_t row_offset;
   uint32_t col_offset;
+  // For whole rows/chunks per load group, thread-local bounds only change on seek/advance.
+  bool is_valid_n;
+  int32_t remaining_k_rows;
+  int32_t remaining_k_chunks;
+  int32_t remaining_n_chunks;
   uint32_t cluster_rank = blockIdx.x % kMultiCastSizeB;
 
   CUDA_INLINE
@@ -72,7 +86,7 @@ public:
     if (warp_id == 0) {
       aiu_load_gmem_linear_3d(
           gmem_ptr, smem_ptr,
-          ProblemShape::K / kPackSizeK, ProblemShape::N / 32, kPackSizeK * ElementQB::kBits,
+          kWeightShapeK / kPackSizeK, kWeightShapeN / 32, kPackSizeK * ElementQB::kBits,
           row_offset, col_offset / ElementQB::kBits, 0,
           BlockShape::K / kPackSizeK, BlockShape::N / 32, kPackSizeK * ElementQB::kBits);
     }
@@ -154,8 +168,8 @@ public:
       uint32_t offset = (col / kSwizzleInt4s * BlockShape::N + row) * kSwizzleInt4s + col % kSwizzleInt4s;
       uint32_t swizzled_offset = offset ^ ((smem_base + offset / 8) % kSwizzleInt4s);
       if constexpr (kNeedsBoundsCheck) {
-        bool valid_n = kWeightShapeN >= ProblemShape::N || is_full_n_tile || col_offset + row < kWeightShapeN;
-        bool valid_k = kWeightShapeK >= ProblemShape::K || is_full_k_tile || row_offset * ElementQB::kBits / 128 + col < kGlobalRowInt4s;
+        bool valid_n = kWeightShapeN >= kCoveredShapeN || is_full_n_tile || col_offset + row < kWeightShapeN;
+        bool valid_k = kWeightShapeK >= kCoveredShapeK || is_full_k_tile || row_offset * ElementQB::kBits / 128 + col < kGlobalRowInt4s;
         bool valid = valid_n && valid_k;
         legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + row * kGlobalRowInt4s + col,
             smem_ptr + swizzled_offset, valid, (BlockShape::N * kRowInt4s) % kNumLoadThreads == 0 || row < BlockShape::N);
@@ -185,15 +199,22 @@ public:
       uint32_t gmem_offset = col * kWeightShapeN + gmem_row;
       if constexpr (kNeedsBoundsCheck) {
         bool valid_n;
-        if constexpr (kUseChunkNBounds) {
-          uint32_t chunk_index;
-          if constexpr (kTileInt4s % kNumLoadThreads == 0) chunk_index = i / (kTileInt4s / kNumLoadThreads);
-          else chunk_index = index / kTileInt4s;
-          valid_n = kWeightShapeN >= ProblemShape::N || col_offset / kChunkRows + chunk_index * (64 / kChunkRows) < kWeightShapeN / kChunkRows;
+        bool valid_k;
+        if constexpr (kUseFlatBounds) {
+          constexpr uint32_t kChunkIters = kFlatTileInt4s / kNumLoadThreads;
+          valid_n = kWeightShapeN >= kCoveredShapeN || int32_t(i / kChunkIters * (64 / kFlatChunkRows)) < remaining_n_chunks;
+          valid_k = kWeightShapeK >= kCoveredShapeK || int32_t(i % kChunkIters * (kNumLoadThreads / kFlatChunkRows)) < remaining_k_chunks;
         } else {
-          valid_n = kWeightShapeN >= ProblemShape::N || is_full_n_tile || col_offset + gmem_row < kWeightShapeN;
+          if constexpr (kUseChunkNBounds) {
+            uint32_t chunk_index;
+            if constexpr (kTileInt4s % kNumLoadThreads == 0) chunk_index = i / (kTileInt4s / kNumLoadThreads);
+            else chunk_index = index / kTileInt4s;
+            valid_n = kWeightShapeN >= kCoveredShapeN || col_offset / kChunkRows + chunk_index * (64 / kChunkRows) < kWeightShapeN / kChunkRows;
+          } else {
+            valid_n = kWeightShapeN >= kCoveredShapeN || is_full_n_tile || col_offset + gmem_row < kWeightShapeN;
+          }
+          valid_k = kWeightShapeK >= kCoveredShapeK || is_full_k_tile || row_offset * ElementQB::kBits / 128 + col < kWeightShapeK * ElementQB::kBits / 128;
         }
-        bool valid_k = kWeightShapeK >= ProblemShape::K || is_full_k_tile || row_offset * ElementQB::kBits / 128 + col < kWeightShapeK * ElementQB::kBits / 128;
         bool valid = valid_n && valid_k;
         legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + gmem_offset, smem_ptr + offset, valid, kNumInt4s % kNumLoadThreads == 0 || index < kNumInt4s);
       } else {
@@ -209,7 +230,7 @@ public:
     for (uint32_t slab = warp_id; slab < CEIL_DIV(BlockShape::K, kSwizzleK); slab += kNumLoadThreads / 32) {
       aiu_load_gmem<ElementQB::kBits>(
           gmem_ptr_raw, smem_ptr + slab * BlockShape::N * kSwizzleBytes / sizeof(int4),
-          ProblemShape::N * MAX(1u, Ctx::kNumExperts), ProblemShape::K,
+          kWeightShapeN * MAX(1u, Ctx::kNumExperts), kWeightShapeK,
           expert_index * kWeightShapeN + col_offset, row_offset + slab * kSwizzleK,
           BlockShape::N, kSwizzleK);
     }
@@ -217,7 +238,18 @@ public:
 
   CUDA_INLINE
   void load_legacy(int4 *smem_ptr) {
-    if constexpr (kNeedsBoundsCheck) {
+    if constexpr (kUsePackedBounds) {
+      constexpr uint32_t kRowsPerIteration = kNumLoadThreads / kSmemStride;
+      uint32_t thread_id = ctx.load_thread_id();
+      const int4 *thread_gmem = gmem_ptr + (thread_id / kSmemStride) * kGmemStride + thread_id % kSmemStride;
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < CEIL_DIV(kNumInt4s, kNumLoadThreads); ++i) {
+        uint32_t index = i * kNumLoadThreads + thread_id;
+        bool valid_k = kWeightShapeK >= kCoveredShapeK || int32_t(i * kRowsPerIteration) < remaining_k_rows;
+        legacy_load_zfill_pred<kUseCpAsync>(thread_gmem + i * kRowsPerIteration * kGmemStride,
+            smem_ptr + index, is_valid_n && valid_k, kNumInt4s % kNumLoadThreads == 0 || index < kNumInt4s);
+      }
+    } else if constexpr (kNeedsBoundsCheck) {
       bool is_full_n_tile = col_offset * kPackSizeK / 4 + kSmemStride <= kGmemStride;
       bool is_full_k_tile = row_offset + BlockShape::K / kPackSizeK <= kWeightShapeK / kPackSizeK;
       PRAGMA_UNROLL
@@ -225,8 +257,8 @@ public:
         uint32_t index = i * kNumLoadThreads + ctx.load_thread_id();
         uint32_t row = index / kSmemStride;
         uint32_t col = index % kSmemStride;
-        bool valid_n = kWeightShapeN >= ProblemShape::N || is_full_n_tile || col_offset * kPackSizeK / 4 + col < kGmemStride;
-        bool valid_k = kWeightShapeK >= ProblemShape::K || is_full_k_tile || row_offset + row < kWeightShapeK / kPackSizeK;
+        bool valid_n = kWeightShapeN >= kCoveredShapeN || is_full_n_tile || col_offset * kPackSizeK / 4 + col < kGmemStride;
+        bool valid_k = kWeightShapeK >= kCoveredShapeK || is_full_k_tile || row_offset + row < kWeightShapeK / kPackSizeK;
         bool valid = valid_n && valid_k;
         legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + row * kGmemStride + col,
             smem_ptr + index, valid, kNumInt4s % kNumLoadThreads == 0 || index < kNumInt4s);
@@ -239,6 +271,8 @@ public:
 
   CUDA_INLINE
   void advance() {
+    if constexpr (kUsePackedBounds) remaining_k_rows -= int32_t(BlockShape::K / kPackSizeK);
+    if constexpr (kUseFlatBounds) remaining_k_chunks -= int32_t(BlockShape::K * ElementQB::kBits / 128);
     if constexpr (Ctx::kUseRawWeight || Ctx::kUseFlatWeight) {
       row_offset += BlockShape::K;
       if constexpr (!kUseTma) gmem_ptr += BlockShape::K * ElementQB::kBits / 128 * (Ctx::kUseFlatWeight ? kWeightShapeN : 1);
@@ -254,6 +288,11 @@ public:
     if constexpr (Ctx::kUseRawWeight || Ctx::kUseFlatWeight) {
       row_offset = k_block_id * BlockShape::K;
       col_offset = n_block_id * BlockShape::N;
+      if constexpr (kUseFlatBounds) {
+        remaining_n_chunks = int32_t(kWeightShapeN / kFlatChunkRows) - int32_t(col_offset / kFlatChunkRows);
+        uint32_t thread_column = ctx.load_thread_id() / kFlatChunkRows;
+        remaining_k_chunks = int32_t(kWeightShapeK * ElementQB::kBits / 128) - int32_t(row_offset * ElementQB::kBits / 128 + thread_column);
+      }
       if constexpr (!kUseTma) {
         if constexpr (Ctx::kUseFlatWeight) {
           uint64_t expert_offset = uint64_t(expert_id) * kWeightShapeN * kWeightShapeK;
@@ -268,6 +307,11 @@ public:
     }
     row_offset = k_block_id * (BlockShape::K / kPackSizeK);
     col_offset = n_block_id * BlockShape::N * ElementQB::kBits / 32;
+    if constexpr (kUsePackedBounds) {
+      uint32_t thread_id = ctx.load_thread_id();
+      is_valid_n = kWeightShapeN >= kCoveredShapeN || n_block_id * kSmemStride + thread_id % kSmemStride < kGmemStride;
+      remaining_k_rows = int32_t(kWeightShapeK / kPackSizeK) - int32_t(row_offset + thread_id / kSmemStride);
+    }
 
     uint64_t gmem_offset = expert_id * kGmemExpertStride;
     if constexpr (!kUseAiu || kNeedsBoundsCheck) gmem_offset += n_block_id * kSmemStride + k_block_id * (kGmemStride * BlockShape::K / kPackSizeK);

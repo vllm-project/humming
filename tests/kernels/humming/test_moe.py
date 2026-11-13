@@ -30,6 +30,7 @@ def _case(
     use_m_major_input_scale: bool = False,
     expert_max_tokens: int | None = None,
     shape_k: int = SHAPE_K,
+    shape_n: int = SHAPE_N,
     **layer_values,
 ) -> KernelTestCase:
     defaults = {
@@ -41,7 +42,7 @@ def _case(
     return KernelTestCase(
         name=name,
         layer_config=LayerConfig(
-            shape_n=SHAPE_N,
+            shape_n=shape_n,
             shape_k=shape_k,
             num_experts=NUM_EXPERTS,
             **(defaults | layer_values),
@@ -61,6 +62,50 @@ def _case(
 
 
 MOE_CASES = (
+    *(
+        _case(
+            f"partial-nk-{gemm_type.value}-{weight_mode}",
+            gemm_type,
+            shape_n=192,
+            shape_k=96 if weight_mode in ("fused", "group-zp-a8") else 192,
+            **layer_values,
+        )
+        for gemm_type in (GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
+        for weight_mode, layer_values in (
+            ("group-zp", dict(weight_scale_group_size=32, has_zero_point=True)),
+            ("secondary", dict(weight_scale_group_size=32, weight_scale_2_type="channel", has_bias=True)),
+            ("raw", dict(a_dtype=dtypes.float8e4m3, b_dtype=dtypes.float8e4m3)),
+            (
+                "group-zp-a8",
+                dict(
+                    a_dtype=dtypes.float8e4m3,
+                    b_dtype=dtypes.uint3,
+                    weight_scale_group_size=32,
+                    has_zero_point=True,
+                ),
+            ),
+            (
+                "fused",
+                dict(
+                    a_dtype=dtypes.int8,
+                    b_dtype=dtypes.float4e2m1,
+                    bs_dtype=dtypes.float8e8m0,
+                    weight_scale_group_size=32,
+                    use_fused_e8m0_scale=True,
+                ),
+            ),
+            (
+                "mx",
+                dict(
+                    a_dtype=dtypes.float4e2m1,
+                    b_dtype=dtypes.float4e2m1,
+                    bs_dtype=dtypes.float8e8m0,
+                    input_scale_group_size=32,
+                    weight_scale_group_size=32,
+                ),
+            ),
+        )
+    ),
     _case("indexed-pad-nk", GemmType.INDEXED, pad_shape_n=96, pad_shape_k=352),
     _case(
         "grouped-contiguous-fp8-pad-nk",

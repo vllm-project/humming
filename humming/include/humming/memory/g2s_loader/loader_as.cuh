@@ -39,7 +39,6 @@ private:
   static constexpr uint32_t kGroupSize = kIsGroupScale ? Ctx::kInputScaleGroupSize : ProblemShape::K;
 
   // The unpadded K may end in a partial group; columns past it are zero-filled.
-  static_assert(ProblemShape::K == kGroupSize || ProblemShape::K % kGroupSize == 0);
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K - PadShape::K, kGroupSize);
   static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);
@@ -67,8 +66,8 @@ private:
 
   template <typename T>
   CUDA_INLINE void load_scale(const T *source, T *destination, bool is_valid_column, bool is_valid_row) {
-    // GEMM traverses padded K, but input scales cover only the original input.
-    if constexpr (PadShape::K != 0 && kIsGroupScale) {
+    // The final CTA can extend beyond the input even without explicit padding.
+    if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K != 0 && kIsGroupScale) {
       if constexpr (kUseCpAsync)
         legacy_load_zfill_pred<true>(source, destination, is_valid_column, is_valid_row);
       else if (is_valid_row)
@@ -264,7 +263,7 @@ public:
       if (row < BlockShape::M && source_row < shape_m) {
         if (component == 0) {
           const auto *source = reinterpret_cast<const uint4 *>(gmem_ptr + source_row * kProblemNumGroups);
-          if constexpr (PadShape::K != 0)
+          if constexpr ((ProblemShape::K - PadShape::K) % BlockShape::K != 0)
             indexed_scale_cache[i] = col_offset < kProblemNumGroups ? *source : uint4{};
           else
             indexed_scale_cache[i] = *source;

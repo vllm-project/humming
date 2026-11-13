@@ -372,9 +372,15 @@ def process_fused_e8m0_scale(
     weight_k = weight.size(-1) * 32 // config.b_dtype.num_bits
     num_weight_groups = weight_k // config.weight_scale_group_size
     delta_scale_offsets = delta_scale_offsets.reshape(num_experts, config.shape_n, -1)
-    delta_scale_offsets = (
-        delta_scale_offsets[:, :weight_n, :num_weight_groups].contiguous().view(num_experts, -1)
-    )
+    delta_scale_offsets = delta_scale_offsets[:, :weight_n, :num_weight_groups]
+    # Repacking can store more rows or K groups than the scale tensor used by GEMM.
+    missing_rows = weight_n - delta_scale_offsets.size(-2)
+    missing_groups = num_weight_groups - delta_scale_offsets.size(-1)
+    if missing_rows or missing_groups:
+        delta_scale_offsets = torch.nn.functional.pad(
+            delta_scale_offsets, (0, missing_groups, 0, missing_rows)
+        )
+    delta_scale_offsets = delta_scale_offsets.contiguous().view(num_experts, -1)
     weight_scale = weight_scale.maximum(scale_min_new) - scale_min_new
     if config.a_dtype == dtypes.float8e4m3:
         weight_scale = weight_scale + 1
@@ -733,6 +739,9 @@ def transform_humming_tensors(
         group_size = config.weight_scale_group_size or config.weight_shape_k
         num_groups = (config.weight_shape_k + group_size - 1) // group_size
         repack_zero_point = zero_point[..., :zero_point_rows, :num_groups].contiguous()
+        missing_groups = num_groups - repack_zero_point.size(-1)
+        if missing_groups:
+            repack_zero_point = torch.nn.functional.pad(repack_zero_point, (0, missing_groups))
 
     weight = transform_humming_weight(
         weight=weight,

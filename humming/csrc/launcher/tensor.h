@@ -475,7 +475,8 @@ inline CUtensorMap make_tma_desc_bs(Tensor tensor, KernelData &kernel_data) {
   uint32_t group_size = kernel_data.weight_scale_group_size;
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(block_shape_k, group_size);
 
-  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
+  uint32_t num_experts = std::max(1u, kernel_data.num_experts);
+  tensor = torch_view_shape(tensor, {num_experts, -1, tensor.size(-1)});
 
   if (kernel_data.use_block_scaled_mma && kernel_data.is_group_weight_scale) {
     uint32_t num_bits = get_dtype_num_bits(kernel_data.a_dtype_id);
@@ -487,17 +488,15 @@ inline CUtensorMap make_tma_desc_bs(Tensor tensor, KernelData &kernel_data) {
       packed_num_groups = CEIL_DIV(num_groups, 4);
     }
     if (packed_block_n > 256) {
-      ASSERT_CHECK(packed_block_n % 256 == 0, "MXMMA BS TMA width must be divisible by 256");
-      ASSERT_CHECK(tensor.size(-1) % 256 == 0, "MXMMA packed BS width must be divisible by 256");
-      tensor = torch_view_shape(tensor, {-1, tensor.size(-1) / 256, 256});
-      return make_tma_desc(tensor, {256, packed_block_n / 256, packed_num_groups}, 0, "bs");
+      tensor = torch_view_shape(tensor, {num_experts, -1, tensor.size(-1) / 8, 8});
+      return make_tma_desc(tensor, {8, packed_block_n / 8, packed_num_groups, 1}, 0, "bs");
     }
-    return make_tma_desc(tensor, {packed_block_n, packed_num_groups}, 0, "bs");
+    return make_tma_desc(tensor, {packed_block_n, packed_num_groups, 1}, 0, "bs");
   }
 
-  tensor = torch_view_shape(tensor, {tensor.size(0), -1, 16});
+  tensor = torch_view_shape(tensor, {num_experts, tensor.size(1), -1, 16});
 
-  return make_tma_desc(tensor, {16, block_shape_n / 16, num_groups}, 0, "bs");
+  return make_tma_desc(tensor, {16, block_shape_n / 16, num_groups, 1}, 0, "bs");
 }
 
 inline CUtensorMap make_tma_desc_bzp(std::optional<Tensor> &tensor_, KernelData &kernel_data) {
@@ -509,18 +508,18 @@ inline CUtensorMap make_tma_desc_bzp(std::optional<Tensor> &tensor_, KernelData 
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(block_shape_k, group_size);
 
   auto tensor = tensor_.value();
-  tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
+  tensor = torch_view_shape(tensor, {std::max(1u, kernel_data.num_experts), -1, tensor.size(-1)});
 
   if (kernel_data.is_fp_zero_point) {
-    return make_tma_desc(tensor, {block_shape_n, num_groups}, 0, "bzp");
+    return make_tma_desc(tensor, {block_shape_n, num_groups, 1}, 0, "bzp");
   }
 
   uint32_t num_bits = get_dtype_num_bits(kernel_data.b_dtype_id) <= 4 ? 4 : 8;
   if (kernel_data.use_block_scaled_mma && get_dtype_num_bits(kernel_data.a_dtype_id) == 4 && group_size > 0) {
     uint32_t scale_vec = 256 / 4 / group_size;
-    if (scale_vec > 1) return make_tma_desc(tensor, {block_shape_n * num_bits * scale_vec / 32, num_groups / scale_vec}, 0, "bzp");
+    if (scale_vec > 1) return make_tma_desc(tensor, {block_shape_n * num_bits * scale_vec / 32, num_groups / scale_vec, 1}, 0, "bzp");
   }
-  return make_tma_desc(tensor, {block_shape_n * num_bits / 32, num_groups}, 0, "bzp");
+  return make_tma_desc(tensor, {block_shape_n * num_bits / 32, num_groups, 1}, 0, "bzp");
 }
 
 inline CUtensorMap make_tma_desc_bias(std::optional<Tensor> &tensor_, KernelData &kernel_data) {
@@ -529,9 +528,9 @@ inline CUtensorMap make_tma_desc_bias(std::optional<Tensor> &tensor_, KernelData
   uint32_t block_shape_n = kernel_data.block_shape_n;
 
   auto tensor = tensor_.value();
-  tensor = torch_view_shape(tensor, {-1, 64});
+  tensor = torch_view_shape(tensor, {std::max(1u, kernel_data.num_experts), -1, 32});
 
-  return make_tma_desc(tensor, {64, block_shape_n / 64}, 0, "bias");
+  return make_tma_desc(tensor, {32, block_shape_n / 32, 1}, 0, "bias");
 }
 
 inline CUtensorMap make_tma_desc_bs2(std::optional<Tensor> &tensor_, KernelData &kernel_data) {
@@ -540,7 +539,7 @@ inline CUtensorMap make_tma_desc_bs2(std::optional<Tensor> &tensor_, KernelData 
   uint32_t block_shape_n = kernel_data.block_shape_n;
 
   auto tensor = tensor_.value();
-  tensor = torch_view_shape(tensor, {-1, 64});
+  tensor = torch_view_shape(tensor, {std::max(1u, kernel_data.num_experts), -1, 32});
 
-  return make_tma_desc(tensor, {64, block_shape_n / 64}, 0, "bs2");
+  return make_tma_desc(tensor, {32, block_shape_n / 32, 1}, 0, "bs2");
 }

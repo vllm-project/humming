@@ -187,7 +187,7 @@ public:
         if constexpr (kIsIndexedGemm) gmem_row = get_output_row_index(gmem_row);
         uint32_t gmem_col = first_column / 8 + column_block * 8 + smem_col;
         bool valid_row = gmem_row < (kIsIndexedGemm ? output_shape_m : block_output_shape_m);
-        bool valid_column = PadShape::N == 0 || col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N;
+        bool valid_column = (ProblemShape::N - PadShape::N) % BlockShape::N == 0 || col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N;
         if (!valid_row || !valid_column) continue;
 
         int4 val = ctx.smem.reduce[smem_offset];

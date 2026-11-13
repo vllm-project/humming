@@ -227,6 +227,24 @@ CUDA_INLINE void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 };
 
+// Offsets and bounds are measured in T elements; gmem_ptr already points to the tile.
+template <bool kUseCpAsync, uint32_t kNumElements, uint32_t kNumThreads,
+    uint32_t kGmemStride, uint32_t kSmemStride, uint32_t kThreadOffset = 0, typename T = int4>
+CUDA_INLINE void legacy_load_2d_zfill(const T *gmem_ptr, T *smem_ptr,
+    uint32_t row_offset, uint32_t col_offset, uint32_t num_rows, uint32_t num_cols) {
+  uint32_t thread_id = threadIdx.x - kThreadOffset;
+  PRAGMA_UNROLL
+  for (uint32_t i = 0; i < CEIL_DIV(kNumElements, kNumThreads); ++i) {
+    uint32_t index = i * kNumThreads + thread_id;
+    uint32_t row = index / kSmemStride;
+    uint32_t col = index % kSmemStride;
+    bool valid = row_offset + row < num_rows && col_offset + col < num_cols;
+    legacy_load_zfill_pred<kUseCpAsync>(gmem_ptr + row * kGmemStride + col, smem_ptr + index,
+        valid, index < kNumElements);
+  }
+}
+
+
 template <uint32_t kBits>
 CUDA_INLINE void aiu_load_gmem(
     const void *gmem_ptr, void *smem_ptr,

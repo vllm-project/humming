@@ -44,7 +44,8 @@ class Sm90H20Heuristics(DeviceHeuristics):
         num_sms = current_device.sm_count
         warp_k = 512 // a_bits
         reference_k = 2 * warp_k
-        reference_tiles = math.ceil(shape_m / block_shape_m) * (shape_n // 128) * (shape_k // reference_k)
+        reference_output_tiles = math.ceil(shape_m / block_shape_m) * ceil_div(shape_n, 128)
+        reference_tiles = reference_output_tiles * ceil_div(shape_k, reference_k)
         tiles_per_sm = reference_tiles / num_sms
 
         def make_config(block_n, block_k, warp_n, warp_k, num_stages, use_tma, overlap=False):
@@ -64,14 +65,15 @@ class Sm90H20Heuristics(DeviceHeuristics):
 
         max_output_values = 6 * 1024
         wide_k = 2 * reference_k if a_bits == 16 or b_bits >= 4 else reference_k
-        wide_num_iters = math.ceil(shape_m / block_shape_m) * (shape_n // 256) * (shape_k // wide_k)
+        wide_output_tiles = math.ceil(shape_m / block_shape_m) * ceil_div(shape_n, 256)
+        wide_num_iters = wide_output_tiles * ceil_div(shape_k, wide_k)
         stage4_slice = max(4, round_up(ceil_div(wide_num_iters, num_sms), 4))
         stage4_active_ctas = min(num_sms, math.ceil(wide_num_iters / stage4_slice))
         if (
             block_shape_m * 256 <= max_output_values
             and shape_n % 256 == 0
             and shape_k % wide_k == 0
-            and shape_k // wide_k >= 4 * 4
+            and ceil_div(shape_k, wide_k) >= 4 * 4
             and stage4_active_ctas * 2 >= num_sms
         ):
             block_shape = (block_shape_m, 256, wide_k)
@@ -89,12 +91,12 @@ class Sm90H20Heuristics(DeviceHeuristics):
 
         if a_bits != 16 or block_shape_m * 128 > max_output_values:
             return None
-        k_pipeline_turns = shape_k // warp_k
+        k_pipeline_turns = ceil_div(shape_k, warp_k)
         if k_pipeline_turns <= 32:
             return None
         if k_pipeline_turns <= 64 and tiles_per_sm <= 6 and shape_k % warp_k == 0:
             return make_config(128, warp_k, 32, warp_k, 4, False)
-        if shape_k % reference_k == 0 and shape_n // 128 <= math.ceil(num_sms / 8):
+        if shape_k % reference_k == 0 and ceil_div(shape_n, 128) <= math.ceil(num_sms / 8):
             return make_config(128, reference_k, 32, reference_k, 4, True)
         return None
 
@@ -108,7 +110,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         block_k: int,
     ) -> int:
         """Expose enough dense output tiles without sacrificing M reuse."""
-        num_n_tiles = layer_config.shape_n // block_n
+        num_n_tiles = ceil_div(layer_config.shape_n, block_n)
         current_m_tiles = math.ceil(shape_m / block_m)
 
         # Stream-K slices provide less useful parallelism than distinct output tiles.
@@ -194,13 +196,13 @@ class Sm90H20Heuristics(DeviceHeuristics):
         wide_num_stages = 3
         wide_output_tiles = 0
         if wide_block_n:
-            wide_output_tiles = estimated_m_blocks * (layer_config.shape_n // wide_block_n)
+            wide_output_tiles = estimated_m_blocks * ceil_div(layer_config.shape_n, wide_block_n)
         expert_tile_fill = shape_m / (estimated_m_blocks * block_m)
         has_wide_grid = wide_output_tiles >= 2 * num_sms_physical
         underfilled_expert_tiles = expert_tile_fill < 0.5 or (
             expert_tile_fill <= 0.5 and (has_wide_grid or layer_config.b_dtype.num_bits < 4)
         )
-        wide_k_tiles = layer_config.shape_k // wide_block_k
+        wide_k_tiles = ceil_div(layer_config.shape_k, wide_block_k)
         stream_k_grid_gain = min(16, max(4, wide_k_tiles // (2 * wide_num_stages)))
         stream_k_can_fill_grid = (
             layer_config.b_dtype.num_bits <= 4
@@ -236,14 +238,14 @@ class Sm90H20Heuristics(DeviceHeuristics):
                 )
                 return
 
-        num_output_tiles = estimated_m_blocks * (layer_config.shape_n // block_n)
+        num_output_tiles = estimated_m_blocks * ceil_div(layer_config.shape_n, block_n)
         num_ctas_per_sm = min(3, cls.max_smem_size // smem_size, 1024 // num_threads)
         if num_output_tiles < num_sms_physical:
             num_ctas_per_sm = min(num_ctas_per_sm, 2)
         if num_ctas_per_sm < 1:
             return
 
-        k_tiles = layer_config.shape_k // block_k
+        k_tiles = ceil_div(layer_config.shape_k, block_k)
         useful_ctas = num_output_tiles * math.ceil(k_tiles / num_stages)
         num_sms = min(num_sms_physical, math.ceil(useful_ctas / num_ctas_per_sm))
         config.update(num_stages=num_stages, num_ctas_per_sm=num_ctas_per_sm, num_sms=max(1, num_sms))
@@ -377,9 +379,6 @@ class Sm90H20Heuristics(DeviceHeuristics):
         warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape"]
         num_stages = 3
         min_warp_shape_n = 32 if a_dtype.num_bits == 16 else 16
-        while layer_config.shape_n % block_shape_n:
-            block_shape_n //= 2
-            warp_shape_n = min(warp_shape_n, block_shape_n // 4)
         assert warp_shape_n >= min_warp_shape_n
 
         if not layer_config.num_experts:
@@ -396,7 +395,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
             )
 
         warp_shape_m = block_shape_m
-        num_blocks_n = layer_config.shape_n // block_shape_n
+        num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
         num_blocks_m = cls.estimate_num_blocks_m(layer_config, shape_m, block_shape_m, gemm_type)
 
         num_sms = current_device.sm_count
@@ -417,7 +416,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
                 if can_split_dense_k:
                     # Reserve three pipeline turns per CTA after widening the K tile.
                     slice_block_k = max(block_shape_k, 2 * warp_shape_k)
-                    num_k_iters = layer_config.shape_k // slice_block_k
+                    num_k_iters = ceil_div(layer_config.shape_k, slice_block_k)
                     total_k_iters = num_blocks_n * num_blocks_m * num_k_iters
                     min_slice_iters = 3 * max_num_stages
                     if total_k_iters >= num_sms * num_ctas_per_sm * min_slice_iters:
@@ -484,11 +483,6 @@ class Sm90H20Heuristics(DeviceHeuristics):
             factor = min(9, max(factor, layer_config.shape_k / (8 * block_shape_k)))
             num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * factor))
 
-        while layer_config.shape_k % block_shape_k != 0:
-            warp_shape_k = 512 // layer_config.a_dtype.num_bits
-            block_shape_k = block_shape_k // 2
-            assert block_shape_k >= warp_shape_k
-
         if (
             layer_config.a_dtype.num_bits == 8
             and layer_config.input_scale_group_size > 0
@@ -517,13 +511,13 @@ class Sm90H20Heuristics(DeviceHeuristics):
             if config["num_ctas_per_sm"] > 1 and shape_m >= 24576:
                 tiles_per_cta = 5
                 block_m, block_n, _ = config["block_shape"]
-                num_tiles = (layer_config.shape_n // block_n) * (shape_m // block_m)
+                num_tiles = ceil_div(layer_config.shape_n, block_n) * (shape_m // block_m)
                 sms_target = num_tiles / (config["num_ctas_per_sm"] * tiles_per_cta)
                 config["num_sms"] = max(config["num_sms"], 1 << round(math.log2(sms_target)))
 
         has_tma_tile = block_shape_m >= 48
         has_tma_resources = num_ctas_per_sm <= 2 and num_warps <= 8
-        has_tma_pipeline = layer_config.shape_k // block_shape_k >= 24
+        has_tma_pipeline = ceil_div(layer_config.shape_k, block_shape_k) >= 24
         use_dense_tma = not is_moe and has_tma_tile and has_tma_resources and has_tma_pipeline
         if use_dense_tma:
             config["use_tma"] = True
