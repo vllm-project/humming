@@ -41,7 +41,8 @@ private:
   // The unpadded K may end in a partial group; columns past it are zero-filled.
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kProblemNumGroups = CEIL_DIV(ProblemShape::K - PadShape::K, kGroupSize);
-  static constexpr uint32_t kNumGroups = CEIL_DIV(BlockShape::K, kGroupSize);
+  // Per-token scales have one value per row, even when a CTA extends beyond K.
+  static constexpr uint32_t kNumGroups = kIsGroupScale ? CEIL_DIV(BlockShape::K, kGroupSize) : 1;
   static constexpr uint32_t kMxScaleVec = kPartMmaShapeK / kGroupSize;
   static constexpr uint32_t kLoadsPerGroup = kUseMxScale ? MAX(1u, 4 / kNumGroups) : CEIL_DIV(kGroupSize, BlockShape::K);
   static constexpr uint32_t kRowLoadIters = CEIL_DIV(BlockShape::M, kNumLoadThreads);
