@@ -12,6 +12,7 @@ from humming.testing import (
     assert_kernel_test_shape_coverage,
     skip_if_unsupported,
 )
+from humming.utils.math import round_up
 
 MIN_SHAPE_N = 64
 MIN_SHAPE_K = 32
@@ -264,21 +265,25 @@ def test_shape(test_case):
     assert_kernel_test_shape_coverage(results)
 
 
-def test_layer_uses_only_storage_padding():
+def test_layer_preserves_explicit_padding_with_compact_weights():
     torch.manual_seed(2026)
     layer = HummingLayer(
         shape_n=72,
         shape_k=96,
         weight_config={"quant_method": "humming", "dtype": "uint4"},
+        pad_n_to_multiple=256,
+        pad_k_to_multiple=128,
         torch_dtype=torch.bfloat16,
     ).cuda()
     layer.load_from_unquantized(torch.randn(72, 96, device="cuda", dtype=torch.bfloat16))
     reference_weight = layer.weight_schema.dequant_tensors(dict(layer.state_dict())).float()
     layer.transform()
-    assert layer.humming_config.shape_n == 96
-    assert layer.humming_config.shape_k == 96
-    assert layer.humming_config.pad_shape_n == 24
-    assert layer.humming_config.pad_shape_k == 0
+    assert layer.humming_config.shape_n == 256
+    assert layer.humming_config.shape_k == 128
+    assert layer.humming_config.pad_shape_n == 184
+    assert layer.humming_config.pad_shape_k == 32
+    assert layer.humming_config.weight_shape_n == 128
+    assert layer.humming_config.weight_shape_k == 96
     for shape_m in (1, 17, 129):
         inputs = torch.randn(shape_m, 96, device="cuda", dtype=torch.bfloat16)
         expected = inputs.float() @ reference_weight.T
@@ -350,9 +355,20 @@ def test_partial_nk_tiles(shape_n, shape_k, use_tma, use_stream_k, weight_mode, 
     group_size = layer_values.get("weight_scale_group_size", 0)
     if group_size and shape_k % group_size:
         pytest.skip("weight quantization requires complete source groups")
-    layer = LayerConfig(shape_n=shape_n, shape_k=shape_k, c_dtype=dtypes.bfloat16, **layer_values)
+    padded_n = round_up(shape_n, 512 if weight_mode == "mx-wide" else 128)
+    padded_k = round_up(shape_k, 128)
+    layer = LayerConfig(
+        shape_n=padded_n,
+        shape_k=padded_k,
+        pad_shape_n=padded_n - shape_n,
+        pad_shape_k=padded_k - shape_k,
+        c_dtype=dtypes.bfloat16,
+        **layer_values,
+    )
     mma_type = get_default_mma_type(layer)
     skip_if_unsupported(a_dtype=layer.a_dtype, mma_type=mma_type.value, use_tma=use_tma)
+    if mma_type == MmaType.UMMA and not use_tma:
+        pytest.skip("UMMA requires TMA weight loading")
     if mma_type == MmaType.UMMA:
         block_shape = (32, 128, 128)
         warp_shape = (32, 32, 128)

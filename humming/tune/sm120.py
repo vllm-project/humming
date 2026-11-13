@@ -6,7 +6,7 @@ from humming.config.mma import get_default_mma_type, get_register_budget_error
 from humming.device import current_device
 from humming.tune.raster import get_moe_raster_group_m
 from humming.tune.sm8x import Sm89Heuristics
-from humming.utils.math import ceil_div, round_up
+from humming.utils.math import round_up
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -47,7 +47,7 @@ class Sm120Heuristics(Sm89Heuristics):
             return block_shape_m
 
         min_grid_blocks = math.ceil(current_device.sm_count * num_ctas_per_sm / 2)
-        num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
+        num_blocks_n = layer_config.shape_n // block_shape_n
         num_blocks_m = math.ceil(shape_m / block_shape_m)
         num_blocks = num_blocks_n * num_blocks_m
         if num_blocks >= min_grid_blocks:
@@ -174,8 +174,8 @@ class Sm120Heuristics(Sm89Heuristics):
             config["smem_reuse_mode"] = "last_stage"
 
         if gemm_type == GemmType.DENSE:
-            num_blocks_n = ceil_div(layer_config.shape_n, config["block_shape"][1])
-            num_blocks_k = ceil_div(layer_config.shape_k, config["block_shape"][2])
+            num_blocks_n = layer_config.shape_n // config["block_shape"][1]
+            num_blocks_k = layer_config.shape_k // config["block_shape"][2]
             num_blocks_nk = num_blocks_n * num_blocks_k
             config.pop("num_sms", None)
 
@@ -275,7 +275,7 @@ class Sm120Heuristics(Sm89Heuristics):
         if candidate_n < 128 or layer_config.shape_n % candidate_n:
             return
         m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m, gemm_type)
-        if m_tiles * ceil_div(layer_config.shape_n, candidate_n) < 2 * current_device.sm_count:
+        if m_tiles * (layer_config.shape_n // candidate_n) < 2 * current_device.sm_count:
             return
 
         # Move intra-CTA K parallelism into independently scheduled four-warp CTAs.
@@ -359,7 +359,7 @@ class Sm120Heuristics(Sm89Heuristics):
             }
             is_aligned = layer_config.shape_n % 256 == 0 and layer_config.shape_k % 128 == 0
             m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, 128, gemm_type)
-            has_many_waves = m_tiles * ceil_div(layer_config.shape_n, 256) >= 4 * current_device.sm_count
+            has_many_waves = m_tiles * (layer_config.shape_n // 256) >= 4 * current_device.sm_count
             if is_aligned and has_many_waves:
                 if cls.sm_version == 120:
                     candidate.update(num_sms=current_device.sm_count, use_stream_k=False)
@@ -392,7 +392,7 @@ class Sm120Heuristics(Sm89Heuristics):
                 m_warp_choices.extend(count for count in (1, 2) if count not in m_warp_choices)
             max_stages = base_config["num_stages"]
             if is_mxmma:
-                max_stages = min(max(4, max_stages), max(2, ceil_div(layer_config.shape_k, block_k)))
+                max_stages = min(max(4, max_stages), max(2, layer_config.shape_k // block_k))
             has_narrower_n = block_n < base_configs[0]["block_shape"][1]
             max_tile_m = 160 if is_mixed_mxmma and has_narrower_n else 144
             min_m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, max_tile_m, gemm_type)
@@ -429,7 +429,7 @@ class Sm120Heuristics(Sm89Heuristics):
 
                     if num_m_warps == 1 and m_tiles * tile_m > max_padded_rows:
                         continue
-                    if m_tiles * ceil_div(layer_config.shape_n, block_n) < current_device.sm_count * 2:
+                    if m_tiles * (layer_config.shape_n // block_n) < current_device.sm_count * 2:
                         continue
                     if has_narrower_n:
                         min_tile_m = original_m if use_indexed_warp_spec else reference_m
@@ -478,7 +478,7 @@ class Sm120Heuristics(Sm89Heuristics):
 
     @classmethod
     def _estimate_moe_weight_working_set(cls, layer_config, config, m_tiles) -> float:
-        n_tiles = ceil_div(layer_config.shape_n, config["block_shape"][1])
+        n_tiles = layer_config.shape_n // config["block_shape"][1]
         resident_ctas = config.get("num_sms", current_device.sm_count)
         resident_ctas *= config.get("num_ctas_per_sm", 1)
         concurrent_experts = 1 + resident_ctas * layer_config.num_experts / (m_tiles * n_tiles)
@@ -599,8 +599,7 @@ class Sm120Heuristics(Sm89Heuristics):
                 candidate["num_stages"],
                 warp_shape=candidate["warp_shape"],
             )
-            n_tiles = ceil_div(layer_config.shape_n, block_n)
-            grid_ctas = max(1, shape_m * n_tiles * 4 // current_device.sm_count)
+            grid_ctas = max(1, shape_m * (layer_config.shape_n // block_n) * 4 // current_device.sm_count)
             num_ctas = min(max_ctas, cls.max_smem_size // smem, grid_ctas)
             if num_ctas > best_ctas:
                 candidate["num_ctas_per_sm"] = num_ctas
@@ -681,6 +680,11 @@ class Sm120Heuristics(Sm89Heuristics):
             should_refit = True
 
         if should_refit:
+            while layer_config.shape_n % block_n:
+                block_n //= 2
+            while layer_config.shape_k % block_k:
+                block_k //= 2
+                warp_k = min(warp_k, block_k)
             has_same_block = tuple(config["block_shape"]) == (block_m, block_n, block_k)
             has_same_warp = tuple(config["warp_shape"]) == (warp_m, warp_n, warp_k)
             if has_same_block and has_same_warp:
@@ -754,7 +758,7 @@ class Sm120Heuristics(Sm89Heuristics):
         block_m, block_n, block_k = config["block_shape"]
         num_blocks_m = math.ceil(shape_m / block_m)
         num_blocks_n = math.ceil(layer_config.shape_n / block_n)
-        num_k_tiles = ceil_div(layer_config.shape_k, block_k)
+        num_k_tiles = layer_config.shape_k // block_k
         num_ctas = current_device.sm_count * config.get("num_ctas_per_sm", 1)
         return num_blocks_m * num_blocks_n * num_k_tiles < num_ctas * config["num_stages"] * 2
 
@@ -779,7 +783,7 @@ class Sm120Heuristics(Sm89Heuristics):
         if warp_m % 16:
             return
 
-        num_k_tiles = ceil_div(layer_config.shape_k, block_k)
+        num_k_tiles = layer_config.shape_k // block_k
         avoid_small_warp_m = cls.sm_version == 120 and shape_m <= block_m and warp_m < 32 and num_k_tiles > 4
         if not use_stream_k and avoid_small_warp_m:
             return
@@ -848,7 +852,7 @@ class Sm120Heuristics(Sm89Heuristics):
 
         m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m)
         min_grid_blocks = math.ceil(current_device.sm_count * 2 / 3)
-        has_sparse_grid = m_tiles * ceil_div(layer_config.shape_n, block_n) < min_grid_blocks
+        has_sparse_grid = m_tiles * (layer_config.shape_n // block_n) < min_grid_blocks
         if block_n <= 64 or not has_sparse_grid:
             return
 

@@ -7,7 +7,7 @@ from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import current_device
 from humming.tune.raster import get_moe_raster_group_m
-from humming.utils.math import ceil_div, round_up
+from humming.utils.math import round_up
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -136,7 +136,13 @@ class DeviceHeuristics:
             warp_shape_m = block_shape_m
             num_warps_m = 1
 
-        num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
+        while layer_config.shape_n % block_shape_n != 0:
+            assert block_shape_n > 64
+            block_shape_n = block_shape_n // 2
+            if warp_shape_n > layer_config.a_dtype.num_bits * 4:
+                warp_shape_n = warp_shape_n // 2
+
+        num_blocks_n = layer_config.shape_n // block_shape_n
         num_blocks_m = cls.estimate_num_blocks_m(layer_config, shape_m, block_shape_m)
 
         num_sms = current_device.sm_count
@@ -162,11 +168,11 @@ class DeviceHeuristics:
             if warp_shape_n > layer_config.a_dtype.num_bits * 4 and block_shape_n > 64:
                 warp_shape_n = warp_shape_n // 2
                 block_shape_n = block_shape_n // 2
-                num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
+                num_blocks_n = num_blocks_n * 2
                 continue
             elif block_shape_n > 64:
                 block_shape_n = block_shape_n // 2
-                num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
+                num_blocks_n = num_blocks_n * 2
             elif num_ctas_per_sm > 1:
                 num_ctas_per_sm = num_ctas_per_sm - 1
                 continue
@@ -200,7 +206,7 @@ class DeviceHeuristics:
                 num_warps *= 2
 
             while num_warps < 8:
-                if block_shape_k * 2 > layer_config.shape_k:
+                if layer_config.shape_k % (block_shape_k * 2) != 0:
                     break
                 block_shape_new = (block_shape_m, block_shape_n, block_shape_k * 2)
                 smem_size = estimate_smem_size_layer(
@@ -305,7 +311,7 @@ class DeviceHeuristics:
         if can_reuse_weight and has_split_m_warps and is_reuse_tile_aligned:
             reuse_block_shape = (64, 128, 64)
             reuse_warp_shape = (64, 32, 64)
-            num_weight_tiles = ceil_div(layer_config.shape_n, 128) * ceil_div(layer_config.shape_k, 64)
+            num_weight_tiles = (layer_config.shape_n // 128) * (layer_config.shape_k // 64)
             has_pipeline_work = num_weight_tiles >= num_sms * 2 * 4
             reuse_smem_size = estimate_smem_size_layer(
                 layer_config,
@@ -322,7 +328,7 @@ class DeviceHeuristics:
                 warp_shape_m, warp_shape_n, warp_shape_k = reuse_warp_shape
                 num_stages = 2
                 num_ctas_per_sm = 2
-                num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
+                num_blocks_n = layer_config.shape_n // block_shape_n
                 num_blocks_m = cls.estimate_num_blocks_m(layer_config, shape_m, block_shape_m)
 
         use_stream_k = True
@@ -335,6 +341,14 @@ class DeviceHeuristics:
                 num_warps_m = block_shape_m // warp_shape_m
                 warp_shape_m = round_up(warp_shape_m, 16)
                 block_shape_m = num_warps_m * warp_shape_m
+
+        while layer_config.shape_k % block_shape_k != 0:
+            block_shape_k = block_shape_k // 2
+            if use_batch_invariant:
+                warp_shape_k = block_shape_k
+            else:
+                warp_shape_k = 512 // layer_config.a_dtype.num_bits
+                assert block_shape_k >= warp_shape_k
 
         use_stream_k = layer_config.shape_k > 1024 and use_stream_k and not use_dense_output_grid
         use_fp32_accum = layer_config.a_dtype.is_floating_point_type and not use_f16_accum
@@ -350,7 +364,7 @@ class DeviceHeuristics:
                 # Account for Scheduler's aligned slices and pipeline startup,
                 # as in SM100's work estimate, before splitting a single wave.
                 stream_stages = min(num_stages, max_num_stages - 1) if block_shape_m >= 64 else num_stages
-                k_iters = ceil_div(layer_config.shape_k, block_shape_k)
+                k_iters = layer_config.shape_k // block_shape_k
                 scale_group = max(layer_config.input_scale_group_size, layer_config.weight_scale_group_size)
                 alignment = math.lcm(max(1, scale_group // block_shape_k), stream_stages)
                 slice_iters = math.ceil(num_output_tiles * k_iters / blocks_per_wave)
@@ -366,7 +380,7 @@ class DeviceHeuristics:
         keep_full_pipeline = has_small_dense_tile and has_long_wide_weights and max_num_stages == 3
         has_sparse_dense_grid = is_dense_a16 and num_ctas_per_sm == 1 and block_shape_m <= 64
         has_sparse_dense_grid &= num_blocks_m * num_blocks_n * 3 < num_sms * 2
-        has_long_pipeline = ceil_div(layer_config.shape_k, block_shape_k) >= 4 * num_stages
+        has_long_pipeline = layer_config.shape_k // block_shape_k >= 4 * num_stages
         keep_full_pipeline |= has_sparse_dense_grid and has_long_pipeline and max_num_stages == 3
         has_large_a16_tile = layer_config.a_dtype.num_bits == 16 and block_shape_m >= 64
         has_large_a16_tile &= not keep_full_pipeline
@@ -375,7 +389,7 @@ class DeviceHeuristics:
         if is_moe_a16 and use_stream_k:
             # A fifth stage needs enough K work to amortize its startup and
             # Scheduler's coarser stage-aligned Stream-K slices.
-            num_stages = min(num_stages, max(4, ceil_div(layer_config.shape_k, block_shape_k) // 2))
+            num_stages = min(num_stages, max(4, layer_config.shape_k // block_shape_k // 2))
         if use_batch_invariant:
             assert not use_stream_k
             assert block_shape_k == warp_shape_k
@@ -483,7 +497,7 @@ class DeviceHeuristics:
             return block_m
 
         num_blocks_m = math.ceil(shape_m / block_m)
-        num_blocks_n = ceil_div(layer_config.shape_n, block_n)
+        num_blocks_n = layer_config.shape_n // block_n
         is_short_k = layer_config.shape_k <= 1024
         wave_fraction = 2 if is_short_k else 4
         target_blocks = math.ceil(current_device.sm_count * num_ctas_per_sm / wave_fraction)

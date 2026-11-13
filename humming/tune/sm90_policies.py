@@ -19,7 +19,6 @@ from humming.tune.candidate import (
     get_problem_rejection_reasons,
 )
 from humming.tune.raster import get_moe_raster_group_m
-from humming.utils.math import ceil_div
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -112,7 +111,7 @@ def fit_sm90_tile(
             should_limit_stages = has_packed_group_input or (tuning.use_stream_k and use_wgmma_ss)
             mma_type = tuning.mma_type or get_default_mma_type(layer_config)
             if should_limit_stages and mma_type == MmaType.WGMMA:
-                k_iters = ceil_div(layer_config.shape_k, config["block_shape"][2])
+                k_iters = layer_config.shape_k // config["block_shape"][2]
                 stages = min(stages, max(3, k_iters))
             use_tma_c = tuning.use_tma_c and gemm_type != GemmType.INDEXED
             while True:
@@ -174,7 +173,7 @@ def select_sm90_small_m_schedule(
     mma_m = 8 if block_m <= 8 else math.ceil(block_m / 16) * 16
     mma_k = 128
     num_stages = 4
-    num_weight_tiles = ceil_div(layer.shape_n, 128) * ceil_div(layer.shape_k, 128)
+    num_weight_tiles = (layer.shape_n // 128) * (layer.shape_k // 128)
     reason = None
     proposal = None
 
@@ -189,7 +188,7 @@ def select_sm90_small_m_schedule(
         if has_pipeline_work and (has_small_m or has_decode_work):
             reason = "selected MMA with CTA residency fitted to K work and accumulator size"
     elif mma_m == 8:
-        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * ceil_div(layer.shape_n, 128)
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
         if is_h20 and num_output_tiles > num_sms:
             return selected
         mma_k = 64
@@ -199,8 +198,8 @@ def select_sm90_small_m_schedule(
         # Halving an indexed K tile adds loads without removing producer overhead.
         if problem.gemm_type == GemmType.INDEXED and block_k > 128:
             return selected
-        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * ceil_div(layer.shape_n, 128)
-        num_base_tiles = problem.estimate_num_blocks_m(block_m) * ceil_div(layer.shape_n, block_n)
+        num_output_tiles = problem.estimate_num_blocks_m(mma_m) * (layer.shape_n // 128)
+        num_base_tiles = problem.estimate_num_blocks_m(block_m) * (layer.shape_n // block_n)
         has_short_grid = num_output_tiles <= num_sms * 5 / 4
         has_extra_k_parallelism = block_k <= 64 and num_output_tiles <= num_sms * 9 / 4
         has_no_extra_padding = mma_m == block_m and num_output_tiles <= num_sms * 2
@@ -368,7 +367,7 @@ def get_compact_scaled_moe_config(
     has_narrow_n = layer_config.shape_n % 128 != 0
     if not (has_short_k or has_narrow_n):
         return None
-    if has_narrow_n and ceil_div(layer_config.shape_n, 64) >= current_device.sm_count / 4:
+    if has_narrow_n and layer_config.shape_n // 64 >= current_device.sm_count / 4:
         return None
     if get_problem_rejection_reasons(layer_config, MmaType.WGMMA):
         return None
@@ -512,7 +511,7 @@ def get_overlap_config(
     # fit_sm90_tile caps packed group-input rings at the K iterations.
     num_stages = 4
     if layer.use_packed_k_layout and layer.is_group_input_scale and layer.shape_k <= 512:
-        num_stages = min(4, max(3, ceil_div(layer.shape_k, block_k)))
+        num_stages = min(4, max(3, layer.shape_k // block_k))
     if is_dense and shape_m <= (64 if is_h20 else 32):
         return None
     if is_dense and shape_m <= 64 and layer.shape_k > 1024:
@@ -531,7 +530,7 @@ def get_overlap_config(
             DeviceHeuristics.get_expert_rows(layer, shape_m, gemm_type, cv)
             for cv in (0.0, expert_probability_cv, max(1.0, expert_probability_cv))
         ]
-        full_tiles = (distributions[1] // 16).sum(axis=1) * ceil_div(layer.shape_n, 128)
+        full_tiles = (distributions[1] // 16).sum(axis=1) * (layer.shape_n // 128)
         if full_tiles.mean() < num_sms and not has_short_k_moe:
             return None
 
@@ -606,7 +605,7 @@ def get_overlap_config(
             if smem_size * config["num_ctas_per_sm"] > 227 * 1024:
                 continue
             tiles = [
-                ((rows + block_m - 1) // block_m).sum(axis=1) * ceil_div(layer.shape_n, block_n)
+                ((rows + block_m - 1) // block_m).sum(axis=1) * (layer.shape_n // block_n)
                 for rows in distributions
             ]
             has_short_grid = is_dense and tiles[0].mean() < num_sms * 2 / 3
@@ -649,7 +648,7 @@ def get_overlap_config(
             "warp_shape": (block_m, 32, block_k),
         }
         wide_m_tiles = ((distributions[1] + block_m - 1) // block_m).sum(axis=1).mean()
-        wide_output_tiles = wide_m_tiles * ceil_div(layer.shape_n, 512)
+        wide_output_tiles = wide_m_tiles * (layer.shape_n // 512)
         fitted = fit_sm90_tile(layer, wide_config, gemm_type=gemm_type)
         if wide_output_tiles >= num_sms and fitted == wide_config:
             config = wide_config
@@ -681,7 +680,7 @@ def get_short_k_config(
         return None
 
     alignment = 16 if layer_config.a_dtype.is_integer_type else 8
-    n_tiles = ceil_div(layer_config.shape_n, 128)
+    n_tiles = layer_config.shape_n // 128
     block_m = int(shape_m * n_tiles / current_device.sm_count) // alignment * alignment
     block_m = min(64, max(16, block_m))
     has_unpacked_group_weights = (
@@ -799,13 +798,13 @@ def get_block_scaled_moe_config(
         base_utilization = counts.sum(axis=1) / (base_m_tiles * block_m)
         if base_utilization.mean() < 2 / 3:
             return None
-        base_output_tiles = base_m_tiles * ceil_div(shape_n, block_n)
+        base_output_tiles = base_m_tiles * (shape_n // block_n)
         has_large_grid = base_output_tiles.mean() >= 16 * resident_blocks
         block_m_candidates = tuple(range(8, block_m + 1, 8)) if has_large_grid else (block_m,)
     best = None
     for candidate_m in block_m_candidates:
         m_tiles = ((counts + candidate_m - 1) // candidate_m).sum(axis=1)
-        tiles = m_tiles * ceil_div(shape_n, block_n)
+        tiles = m_tiles * (shape_n // block_n)
         utilization = counts.sum(axis=1) / (m_tiles * candidate_m)
         if utilization.mean() < 2 / 3 or tiles.mean() < resident_blocks * 2 / 3:
             continue
@@ -962,6 +961,8 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
             block_shape_k = block_shape_k // 2
             warp_shape_k = warp_shape_k // 2
 
+        while layer_config.shape_k % block_shape_k != 0:
+            block_shape_k = block_shape_k // 2
     else:
         block_shape_n = 256
         block_shape_k = warp_shape_k
@@ -971,19 +972,18 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
             warp_shape_k = warp_shape_k // 2
 
     min_warp_shape_n = 32 if layer_config.a_dtype.num_bits == 16 else 16
-    # Prefer complete tiles where possible, but never shrink below a full WGMMA group.
-    while layer_config.shape_n % block_shape_n and block_shape_n > min_warp_shape_n * 4:
+    # Keep a complete four-warp WGMMA group while fitting output width.
+    while layer_config.shape_n % block_shape_n != 0:
         block_shape_n //= 2
+        assert block_shape_n >= min_warp_shape_n * 4
     warp_shape_n = min(warp_shape_n, block_shape_n // 4)
 
     # Earlier shape fitting can reduce block K below the initial warp K.
     warp_shape_k = min(warp_shape_k, block_shape_k)
-
-    # Keep the measured aligned schedules when available; the minimum tile can have a tail.
-    min_block_k = 512 // layer_config.a_dtype.num_bits
-    while layer_config.shape_k % block_shape_k and block_shape_k > min_block_k:
-        block_shape_k //= 2
+    while layer_config.shape_k % block_shape_k != 0:
+        block_shape_k = block_shape_k // 2
         warp_shape_k = min(warp_shape_k, block_shape_k)
+        assert block_shape_k >= warp_shape_k
 
     if layer_config.use_packed_k_layout:
         warp_shape_k = 128
@@ -1013,7 +1013,7 @@ def build_sm90_seed_config(problem: TuningProblem) -> dict:
     if problem.use_batch_invariant:
         # Keep one K partition and the same reduction tile for every batch size.
         batch_invariant_k = 128 if layer_config.use_packed_k_layout else 1024 // layer_config.a_dtype.num_bits
-        block_shape_k = batch_invariant_k
+        block_shape_k = min(batch_invariant_k, layer_config.shape_k & -layer_config.shape_k)
         warp_shape_k = block_shape_k
 
     config = {
@@ -1065,7 +1065,7 @@ def select_grouped_scale(
         problem.expert_probability_cv,
     )
     if problem.use_batch_invariant:
-        block_ks = (128 if layer_config.shape_k >= 128 else 64,)
+        block_ks = (min(128, layer_config.shape_k & -layer_config.shape_k),)
     else:
         block_ks = (256, 128, 64) if block_shape_m <= 32 else (128, 64)
     use_multicast = problem.gemm_type == GemmType.DENSE and problem.shape_m / block_shape_m >= 4
@@ -1234,7 +1234,7 @@ def get_scaled_a8_config(
     if gemm_type == GemmType.DENSE:
         if short_k:
             return None
-        n_tiles = ceil_div(layer_config.shape_n, 128)
+        n_tiles = layer_config.shape_n // 128
         has_wide_short_grid = layer_config.shape_k <= 1024 and n_tiles >= num_sms / 4 and shape_m <= 128
         if is_h20 and shape_m < 32:
             return None
@@ -1257,7 +1257,7 @@ def get_scaled_a8_config(
         else:
             if shape_m <= 64:
                 return None
-            wide_tiles = math.ceil(shape_m / 64) * ceil_div(layer_config.shape_n, 256)
+            wide_tiles = math.ceil(shape_m / 64) * (layer_config.shape_n // 256)
             if layer_config.shape_n % 256 == 0 and wide_tiles >= num_sms * 2 / 3:
                 config = make_config(64, 256, 32, True, False)
             else:
@@ -1267,7 +1267,7 @@ def get_scaled_a8_config(
     counts = DeviceHeuristics.get_expert_rows(layer_config, shape_m, gemm_type, expert_probability_cv)
     is_indexed = gemm_type == GemmType.INDEXED
     if is_h20 and is_indexed and not has_unpacked_weights and layer_config.shape_k < 4096:
-        full_tiles = (counts // 32).sum(axis=1) * ceil_div(layer_config.shape_n, 256)
+        full_tiles = (counts // 32).sum(axis=1) * (layer_config.shape_n // 256)
         if short_k or full_tiles.mean() < num_sms:
             return None
     candidates = []
@@ -1278,10 +1278,10 @@ def get_scaled_a8_config(
         if layer_config.a_dtype.is_integer_type and block_m > 32 and block_m % 16:
             continue
         m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
-        wide_tiles = m_tiles * ceil_div(layer_config.shape_n, 256)
+        wide_tiles = m_tiles * (layer_config.shape_n // 256)
         use_wide_tile = layer_config.shape_n % 256 == 0 and wide_tiles.mean() >= num_sms * 2 / 3
         block_n = 256 if use_wide_tile else 128
-        tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
+        tiles = m_tiles * (layer_config.shape_n // block_n)
         config = make_config(block_m, block_n, block_n // 8, True, True, stages=3 if short_k else 4)
         if fits_resources(config):
             score = float(np.ceil(tiles / num_sms).mean() * (block_m + 32) * block_n / 128)
@@ -1291,7 +1291,7 @@ def get_scaled_a8_config(
     config = min(candidates, key=lambda item: item[0])[1]
     block_m, block_n, _ = config["block_shape"]
     if is_h20 and is_indexed and not has_unpacked_weights and block_n == 256 and block_m <= 16:
-        full_tiles = (counts // block_m).sum(axis=1) * ceil_div(layer_config.shape_n, block_n)
+        full_tiles = (counts // block_m).sum(axis=1) * (layer_config.shape_n // block_n)
         if full_tiles.mean() < num_sms:
             return None
     if has_unpacked_weights and (is_grouped or is_indexed) and block_m <= 32:
@@ -1305,8 +1305,7 @@ def get_scaled_a8_config(
                 synchronous = wider
         if fits_resources(synchronous):
             block_n = synchronous["block_shape"][1]
-            m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
-            tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
+            tiles = ((counts + block_m - 1) // block_m).sum(axis=1) * (layer_config.shape_n // block_n)
             has_short_indexed_grid = is_h20 and is_indexed and tiles.mean() < num_sms * 4
             if has_short_indexed_grid and layer_config.shape_k <= 4096:
                 return None
@@ -1373,7 +1372,7 @@ def get_packed_wna8_config(
         block_m = math.ceil(shape_m / math.ceil(shape_m / 64))
         alignment = 16 if layer_config.a_dtype.is_integer_type else 8
         block_m = math.ceil(block_m / alignment) * alignment
-        tiles = math.ceil(shape_m / block_m) * ceil_div(layer_config.shape_n, 128)
+        tiles = math.ceil(shape_m / block_m) * (layer_config.shape_n // 128)
         can_split_k = not is_h20 and shape_m >= 32 and layer_config.shape_k >= 2048
         if can_split_k and tiles < current_device.sm_count * 2 / 3:
             return {
@@ -1410,7 +1409,7 @@ def get_packed_wna8_config(
         block_m, block_n, _ = config["block_shape"]
         resident_ctas = config["num_ctas_per_sm"]
         m_tiles = ((expert_rows + block_m - 1) // block_m).sum(axis=1)
-        tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
+        tiles = m_tiles * (layer_config.shape_n // block_n)
         waves = np.ceil(tiles / (num_sms * resident_ctas))
         return float(waves.mean() * resident_ctas * (block_m + 32) * block_n / 128)
 
@@ -1504,7 +1503,7 @@ def get_packed_wna8_config(
             return None
         if gemm_type == GemmType.DENSE or not layer_config.use_fused_e8m0_scale:
             m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1)
-            tiles = m_tiles * ceil_div(layer_config.shape_n, block_n)
+            tiles = m_tiles * (layer_config.shape_n // block_n)
             resident_ctas = 1 if layer_config.use_fused_e8m0_scale else best_config["num_ctas_per_sm"]
             if tiles.mean() < num_sms * resident_ctas / 2:
                 return None

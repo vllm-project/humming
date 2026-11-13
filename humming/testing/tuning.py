@@ -122,6 +122,8 @@ def _is_legal_geometry(
 ) -> bool:
     if block_shape[0] > 256:
         return False
+    if layer_config.shape_n % block_shape[1] or layer_config.shape_k % block_shape[2]:
+        return False
     if any(block % warp for block, warp in zip(block_shape, warp_shape, strict=True)):
         return False
     if warp_shape[1] > 64:
@@ -455,8 +457,7 @@ def _try_combine_candidate(
         return None
     if mma_type == MmaType.WGMMA and config["num_stages"] < 3:
         return None
-    multicast_n = block_shape[1] * config["multi_cast_size_a"]
-    if config["multi_cast_size_a"] > 1 and layer_config.shape_n % multicast_n:
+    if layer_config.shape_n % (block_shape[1] * config["multi_cast_size_a"]):
         return None
     if compute_config.use_batch_invariant and (config["use_stream_k"] or block_shape[2] != warp_shape[2]):
         return None

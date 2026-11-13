@@ -10,7 +10,6 @@ from humming.config.mma import (
     get_register_budget_error,
 )
 from humming.tune.base import DeviceHeuristics
-from humming.utils.math import ceil_div
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -310,6 +309,12 @@ def get_problem_rejection_reasons(
     mma_type: MmaType | None = None,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
+    input_group_size = layer_config.input_scale_group_size
+    # A partial last input-scale group is allowed once K is padded to whole groups.
+    is_padded_k_misaligned = bool(input_group_size) and layer_config.shape_k % input_group_size != 0
+    if is_padded_k_misaligned and layer_config.shape_k != input_group_size:
+        msg = f"shape_k={layer_config.shape_k} is not divisible by input scale group={input_group_size}"
+        reasons.append(msg)
     mma_type = mma_type or get_default_mma_type(layer_config)
     if mma_type != MmaType.WGMMA:
         return tuple(reasons)
@@ -349,6 +354,10 @@ def _analyze_geometry(
     if reasons:
         return _GeometryAnalysis(tuple(reasons), None)
 
+    if layer_config.shape_n % block_shape[1]:
+        reasons.append(f"shape_n={layer_config.shape_n} is not divisible by block_n={block_shape[1]}")
+    if layer_config.shape_k % block_shape[2]:
+        reasons.append(f"shape_k={layer_config.shape_k} is not divisible by block_k={block_shape[2]}")
     if block_shape[0] > 256:
         reasons.append(f"block_m={block_shape[0]} exceeds 256")
     for name, size in (
@@ -421,7 +430,7 @@ def _get_tile_rejection_reasons(
     ):
         if group_size and group_size % schedule.block_shape[2] and schedule.block_shape[2] % group_size:
             reasons.append(f"block_k={schedule.block_shape[2]} and {scale_name}={group_size} do not nest")
-    if schedule.multi_cast_size_a > 1 and problem.layer_config.shape_n % (
+    if schedule.multi_cast_size_a > 0 and problem.layer_config.shape_n % (
         schedule.block_shape[1] * schedule.multi_cast_size_a
     ):
         reasons.append(
@@ -511,9 +520,13 @@ def _analyze_resources(
         and problem.layer_config.shape_n > 0
         and schedule.block_shape[0] > 0
         and schedule.block_shape[1] > 0
+        and problem.layer_config.shape_n % schedule.block_shape[1] == 0
     ):
-        num_n_tiles = ceil_div(problem.layer_config.shape_n, schedule.block_shape[1])
-        num_output_tiles = num_n_tiles * problem.estimate_num_blocks_m(schedule.block_shape[0])
+        num_output_tiles = (
+            problem.layer_config.shape_n
+            // schedule.block_shape[1]
+            * problem.estimate_num_blocks_m(schedule.block_shape[0])
+        )
 
     residency_limits: list[int] = []
     if execution.num_threads > 0:

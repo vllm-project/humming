@@ -66,8 +66,10 @@ MOE_CASES = (
         _case(
             f"partial-nk-{gemm_type.value}-{weight_mode}",
             gemm_type,
-            shape_n=192,
-            shape_k=96 if weight_mode in ("fused", "group-zp-a8") else 192,
+            shape_n=256,
+            pad_shape_n=64,
+            shape_k=256,
+            pad_shape_k=160 if weight_mode in ("fused", "group-zp-a8") else 64,
             **layer_values,
         )
         for gemm_type in (GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)

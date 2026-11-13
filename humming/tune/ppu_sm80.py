@@ -7,7 +7,6 @@ from humming.config import GemmType, LayerConfig, TuningConfig
 from humming.config.mma import get_register_budget_error
 from humming.device import current_device
 from humming.tune.base import DeviceHeuristics
-from humming.utils.math import ceil_div
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -40,7 +39,7 @@ class PPUSm80Heuristics(DeviceHeuristics):
         warp_shape_k = 512 // layer_config.a_dtype.num_bits
         block_shape_n = 256
         num_sms = current_device.sm_count
-        num_blocks_n = ceil_div(layer_config.shape_n, block_shape_n)
+        num_blocks_n = layer_config.shape_n // block_shape_n
 
         num_ctas_per_sm = 2
         use_stream_k = False
@@ -55,6 +54,10 @@ class PPUSm80Heuristics(DeviceHeuristics):
         num_warps_n = block_shape_n // warp_shape_n
         num_warps_k = 8 // num_warps_n
         block_shape_k = num_warps_k * warp_shape_k
+        while layer_config.shape_k % block_shape_k != 0:
+            block_shape_k = block_shape_k // 2
+            num_warps_k = num_warps_k // 2
+
         # A second set of K warps halves the per-thread register budget at the
         # target CTA residency. Group-scaled INT8 tiles also need an extra
         # accumulator, so only expand K parallelism when both CTAs still fit.

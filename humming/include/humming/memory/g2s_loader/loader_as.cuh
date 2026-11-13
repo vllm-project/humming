@@ -343,7 +343,8 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t, uint32_t m_block_id, uint32_t k_block_id, uint32_t current_shape_m, uint32_t m_offset) {
-    if constexpr (kUseMxScale) counter = 0;
+    // A previous tile may end before its last scale group is complete.
+    counter = kUseMxScale ? 0 : k_block_id % kLoadsPerGroup;
     if constexpr (kIsGroupScale) {
       if constexpr (BlockShape::K >= kGroupSize) {
         col_offset = k_block_id * kNumGroups;

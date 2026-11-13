@@ -11,9 +11,9 @@ from filelock import FileLock
 
 import humming.utils.jit as jit_utils
 from humming import dtypes, ops
-from humming.config import ComputeConfig, GemmType, LayerConfig, TuningConfig
+from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
 from humming.config.config import _cuda_compiler_version
-from humming.config.mma import get_mxmma_compiler_error
+from humming.config.mma import get_default_mma_type, get_mxmma_compiler_error
 from humming.device import current_device
 from humming.kernel.humming import HummingKernel
 from humming.schema import HummingWeightSchema
@@ -137,6 +137,14 @@ class KernelTestRunner:
                 pytest.skip(compiler_error)
 
         tuning_sources = _get_test_tuning_sources()
+        if any(_get_sample_size(source) is None for source in tuning_sources):
+            if get_default_mma_type(self.layer_config) == MmaType.WGMMA:
+                min_warp_shape_n = 32 if self.layer_config.a_dtype.num_bits == 16 else 16
+                if self.layer_config.shape_n % (min_warp_shape_n * 4):
+                    import pytest
+
+                    pytest.skip("shape_n cannot form four WGMMA warp tiles")
+
         groups = []
         compile_configs = []
         routed_top_k = self.test_case.top_k if self.compute_config.gemm_type != GemmType.DENSE else 1

@@ -166,9 +166,10 @@ def test_grouped_fp8_uses_legal_n_tile_for_non_128_multiple():
 
     assert decision.selected_analysis.legal
     assert "multi_cast_size_a" not in config
-    assert config["block_shape"][1] >= 64
-    assert config["block_shape"][1] // config["warp_shape"][1] % 4 == 0
-    assert config["block_shape"][2] % config["warp_shape"][2] == 0
+    assert config["block_shape"][1] == 64
+    assert config["warp_shape"][1] == 16
+    assert config["block_shape"][2] == 64
+    assert config["warp_shape"][2] == 64
 
 
 def test_grouped_fp8_uses_legal_schedules_across_the_dense_threshold():
@@ -207,18 +208,36 @@ def test_dense_a16_uses_legal_n_tile_for_non_256_multiple():
     assert config["warp_shape"][1] == 32
 
 
-def test_dense_a16_accepts_partial_nk_tiles():
-    layer = _layer(
+def test_dense_a16_requires_padding_when_n_has_no_wgmma_tile():
+    unpadded = _layer(
         2880,
         2880,
         a_dtype=dtypes.bfloat16,
         as_dtype=None,
         input_scale_group_size=0,
     )
-    config = Sm90Heuristics.get_config(layer, shape_m=16, gemm_type=GemmType.DENSE)
-    assert config["block_shape"][1] >= 128
-    assert layer.shape_n % config["block_shape"][1] != 0
-    assert config["block_shape"][1] // config["warp_shape"][1] % 4 == 0
+    padded = _layer(
+        3072,
+        3072,
+        a_dtype=dtypes.bfloat16,
+        as_dtype=None,
+        input_scale_group_size=0,
+    )
+
+    with pytest.raises(AssertionError):
+        Sm90Heuristics.get_config(
+            unpadded,
+            shape_m=16,
+            gemm_type=GemmType.DENSE,
+        )
+
+    config = Sm90Heuristics.get_config(
+        padded,
+        shape_m=16,
+        gemm_type=GemmType.DENSE,
+    )
+    assert config["block_shape"][1:] == (128, 64)
+    assert config["warp_shape"][1:] == (32, 64)
 
 
 def test_short_k_does_not_leave_warp_k_larger_than_block_k():

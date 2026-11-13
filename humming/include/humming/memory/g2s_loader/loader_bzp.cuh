@@ -95,6 +95,7 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
+    counter = k_block_id % kLoadsPerGroup;
     expert_index = expert_id;
     column_offset = n_block_id * kSmemStride;
     row_offset = kProblemNumRows * expert_id;

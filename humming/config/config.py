@@ -451,37 +451,6 @@ class LayerConfig(BaseHummingConfig):
             assert self.a_dtype.num_bits == 8, "use_packed_k_layout requires 8-bit activation"
             assert self.b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
 
-        # Keep only padding required by parameter permutations and packed scale words.
-        # CTA dimensions are chosen later and must not determine tensor storage sizes.
-        alignment_n = 8
-        alignment_k = self.weight_scale_group_size or 1
-        if self.has_bias or self.is_channel_weight_scale_2:
-            alignment_n = 32
-        if self.is_block_weight_scale:
-            alignment_n = math.lcm(alignment_n, self.weight_scale_group_size_n)
-        elif not self.is_tensor_weight_scale:
-            if self.use_block_scaled_mma and self.is_group_weight_scale:
-                scale_vec = 256 // self.a_dtype.num_bits // self.weight_scale_group_size
-                alignment_n = math.lcm(alignment_n, 16 if scale_vec == 1 else 8)
-                if self.sm_version // 10 == 12:
-                    packed_groups = 2 if scale_vec == 1 else 4
-                    alignment_k *= packed_groups
-            else:
-                alignment_n = math.lcm(alignment_n, 32 if self.should_apply_bs_on_c else 64)
-        if self.has_zero_point:
-            alignment_n = math.lcm(alignment_n, 64)
-            if self.use_block_scaled_mma and self.a_dtype.num_bits == 4:
-                alignment_k = math.lcm(alignment_k, 256 // self.a_dtype.num_bits)
-
-        extra_n = round_up(self.shape_n, alignment_n) - self.shape_n
-        extra_k = round_up(self.shape_k, alignment_k) - self.shape_k
-        self.shape_n += extra_n
-        self.shape_k += extra_k
-        self.pad_shape_n += extra_n
-        self.pad_shape_k += extra_k
-        self.problem_shape = (0, self.shape_n, self.shape_k)
-        self.pad_shape = (0, self.pad_shape_n, self.pad_shape_k)
-
         if type(self) is LayerConfig:
             self._config_str = self.to_str()
 
