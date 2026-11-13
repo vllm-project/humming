@@ -32,6 +32,7 @@ decltype(&::nvrtcGetPTX) p_nvrtcGetPTX;
 decltype(&::nvrtcGetPTXSize) p_nvrtcGetPTXSize;
 decltype(&::nvrtcGetProgramLog) p_nvrtcGetProgramLog;
 decltype(&::nvrtcGetProgramLogSize) p_nvrtcGetProgramLogSize;
+decltype(&::nvrtcVersion) p_nvrtcVersion;
 
 #define nvrtcAddNameExpression p_nvrtcAddNameExpression
 #define nvrtcCompileProgram p_nvrtcCompileProgram
@@ -44,6 +45,7 @@ decltype(&::nvrtcGetProgramLogSize) p_nvrtcGetProgramLogSize;
 #define nvrtcGetPTXSize p_nvrtcGetPTXSize
 #define nvrtcGetProgramLog p_nvrtcGetProgramLog
 #define nvrtcGetProgramLogSize p_nvrtcGetProgramLogSize
+#define nvrtcVersion p_nvrtcVersion
 
 void die(const std::string &msg) {
   std::fprintf(stderr, "nvrtc_compile: %s\n", msg.c_str());
@@ -107,6 +109,19 @@ void load_nvrtc(const std::string &configured_path) {
   load_symbol(library, p_nvrtcGetPTXSize, "nvrtcGetPTXSize");
   load_symbol(library, p_nvrtcGetProgramLog, "nvrtcGetProgramLog");
   load_symbol(library, p_nvrtcGetProgramLogSize, "nvrtcGetProgramLogSize");
+#ifndef _WIN32
+  load_symbol(library, p_nvrtcVersion, "nvrtcVersion");
+  // NVRTC dlopens libnvrtc-builtins by soname while compiling, and the pip wheel's libnvrtc has no
+  // RUNPATH. Preload the builtins next to libnvrtc so that lookup finds the loaded copy. If they are
+  // not there, NVRTC searches as before and reports its own error.
+  int major = 0, minor = 0;
+  std::error_code ec;
+  auto lib_dir = std::filesystem::canonical(configured_path, ec).parent_path();
+  if (!ec && nvrtcVersion(&major, &minor) == NVRTC_SUCCESS) {
+    auto builtins = lib_dir / ("libnvrtc-builtins.so." + std::to_string(major) + "." + std::to_string(minor));
+    if (std::filesystem::exists(builtins)) dlopen(builtins.c_str(), RTLD_NOW | RTLD_LOCAL);
+  }
+#endif
 }
 
 std::string read_file(const std::string &path) {
