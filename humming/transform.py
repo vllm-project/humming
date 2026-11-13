@@ -514,6 +514,7 @@ def transform_humming_weight(
         group_size_zp=group_size_zp,
         use_packed_k_layout=use_packed_k_layout,
         use_native_dequant=use_native_dequant,
+        inplace=allow_inplace and packed,
     )
     return repacked_weight if is_moe else repacked_weight.squeeze(0)
 

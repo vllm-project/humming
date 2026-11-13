@@ -178,3 +178,67 @@ def test_pack_unpack_weight_int32(num_bits):
     torch.testing.assert_close(packed, expected_packed, rtol=0, atol=0)
     expected = (inputs.to(torch.int64) & ((1 << num_bits) - 1)).to(torch.int32)
     torch.testing.assert_close(ops.unpack_weight(packed, num_bits), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("weight_bits", [3, 4, 8])
+@pytest.mark.parametrize("shape", [(64, 256), (3, 64, 256), (45, 1024, 2048)])
+@pytest.mark.parametrize("use_zero_point", [False, True])
+def test_repack_weight_inplace(weight_bits, shape, use_zero_point):
+    inputs = torch.randint(
+        -(1 << 31),
+        (1 << 31) - 1,
+        (*shape[:-1], shape[-1] * weight_bits // 32),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kwargs = dict(weight_bits=weight_bits, activation_bits=8 if use_zero_point else 16, is_weight_packed=True)
+    if use_zero_point:
+        zero_codes = torch.randint(
+            0, 1 << weight_bits, (*shape[:-1], shape[-1] // 64), dtype=torch.int32, device="cuda"
+        )
+        zero_point = ops.pack_weight(zero_codes.transpose(-1, -2).contiguous(), weight_bits)
+        kwargs.update(
+            zero_point=zero_point.transpose(-1, -2),
+            group_size_zp=64,
+            should_preprocess_for_int2fp=True,
+            should_preprocess_with_zp=True,
+        )
+    expected = ops.repack_weight(inputs, **kwargs)
+    actual = ops.repack_weight(inputs, **kwargs, inplace=True)
+    assert actual.data_ptr() == inputs.data_ptr()
+    assert actual.numel() == inputs.numel()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("interleave_mode", [1, 2, 3])
+@pytest.mark.parametrize("use_fused_e8m0_scale", [False, True])
+def test_repack_weight_inplace_packed_k(interleave_mode, use_fused_e8m0_scale):
+    inputs = torch.randint(-(1 << 31), (1 << 31) - 1, (3, 64, 32), dtype=torch.int32, device="cuda")
+    kwargs = dict(
+        weight_bits=4,
+        activation_bits=8,
+        is_weight_packed=True,
+        use_packed_k_layout=True,
+        use_fused_e8m0_scale=use_fused_e8m0_scale,
+        interleave_mode=interleave_mode,
+    )
+    expected = ops.repack_weight(inputs, **kwargs)
+    actual = ops.repack_weight(inputs, **kwargs, inplace=True)
+    assert actual.data_ptr() == inputs.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_repack_weight_inplace_rejects_resize():
+    inputs = torch.zeros((64, 32), dtype=torch.int32, device="cuda")
+    with pytest.raises(AssertionError):
+        ops.repack_weight(inputs, 4, 16, True, padded_shape_n=128, inplace=True)
+    with pytest.raises(AssertionError):
+        ops.repack_weight(inputs, 4, 16, True, padded_shape_k=512, inplace=True)
+    with pytest.raises(AssertionError):
+        ops.repack_weight(inputs, 4, 16, False, inplace=True)
+    with pytest.raises(AssertionError):
+        ops.repack_weight(inputs, 4, 16, True, outputs=torch.empty_like(inputs), inplace=True)
+    assert torch.all(inputs == 0)

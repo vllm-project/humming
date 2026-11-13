@@ -4,6 +4,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from humming import dtypes
+from humming.device import DeviceInfo
 from humming.kernel.convert_weight import ConvertWeightKernel
 from humming.kernel.dequant_weight import DequantKernel
 from humming.kernel.pack_weight import PackWeightKernel
@@ -392,7 +393,60 @@ def repack_weight(
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
     outputs: torch.Tensor | None = None,
+    inplace: bool = False,
 ) -> torch.Tensor:
+    if inplace:
+        assert outputs is None
+        assert is_weight_packed
+        assert inputs.ndim in (2, 3)
+        assert inputs.is_cuda and inputs.is_contiguous() and inputs.dtype == torch.int32
+        shape_n = inputs.size(-2)
+        assert inputs.size(-1) * 32 % weight_bits == 0
+        shape_k = inputs.size(-1) * 32 // weight_bits
+        assert padded_shape_n is None or padded_shape_n == shape_n
+        assert padded_shape_k is None or padded_shape_k == shape_k
+        assert shape_n % 64 == 0
+        assert shape_k % (512 // activation_bits) == 0
+
+        is_moe = inputs.ndim == 3
+        expert_inputs = inputs if is_moe else inputs.unsqueeze(0)
+        num_experts = expert_inputs.size(0)
+        pack_size_k = 64 if use_packed_k_layout else 256 // activation_bits
+        expert_output_shape = (shape_k // pack_size_k, shape_n * pack_size_k * weight_bits // 32)
+        expert_outputs = inputs.view(num_experts, *expert_output_shape)
+        if inputs.numel() == 0:
+            return expert_outputs if is_moe else expert_outputs.squeeze(0)
+
+        expert_zero_point = zero_point
+        if expert_zero_point is not None and not is_moe:
+            expert_zero_point = expert_zero_point.unsqueeze(0)
+
+        buffer_budget = max(DeviceInfo(inputs.device).l2_cache_size // 4, 32 * 1024 * 1024)
+        bytes_per_expert = expert_inputs[0].numel() * inputs.element_size()
+        batch_size = min(num_experts, max(1, buffer_budget // bytes_per_expert))
+        temporary = inputs.new_empty((batch_size, *expert_output_shape))
+        for start in range(0, num_experts, batch_size):
+            end = min(start + batch_size, num_experts)
+            batch_zero_point = None if expert_zero_point is None else expert_zero_point[start:end]
+            batch_outputs = temporary[: end - start]
+            repack_weight(
+                expert_inputs[start:end],
+                weight_bits=weight_bits,
+                activation_bits=activation_bits,
+                is_weight_packed=True,
+                should_preprocess_for_int2fp=should_preprocess_for_int2fp,
+                should_preprocess_with_zp=should_preprocess_with_zp,
+                use_fused_e8m0_scale=use_fused_e8m0_scale,
+                interleave_mode=interleave_mode,
+                group_size_zp=group_size_zp,
+                zero_point=batch_zero_point,
+                use_packed_k_layout=use_packed_k_layout,
+                use_native_dequant=use_native_dequant,
+                outputs=batch_outputs,
+            )
+            expert_outputs[start:end].copy_(batch_outputs)
+        return expert_outputs if is_moe else expert_outputs.squeeze(0)
+
     outputs = _prepare_output_arg(inputs, outputs, torch.int32)
     op = torch.ops.humming.repack_weight if _should_use_torch_op(inputs) else _repack_weight_op
     returned_outputs = op(
