@@ -15,18 +15,6 @@ from humming.utils.cuda import filter_cuda_paths
 from humming.utils.nvrtc import get_nvrtc_library_path, may_build_nvrtc_compile_binary
 
 
-def _nvrtc_subprocess_env(nvrtc_path):
-    # NVRTC dlopens libnvrtc-builtins by soname while compiling. The pip wheel's libnvrtc has no
-    # RUNPATH, so on Linux the compile subprocess finds it only through LD_LIBRARY_PATH.
-    if os.name == "nt":
-        return None
-    lib_dir = os.path.dirname(os.path.realpath(nvrtc_path))
-    paths = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p]
-    if lib_dir in paths:
-        return None
-    return {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join([lib_dir, *paths])}
-
-
 class Compiler:
     @staticmethod
     def debug_kernel_flags():
@@ -239,7 +227,6 @@ class NVRTCCompiler(Compiler):
     @classmethod
     def _compile(cls, source_path, cache_dirname, sm_version, kernel_expr, flags):
         binary_path = may_build_nvrtc_compile_binary()
-        nvrtc_path = get_nvrtc_library_path()
 
         shims_dir = Path(cache_dirname) / "shims"
         shims_dir.mkdir(exist_ok=True)
@@ -254,7 +241,7 @@ class NVRTCCompiler(Compiler):
         cmd = [
             binary_path,
             "--nvrtc-path",
-            nvrtc_path,
+            get_nvrtc_library_path(),
             "--input",
             source_path,
             "--output",
@@ -269,13 +256,7 @@ class NVRTCCompiler(Compiler):
         with open(Path(cache_dirname) / "cmdline.json", "w") as f:
             json.dump(cmd, f, ensure_ascii=False)
 
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=_nvrtc_subprocess_env(nvrtc_path),
-        )
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return result.returncode, result.stdout, result.stderr
 
 
