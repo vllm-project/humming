@@ -514,3 +514,68 @@ def test_large_token_scaled_moe_considers_wider_m_tiles(
     assert not config["use_stream_k"]
     tuning_values = {key: value for key, value in config.items() if key in TuningConfig.get_field_names()}
     assert get_register_budget_error(layer, TuningConfig(**tuning_values), registers_per_sm=65536) is None
+
+
+def _dense_w4a16_layer(shape_n: int, shape_k: int) -> LayerConfig:
+    return LayerConfig(
+        sm_version=90,
+        shape_n=shape_n,
+        shape_k=shape_k,
+        num_experts=0,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.int4,
+        c_dtype=dtypes.bfloat16,
+        as_dtype=None,
+        bs_dtype=dtypes.bfloat16,
+        input_scale_group_size=0,
+        weight_scale_group_size=128,
+    )
+
+
+@pytest.mark.parametrize("shape_m", [1, 16, 32])
+def test_dense_w4a16_one_wave_of_tiles_streams_without_stream_k(shape_m):
+    # 128 output tiles fill one wave of 132 SMs: one CTA per SM streams a whole tile.
+    config = Sm90Heuristics.get_config(
+        _dense_w4a16_layer(16384, 5120), shape_m=shape_m, gemm_type=GemmType.DENSE
+    )
+    assert config["mma_type"] == "mma"
+    assert config["num_ctas_per_sm"] == 1
+    assert config["use_stream_k"] is False
+    assert config["num_stages"] == 6
+
+
+def test_dense_w4a16_full_waves_of_tiles_stream_without_stream_k():
+    # 224 output tiles fill 85% of the 264 resident CTAs: keep two CTAs per SM, drop Stream-K.
+    config = Sm90Heuristics.get_config(_dense_w4a16_layer(28672, 4096), shape_m=16, gemm_type=GemmType.DENSE)
+    assert config["mma_type"] == "mma"
+    assert config["num_ctas_per_sm"] == 2
+    assert config["use_stream_k"] is False
+    assert config["num_stages"] == 6
+
+
+@pytest.mark.parametrize(
+    ("shape_n", "shape_m"),
+    [(4096, 1), (20480, 16), (36864, 16)],
+    ids=["32-tiles", "160-tiles", "288-tiles"],
+)
+def test_dense_w4a16_partial_waves_keep_stream_k(shape_n, shape_m):
+    config = Sm90Heuristics.get_config(
+        _dense_w4a16_layer(shape_n, 4096), shape_m=shape_m, gemm_type=GemmType.DENSE
+    )
+    assert config["mma_type"] == "mma"
+    assert config["use_stream_k"] is True
+    assert config["num_stages"] == 4
+
+
+@pytest.mark.parametrize("shape_n", [34816, 57344])
+def test_dense_w4a16_m32_keeps_wgmma_residency(shape_n):
+    # A 32-row MMA accumulator only fits one CTA per SM; the warp-specialized WGMMA schedule
+    # with two CTAs per SM hides more latency unless the grid is a single wave.
+    config = Sm90Heuristics.get_config(
+        _dense_w4a16_layer(shape_n, 5120), shape_m=32, gemm_type=GemmType.DENSE
+    )
+    # The WGMMA selection leaves mma_type at its default.
+    assert config.get("mma_type", "wgmma") == "wgmma"
+    assert config["block_shape"] == (32, 128, 64)
+    assert config["num_ctas_per_sm"] == 2
+    assert config["use_warp_spec"] is True
