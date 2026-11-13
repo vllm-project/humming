@@ -64,6 +64,7 @@ class Mxfp4WeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
 

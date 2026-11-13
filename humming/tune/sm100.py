@@ -840,6 +840,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         gemm_type: GemmType,
         use_m_major_input_scale: bool = False,
         use_output_chunks: bool = False,
+        use_deep_pipeline: bool = False,
     ) -> tuple:
         candidates = []
         indexed = gemm_type == GemmType.INDEXED
@@ -872,7 +873,9 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                             use_chunks &= block_m > 32 or cta_group_size == 2
                             output_chunk_rows = 32 if use_chunks else 0
                             shape = (block_m, block_n, block_k)
-                            for stages in range(max_stages, min_stages - 1, -1):
+                            can_split_loads = use_deep_pipeline and cta_group_size == 2 and block_m >= 64
+                            candidate_max_stages = 8 if can_split_loads else max_stages
+                            for stages in range(candidate_max_stages, min_stages - 1, -1):
                                 if not cls._fits_resources(
                                     layer_config,
                                     shape,
@@ -904,6 +907,10 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                                 }
                                 if layer_config.use_raw_weight:
                                     config["umma_cta_group_size"] = cta_group_size
+                                if can_split_loads and stages > 5:
+                                    config["umma_split_async_loads"] = True
+                                    config["evict_weights_first"] = True
+                                    config["consumer_stage_unroll"] = 8
                                 candidates.append(config)
                                 # Use the deepest legal pipeline for each tile.
                                 break
@@ -935,9 +942,28 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         minimum_m_tiles = ((counts + 255) // 256).sum(axis=1).mean()
         minimum_output_tiles = minimum_m_tiles * math.ceil(layer_config.shape_n / 256)
         use_output_chunks = gemm_type == GemmType.INDEXED or minimum_output_tiles >= 4 * num_sms
+        is_sm103_indexed_mx = (
+            layer_config.sm_version == 103
+            and gemm_type == GemmType.INDEXED
+            and layer_config.supports_umma_split_async_loads
+        )
+        has_narrow_cooperative_tiles = layer_config.shape_n % 256 == 0 and layer_config.shape_n % 512 != 0
+        scale_group_size = layer_config.input_scale_group_size
+        has_aligned_scale_words = scale_group_size > 0 and layer_config.shape_k % (4 * scale_group_size) == 0
+        has_sustained_expert_work = (
+            shape_m >= 32 * layer_config.num_experts
+            and layer_config.shape_k >= 2048
+            and minimum_output_tiles >= 4 * num_sms
+        )
+        use_deep_pipeline = (
+            is_sm103_indexed_mx
+            and has_narrow_cooperative_tiles
+            and has_aligned_scale_words
+            and has_sustained_expert_work
+        )
         best_by_residency = {}
         candidates = cls._get_moe_candidates(
-            layer_config, gemm_type, use_m_major_input_scale, use_output_chunks
+            layer_config, gemm_type, use_m_major_input_scale, use_output_chunks, use_deep_pipeline
         )
         for config in candidates:
             block_m, block_n, block_k = config["block_shape"]
@@ -991,6 +1017,12 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                 operand_work = work / k_iters * (block_n + activation_columns)
             score = float(np.sqrt(operand_work * padded_work).mean())
             pipeline_penalty = 1 + 1 / stages
+            has_short_indexed_overlap = (
+                is_sm103_indexed_mx and block_m == 8 and stages < k_iters <= 2 * stages
+            )
+            if has_short_indexed_overlap:
+                # The next tile can start loading while the current tile drains.
+                pipeline_penalty = 1 + 1 / (stages + 1)
             score *= pipeline_penalty
             config = config | {"use_stream_k": use_stream_k}
             previous = best_by_residency.get(num_ctas)
@@ -1002,6 +1034,30 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         # Require a clear improvement before giving up the second resident CTA.
         if best is not None and single_cta is not None and single_cta[0] < best[0] * 0.95:
             best = single_cta
+        if best is not None and single_cta is not None and best[1]["num_ctas_per_sm"] == 2:
+            resident_config = best[1]
+            cooperative_config = single_cta[1]
+            block_m, block_n, block_k = cooperative_config["block_shape"]
+            resident_m, resident_n, _ = resident_config["block_shape"]
+            k_iters = layer_config.shape_k // block_k
+            has_full_cooperative_ring = (
+                is_sm103_indexed_mx
+                and cooperative_config.get("umma_cta_group_size", 1) == 2
+                and not cooperative_config["use_stream_k"]
+                and block_m == resident_m
+                and block_n >= 2 * resident_n
+                and resident_config["num_stages"] < k_iters <= cooperative_config["num_stages"]
+            )
+            # Only the wider tile can hold the whole reduction in its ring.
+            # Prefer the wider tile when the traffic estimates remain close;
+            # the generic score otherwise overvalues the second resident CTA.
+            if has_full_cooperative_ring and single_cta[0] < best[0] * 1.2:
+                unroll = 1 << (k_iters - 1).bit_length()
+                cooperative_config = cooperative_config | {
+                    "producer_stage_unroll": unroll,
+                    "consumer_stage_unroll": unroll,
+                }
+                best = (single_cta[0], cooperative_config)
         if best is None:
             raise ValueError("no resource-feasible UMMA MoE tile for this layer")
         return cls._select_grouped_epilogue(

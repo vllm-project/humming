@@ -1,8 +1,9 @@
 import dataclasses
 
 import pytest
+import torch
 
-from humming import dtypes
+from humming import dtypes, ops
 from humming.config import ComputeConfig, GemmType, LayerConfig
 from humming.config.mma import get_default_mma_type, get_dtype_compatibility_error, get_mma_b_dtype
 from humming.device import current_device
@@ -132,3 +133,27 @@ def test_zero_point_case_coverage():
     assert {case.layer_config.b_dtype.num_bits for case in floating_cases} == set(range(1, 9))
     assert all(case.layer_config.has_zero_point for case in ZERO_POINT_CASES)
     assert {case.layer_config.weight_scale_group_size for case in ZERO_POINT_CASES} == {0, 64}
+
+
+def test_repack_accepts_strided_zero_point():
+    """A zero point packed along N arrives as a transposed view from some loaders."""
+    shape_n, shape_k, group_size = 256, 256, 64
+    weight = torch.randint(0, 256, (shape_n, shape_k), dtype=torch.uint8, device="cuda")
+    weight = weight.view(torch.int32)
+    zero_point = torch.randint(0, 256, (shape_k // group_size, shape_n), dtype=torch.uint8, device="cuda")
+    zero_point = zero_point.view(torch.int32).t()
+    assert not zero_point.is_contiguous()
+
+    def repack(zp):
+        return ops.repack_weight(
+            inputs=weight,
+            zero_point=zp,
+            weight_bits=8,
+            activation_bits=16,
+            is_weight_packed=True,
+            should_preprocess_for_int2fp=True,
+            should_preprocess_with_zp=True,
+            group_size_zp=group_size,
+        )
+
+    assert torch.equal(repack(zero_point), repack(zero_point.contiguous()))

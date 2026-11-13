@@ -99,6 +99,7 @@ class HummingLayerMethod:
         torch_dtype: torch.dtype | None = None,
         sublayer_name: str = "",
         tensors: dict[str, torch.Tensor] | None = None,
+        allow_inplace: bool = False,
     ) -> HummingLayerMeta:
         device = next((param.device for param in layer.parameters() if param.is_cuda), None)
         config = prepare_layer_config(
@@ -113,6 +114,7 @@ class HummingLayerMethod:
             torch_dtype=torch_dtype,
             device=device,
             tensors=tensors,
+            allow_inplace=allow_inplace,
         )
         meta = HummingLayerMeta.from_layer_config(config, sublayer_name)
 
@@ -141,9 +143,14 @@ class HummingLayerMethod:
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         weight_scale_2: torch.Tensor | None,
+        allow_inplace: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return process_fused_e8m0_scale(
-            meta, weight=weight, weight_scale=weight_scale, weight_scale_2=weight_scale_2
+            meta,
+            weight=weight,
+            weight_scale=weight_scale,
+            weight_scale_2=weight_scale_2,
+            allow_inplace=allow_inplace,
         )
 
     @classmethod
@@ -172,6 +179,7 @@ class HummingLayerMethod:
         layer: torch.nn.Module,
         sublayer_name: str = "",
         already_padded: bool = False,
+        allow_inplace: bool = False,
     ):
         meta = cls._get_meta(layer, sublayer_name)
         prefix = meta.name_prefix
@@ -187,6 +195,7 @@ class HummingLayerMethod:
             meta,
             tensors,
             already_padded=already_padded,
+            allow_inplace=allow_inplace,
         )
 
         for key, name in [
@@ -571,7 +580,7 @@ class HummingLayer(torch.nn.Module):
         layer.load_from_tensors(tensors)
         return layer
 
-    def transform(self):
+    def transform(self, allow_inplace: bool = False):
         assert self.torch_dtype is not None
         device = next((param.device for param in self.parameters() if param.is_cuda), None)
         input_schema = self.input_schema.to_humming_schema(self.torch_dtype)
@@ -590,6 +599,7 @@ class HummingLayer(torch.nn.Module):
                     num_experts=self.num_experts,
                     device=device,
                     convert_symmetric_integer=convert_symmetric_integer,
+                    allow_inplace=allow_inplace,
                 )
             else:
                 weight_attrs = self.weight_schema.get_tensors_attrs(
@@ -609,6 +619,7 @@ class HummingLayer(torch.nn.Module):
                     param_dtype=self.torch_dtype,
                     num_experts=self.num_experts,
                     device=device,
+                    allow_inplace=allow_inplace,
                 )
             else:
                 input_attrs = self.input_schema.get_tensors_attrs(
@@ -632,7 +643,7 @@ class HummingLayer(torch.nn.Module):
         assert isinstance(self.weight_schema, HummingWeightSchema)
         if convert_symmetric_integer:
             self.weight_schema, weight_tensors = self.weight_schema.convert_symmetric_integer_weight(
-                self.state_dict()
+                self.state_dict(), allow_inplace=allow_inplace
             )
             for name in ("weight", "zero_point"):
                 if name in weight_tensors:
@@ -654,11 +665,12 @@ class HummingLayer(torch.nn.Module):
             has_bias=self.has_bias,
             device=device,
             tensors=tensors,
+            allow_inplace=allow_inplace,
         )
         self._humming_metas = {}
 
         self.humming_config, tensors = prepare_fp16_e8m0_scale(self.humming_config, tensors)
-        tensors = transform_humming_tensors(self.humming_config, tensors)
+        tensors = transform_humming_tensors(self.humming_config, tensors, allow_inplace=allow_inplace)
         for name, tensor in tensors.items():
             setattr(self, name, torch.nn.Parameter(tensor, requires_grad=False))
 

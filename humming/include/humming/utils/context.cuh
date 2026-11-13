@@ -62,7 +62,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kUseWgmmaSs = kUseWgmma && std::is_same<ElementB, ElementQB>::value;
   static constexpr bool kUseWgmmaTmaNPermute = kUseWgmmaSs && TuningConfig::kUseTmaB;
   static constexpr bool kUseWgmmaTmaAPack = kUseWgmma && TuningConfig::kUseTmaA && ElementA::kBits >= 8 && !kIsIndexedGemm &&
-      (ProblemShape::K - PadShape::K) * ElementA::kBits % 1024 == 0 && BlockShape::K * ElementA::kBits > 1024;
+                                            (ProblemShape::K - PadShape::K) * ElementA::kBits % 1024 == 0 && BlockShape::K * ElementA::kBits > 1024;
   static constexpr bool kUseWgmmaCpAsyncNPermute = kUseWgmmaSs && !TuningConfig::kUseTmaB && WarpShape::N > 16;
   static constexpr bool kUseWgmmaSsNLayout = kUseWgmmaSs && !kUseWgmmaTmaNPermute && !kUseWgmmaCpAsyncNPermute;
   static constexpr bool kUseMxmma = TuningConfig::kMmaType == MmaType::MXMMA;
@@ -173,8 +173,9 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
   static constexpr bool kCanSplitInputScaleLoad = !Base::kIsGroupInputScale || Base::kUseTmaAS;
   static constexpr bool kHasTmaWeightLoads = Base::kUseTmaB && kCanSplitWeightScaleLoad && kCanSplitZeroPointLoad;
   static constexpr bool kHasTmaActivationLoads = Base::kUseTmaA && kCanSplitInputScaleLoad;
-  static constexpr bool kUseUmmaSplitLoads = kHasTmaActivationLoads && kHasTmaWeightLoads;
-  static constexpr bool kUseUmmaSeparateInputScale = Base::kUseUmmaSs && kUseUmmaSplitLoads;
+  static_assert(!TuningConfig::kUmmaSplitAsyncLoads || (Base::kUseUmmaSs && Base::kIsIndexedGemm && !Base::kUseTmaA && kHasTmaWeightLoads));
+  static constexpr bool kUseUmmaSplitLoads = kHasTmaWeightLoads && (kHasTmaActivationLoads || TuningConfig::kUmmaSplitAsyncLoads);
+  static constexpr bool kUseUmmaSeparateInputScale = Base::kUseUmmaSs && kUseUmmaSplitLoads && kHasTmaActivationLoads;
   static constexpr bool kUseUmmaAsyncActivationLoads = Base::kUseUmmaSs && !Base::kUseTmaA && kHasTmaWeightLoads;
   // A cooperative completion is consumed by the issuer. Scale preparation must
   // not need generic reads of B/BS in the other CTA before that completion.

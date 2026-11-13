@@ -61,7 +61,7 @@ class BitnetWeightSchema(BaseWeightSchema):
             e = tensor.size(0) if is_moe else 1
             tensor = tensor.cuda()
             tensor = tensor.transpose(-1, -2).contiguous().view(torch.int32)
-            tensor = ops.unpack_weight(tensor, 2)
+            tensor = ops.unpack_weight(tensor, 2, dtype=torch.int8)
             tensor = tensor.view(e, tensor.size(-2), -1, 4)
             tensor = tensor.transpose(-1, -2).contiguous()
             tensor = tensor.view(e, tensor.size(-3), -1)
@@ -85,6 +85,7 @@ class BitnetWeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         schema = HummingWeightSchema(
             b_dtype=dtypes.float2e0m1,
@@ -94,10 +95,10 @@ class BitnetWeightSchema(BaseWeightSchema):
 
         weight = tensors["weight"]
         weight = weight.transpose(-1, -2).contiguous().view(torch.int32)
-        weight = ops.unpack_weight(weight, 2) - 1
-        weight = weight.abs() | ((weight < 0).to(torch.int32) << 1)
+        weight = ops.unpack_weight(weight, 2, dtype=torch.int8) - 1
         weight = weight.transpose(-1, -2).contiguous()
         weight = ops.pack_weight(weight, 2)
+        ops.convert_weight(weight, "int2", "float2e0m1", inplace=True)
         weight = weight.squeeze(0) if num_experts is None else weight
 
         weight_scale = tensors["weight_scale"]

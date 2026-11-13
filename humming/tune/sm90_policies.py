@@ -497,13 +497,21 @@ def get_overlap_config(
     has_a8_schedule = is_unpacked_a8 or can_overlap_packed or can_overlap_block or can_overlap_small_ss
     if not (can_overlap_a16 or (layer.a_dtype.num_bits == 8 and has_a8_schedule)):
         return None
-    if use_f16_accum or use_batch_invariant or layer.shape_k <= 512:
+    # Indexed A8 MoE at TP-sharded down-proj widths (e.g. K=288 padded to 384)
+    # otherwise falls back to grouped-scale Stream-K, which is ~1.2-2.5x slower.
+    has_short_k_moe = (is_unpacked_a8 or can_overlap_packed) and gemm_type == GemmType.INDEXED
+    has_short_k_moe &= not is_h20 and 256 <= layer.shape_k < 512
+    if use_f16_accum or use_batch_invariant or (layer.shape_k <= 512 and not has_short_k_moe):
         return None
     block_k = 64 if is_a16 else 128
     if layer.shape_n % 128 or layer.shape_k % block_k:
         return None
     if get_problem_rejection_reasons(layer, MmaType.WGMMA):
         return None
+    # fit_sm90_tile caps packed group-input rings at the K iterations.
+    num_stages = 4
+    if layer.use_packed_k_layout and layer.is_group_input_scale and layer.shape_k <= 512:
+        num_stages = min(4, max(3, layer.shape_k // block_k))
     if is_dense and shape_m <= (64 if is_h20 else 32):
         return None
     if is_dense and shape_m <= 64 and layer.shape_k > 1024:
@@ -523,7 +531,7 @@ def get_overlap_config(
             for cv in (0.0, expert_probability_cv, max(1.0, expert_probability_cv))
         ]
         full_tiles = (distributions[1] // 16).sum(axis=1) * (layer.shape_n // 128)
-        if full_tiles.mean() < num_sms:
+        if full_tiles.mean() < num_sms and not has_short_k_moe:
             return None
 
     can_widen_unpacked = is_unpacked_a8 and not is_dense and not layer.is_group_input_scale
@@ -547,7 +555,7 @@ def get_overlap_config(
             if can_widen_grouped_a16 and shape_m > layer.num_experts * max_m:
                 max_m = 176
             if can_overlap_packed:
-                max_m = 160 if block_n == 128 else 48
+                max_m = 160 if block_n == 128 else (96 if has_short_k_moe else 48)
             if can_widen_unpacked:
                 max_m = 176 if block_n == 128 else 128
                 if gemm_type == GemmType.INDEXED:
@@ -563,7 +571,7 @@ def get_overlap_config(
                 "mma_type": MmaType.WGMMA.value,
                 "block_shape": (block_m, block_n, block_k),
                 "warp_shape": (block_m, warp_n, block_k),
-                "num_stages": 4,
+                "num_stages": num_stages,
                 "num_ctas_per_sm": 2 if use_indexed_overlap else 1,
                 "use_warp_spec": True,
                 "use_tma": True,
@@ -586,7 +594,7 @@ def get_overlap_config(
                 layer,
                 config["block_shape"],
                 gemm_type,
-                4,
+                num_stages,
                 warp_shape=config["warp_shape"],
                 smem_reuse_mode="none",
                 use_tma=True,
@@ -601,9 +609,12 @@ def get_overlap_config(
                 for rows in distributions
             ]
             has_short_grid = is_dense and tiles[0].mean() < num_sms * 2 / 3
-            config["use_stream_k"] = bool(not is_dense or (has_short_grid and layer.shape_k >= 2048))
+            # A few K iterations leave Stream-K fixups nothing to amortize.
+            use_moe_stream_k = not is_dense and not has_short_k_moe
+            config["use_stream_k"] = bool(use_moe_stream_k or (has_short_grid and layer.shape_k >= 2048))
             wide_efficiency = 1.1 if block_n == 256 else 1.0
-            if gemm_type == GemmType.INDEXED and can_widen_unpacked and block_n == 256:
+            can_widen_indexed = can_widen_unpacked or has_short_k_moe
+            if gemm_type == GemmType.INDEXED and can_widen_indexed and block_n == 256:
                 wide_efficiency = 1.15
             has_grouped_weight_conversion = can_widen_unpacked and gemm_type != GemmType.INDEXED
             has_weight_conversion_cost = layer.shape_k > 4096 or has_grouped_weight_conversion

@@ -100,6 +100,7 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         weight = tensors["weight"].view(torch.int32)
         weight_scale = tensors["weight_scale"].view(torch.float8_e4m3fn)
@@ -197,6 +198,7 @@ class ModeloptMxfp8WeightSchema(ModeloptWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
 
@@ -273,6 +275,7 @@ class ModeloptNvfp4InputSchema(ModeloptInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
         if schema.static_tensor_scale_name is None:

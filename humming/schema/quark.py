@@ -77,7 +77,7 @@ def _unpack_weight(tensor: torch.Tensor, num_bits: int, reorder: bool = False) -
     packed_bytes = torch.nn.functional.pad(packed_bytes, (0, -packed_bytes.numel() % 4))
     packed = packed_bytes.view(torch.int32).reshape(1, -1)
     packed = torch.nn.functional.pad(packed, (0, -packed.numel() % num_bits))
-    values = ops.unpack_weight(packed, num_bits).flatten()[:num_values].view(output_shape)
+    values = ops.unpack_weight(packed, num_bits, dtype=torch.uint8).flatten()[:num_values].view(output_shape)
     if reorder:
         values = values.reshape(*values.shape[:-1], -1, 8)[..., [0, 4, 1, 5, 2, 6, 3, 7]]
         values = values.flatten(-2)
@@ -87,7 +87,7 @@ def _unpack_weight(tensor: torch.Tensor, num_bits: int, reorder: bool = False) -
 def _pack_weight(tensor: torch.Tensor, num_bits: int) -> torch.Tensor:
     output_shape = (*tensor.shape[:-1], tensor.size(-1) * num_bits // 32)
     num_words = tensor.numel() * num_bits // 32
-    values = tensor.reshape(1, -1).to(torch.int32)
+    values = tensor.reshape(1, -1).to(torch.uint8)
     values = torch.nn.functional.pad(values, (0, -values.numel() % 32))
     return ops.pack_weight(values, num_bits).flatten()[:num_words].view(output_shape).contiguous()
 
@@ -349,10 +349,8 @@ class QuarkWeightSchema(BaseWeightSchema):
         if self.dtype in ("int3", "int4", "uint4") and not is_scalar_zero:
             tensor = _unpack_weight(tensor, num_bits, self.pack_method == "reorder" and num_bits == 4)
         else:
-            tensor = tensor.to(torch.int32)
+            tensor = tensor.to(torch.uint8)
         tensor = tensor & ((1 << num_bits) - 1)
-        if self.dtype.startswith("int"):
-            tensor = tensor ^ (1 << (num_bits - 1))
         if self.transposes_groups:
             tensor = tensor.transpose(-1, -2)
         return tensor.contiguous()
@@ -371,8 +369,8 @@ class QuarkWeightSchema(BaseWeightSchema):
             payload = payload.reshape(*blocks.shape[:-1], 8, 3)
             high_bits = payload[..., :1].reshape(*blocks.shape[:-1], 8, 1)
             low_bits = payload[..., 1:].reshape(*blocks.shape[:-1], 16, 1)
-            high_shifts = torch.tensor([6, 4, 2, 0], device=weight.device)
-            low_shifts = torch.tensor([4, 0], device=weight.device)
+            high_shifts = torch.tensor([6, 4, 2, 0], dtype=torch.uint8, device=weight.device)
+            low_shifts = torch.tensor([4, 0], dtype=torch.uint8, device=weight.device)
             high_bits = ((high_bits >> high_shifts) & 3).flatten(-2)
             low_bits = ((low_bits >> low_shifts) & 15).flatten(-2)
             weight = ((high_bits << 4) | low_bits).flatten(-2)
@@ -386,6 +384,7 @@ class QuarkWeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         tensors = {name: self.process_loaded_weight(tensor, name) for name, tensor in tensors.items()}
         schema = self.to_humming_schema(param_dtype)
@@ -416,6 +415,8 @@ class QuarkWeightSchema(BaseWeightSchema):
         if self.is_integer:
             weight = self._unpack_integer_weight(weight)
             weight = _pack_weight(weight, self.weight_dtype.num_bits)
+            if self.dtype.startswith("int"):
+                ops.convert_weight(weight, self.dtype, str(self.weight_dtype), inplace=True)
             if self.has_zero_point:
                 zero_point = self._unpack_integer_weight(tensors[self.zero_point_name], is_zero_point=True)
                 if self.qscheme == "per_tensor":
@@ -433,6 +434,8 @@ class QuarkWeightSchema(BaseWeightSchema):
                     schema.weight_scale_type = WeightScaleType.GROUP
                 zero_point = zero_point.transpose(-1, -2).contiguous()
                 packed_zero = _pack_weight(zero_point, self.weight_dtype.num_bits)
+                if self.dtype.startswith("int"):
+                    ops.convert_weight(packed_zero, self.dtype, str(self.weight_dtype), inplace=True)
                 result["zero_point"] = packed_zero.transpose(-1, -2).contiguous()
         elif self.dtype != "mx":
             # Quark FP4/FP6/FP8 store consecutive little-endian element bits.
@@ -597,6 +600,7 @@ class QuarkInputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
         if schema.static_tensor_scale_name is None:

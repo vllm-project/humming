@@ -5,7 +5,7 @@
 
 __global__ void dequant_unpacked_fp_type(
     uint32_t *in_ptr, uint32_t *out_ptr,
-    uint32_t total_size,
+    uint64_t total_size,
     uint32_t exponent_bits,
     uint32_t mantissa_bits,
     bool is_signed) {
