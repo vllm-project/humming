@@ -81,7 +81,8 @@ class AWQWeightSchema(BaseWeightSchema):
     def _unpack_and_uninterleave(self, tensor: torch.Tensor):
         num_experts = tensor.size(0) if tensor.ndim == 3 else None
         tensor = tensor.cuda()
-        tensor = ops.unpack_weight(tensor, self.bits)
+        unpack_dtype = torch.uint8 if self.bits <= 8 else torch.int32
+        tensor = ops.unpack_weight(tensor, self.bits, dtype=unpack_dtype)
         tensor = tensor.view(*tensor.shape[:-1], -1, 8)[..., [0, 4, 1, 5, 2, 6, 3, 7]]
         tensor = tensor.view(*tensor.shape[:-2], -1)
         if num_experts is not None:
@@ -96,6 +97,7 @@ class AWQWeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
 

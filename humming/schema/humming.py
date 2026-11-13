@@ -293,32 +293,27 @@ class HummingWeightSchema(BaseWeightSchema):
         return self.quant_tensor(dequanted_weight, target_weight_schema, param_dtype)
 
     def convert_symmetric_integer_weight(
-        self, tensors: dict[str, torch.Tensor]
+        self, tensors: dict[str, torch.Tensor], allow_inplace: bool = False
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
         num_bits = self.b_dtype.num_bits
-        has_integer_zero_point = self.has_zero_point and not self.is_fp_zero_point
-        if not self.b_dtype.is_integer_type or not 2 <= num_bits <= 8 or has_integer_zero_point:
+        if not self.b_dtype.is_integer_type or not 2 <= num_bits <= 8 or self.has_zero_point:
             return self, tensors
 
         # Humming integer weights use offset-binary codes, even for signed source formats.
-        weight = ops.unpack_weight(tensors["weight"], num_bits)
-        if torch.any(weight == 0):
-            return self, tensors
-
-        midpoint = 1 << (num_bits - 1)
-        output_tensors = tensors.copy()
-        if self.has_zero_point:
-            zero_point = tensors["zero_point"]
-            centered_zero_point = zero_point - midpoint
-            if not torch.equal(centered_zero_point.float() + midpoint, zero_point.float()):
-                return self, tensors
-            output_tensors["zero_point"] = centered_zero_point
-
-        weight = weight - midpoint
-        weight = weight.abs() | ((weight < 0).to(torch.int32) << (num_bits - 1))
-        output_tensors["weight"] = ops.pack_weight(weight, num_bits)
+        weight = tensors["weight"]
         weight_dtype = dtypes.FloatingPointType(
             num_bits=num_bits, exponent_bits=0, mantissa_bits=num_bits - 1
+        )
+        can_convert = ops.convert_weight(weight, f"uint{num_bits}", str(weight_dtype), check_only=True)
+        if not can_convert.item():
+            return self, tensors
+
+        output_tensors = tensors.copy()
+        output_tensors["weight"] = ops.convert_weight(
+            weight,
+            f"uint{num_bits}",
+            str(weight_dtype),
+            inplace=allow_inplace,
         )
         return dataclasses.replace(self, b_dtype=weight_dtype), output_tensors
 
@@ -329,6 +324,7 @@ class HummingWeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
         is_tensor_only = self.weight_scale_type == WeightScaleType.TENSOR
@@ -451,6 +447,7 @@ class HummingInputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
         if self.static_tensor_scale_name is None:

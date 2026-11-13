@@ -3,7 +3,7 @@ from typing import Any
 
 import torch
 
-from humming import dtypes
+from humming import dtypes, ops
 from humming.config.enum import InputQuantizationMode, WeightScale2Type, WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
@@ -210,11 +210,12 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         weight = tensors[self.weight_key]
         if self.format == "int-quantized":
             assert weight.dtype == torch.int8
-            weight = weight + 128
+            weight = ops.convert_weight(weight.view(torch.int32), "int8", "uint8", inplace=allow_inplace)
         weight = weight.view(torch.int32)
         weight_scale = tensors["weight_scale"]
         if self.format.startswith("mxfp"):
@@ -296,7 +297,12 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
 
         if self.strategy == "tensor":
             return schema._convert_humming(
-                output_tensors, shape_n_stacks, shape_k_stacks, param_dtype, num_experts
+                output_tensors,
+                shape_n_stacks,
+                shape_k_stacks,
+                param_dtype,
+                num_experts,
+                allow_inplace=allow_inplace,
             )
         return schema, output_tensors
 
@@ -384,6 +390,7 @@ class CompressedTensorsInputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
         if schema.static_tensor_scale_name is None:

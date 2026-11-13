@@ -3,7 +3,7 @@
 
 template <uint32_t kNumBits>
 CUDA_INLINE void common_pack_weight(uint32_t *in_arr, uint32_t *out_arr) {
-  constexpr uint32_t mask = (1 << kNumBits) - 1;
+  constexpr uint32_t mask = static_cast<uint32_t>((uint64_t{1} << kNumBits) - 1);
 
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < kNumBits; i++)
@@ -28,7 +28,7 @@ CUDA_INLINE void common_pack_weight(uint32_t *in_arr, uint32_t *out_arr) {
 
 template <uint32_t kNumBits>
 CUDA_INLINE void common_unpack_weight(uint32_t *in_arr, uint32_t *out_arr) {
-  constexpr uint32_t mask = (1 << kNumBits) - 1;
+  constexpr uint32_t mask = static_cast<uint32_t>((uint64_t{1} << kNumBits) - 1);
 
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < 32; i++) {
@@ -39,7 +39,7 @@ CUDA_INLINE void common_unpack_weight(uint32_t *in_arr, uint32_t *out_arr) {
     uint32_t part1_bits = MIN(32 - bit_offset, kNumBits);
     uint32_t part2_bits = kNumBits - part1_bits;
 
-    uint32_t mask1 = (1 << part1_bits) - 1;
+    uint32_t mask1 = static_cast<uint32_t>((uint64_t{1} << part1_bits) - 1);
     out_arr[i] = (in_arr[index / 32] >> bit_offset) & mask1;
 
     if (part2_bits > 0) {
@@ -49,8 +49,9 @@ CUDA_INLINE void common_unpack_weight(uint32_t *in_arr, uint32_t *out_arr) {
   }
 };
 
-template <uint32_t kNumBits>
-__global__ void pack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, int64_t num_elements) {
+template <uint32_t kNumBits, class SourceType = uint32_t>
+__global__ void pack_weight_kernel(const SourceType *in_ptr, uint32_t *out_ptr, int64_t num_elements) {
+  static_assert(kNumBits >= 1 && kNumBits <= sizeof(SourceType) * 8);
   constexpr uint32_t iters = 1;
   constexpr uint32_t num_ints_per_iter = 32;
   uint32_t in_buffer[32];
@@ -61,6 +62,7 @@ __global__ void pack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, in
     size_t in_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * 32) + i * 32 * 32 + threadIdx.x * 32;
     size_t out_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * kNumBits) + i * 32 * kNumBits + threadIdx.x * kNumBits;
 
+    if (in_offset >= num_elements) return;
     PRAGMA_UNROLL_COUNT(32)
     for (uint32_t i = 0; i < 32; i++) {
       if (in_offset + i >= num_elements) continue;
@@ -76,8 +78,9 @@ __global__ void pack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, in
 }
 
 
-template <uint32_t kNumBits>
-__global__ void unpack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, int64_t num_elements) {
+template <uint32_t kNumBits, class TargetType = uint32_t>
+__global__ void unpack_weight_kernel(const uint32_t *in_ptr, TargetType *out_ptr, int64_t num_elements) {
+  static_assert(kNumBits >= 1 && kNumBits <= sizeof(TargetType) * 8);
   constexpr uint32_t iters = 1;
   constexpr uint32_t num_ints_per_iter = 32;
   uint32_t in_buffer[kNumBits];
@@ -88,6 +91,7 @@ __global__ void unpack_weight_kernel(const uint32_t *in_ptr, uint32_t *out_ptr, 
     size_t in_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * kNumBits) + i * 32 * kNumBits + threadIdx.x * kNumBits;
     size_t out_offset = static_cast<size_t>(blockIdx.x) * (iters * 32 * 32) + i * 32 * 32 + threadIdx.x * 32;
 
+    if (out_offset >= num_elements) return;
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kNumBits; i++) {
       if (in_offset + i >= (num_elements * kNumBits / 32)) continue;

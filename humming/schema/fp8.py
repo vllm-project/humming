@@ -91,6 +91,7 @@ class Fp8WeightSchema(BaseWeightSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
         group_size = 0
         if self.weight_block_size is not None:
@@ -120,7 +121,12 @@ class Fp8WeightSchema(BaseWeightSchema):
 
         if self.weight_block_size is None:
             return schema._convert_humming(
-                output_tensors, shape_n_stacks, shape_k_stacks, param_dtype, num_experts
+                output_tensors,
+                shape_n_stacks,
+                shape_k_stacks,
+                param_dtype,
+                num_experts,
+                allow_inplace=allow_inplace,
             )
         return schema, output_tensors
 
@@ -163,6 +169,7 @@ class Fp8InputSchema(BaseInputSchema):
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
         schema = self.to_humming_schema(param_dtype)
         if schema.static_tensor_scale_name is None:

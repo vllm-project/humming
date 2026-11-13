@@ -108,7 +108,10 @@ class BaseWeightSchema:
         num_experts: int | None = None,
         device: int | torch.device | None = None,
         convert_symmetric_integer: bool = True,
+        allow_inplace: bool = False,
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
+        if not allow_inplace:
+            tensors = tensors.copy()
         with torch.cuda.device(device):
             schema, output_tensors = self._convert_humming(
                 tensors,
@@ -116,9 +119,10 @@ class BaseWeightSchema:
                 shape_k_stacks,
                 param_dtype,
                 num_experts,
+                allow_inplace=allow_inplace,
             )
             if convert_symmetric_integer:
-                return schema.convert_symmetric_integer_weight(output_tensors)
+                return schema.convert_symmetric_integer_weight(output_tensors, allow_inplace=allow_inplace)
             return schema, output_tensors
 
     def _convert_humming(
@@ -128,6 +132,7 @@ class BaseWeightSchema:
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
         raise NotImplementedError
 
@@ -295,7 +300,10 @@ class BaseInputSchema:
         param_dtype: torch.dtype,
         num_experts: int | None = None,
         device: int | torch.device | None = None,
+        allow_inplace: bool = False,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
+        if not allow_inplace:
+            tensors = tensors.copy()
         with torch.cuda.device(device):
             return self._convert_humming(
                 tensors,
@@ -303,6 +311,7 @@ class BaseInputSchema:
                 shape_k_stacks,
                 param_dtype,
                 num_experts,
+                allow_inplace=allow_inplace,
             )
 
     def _convert_humming(
@@ -312,6 +321,7 @@ class BaseInputSchema:
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
+        allow_inplace: bool = False,
     ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
         raise NotImplementedError
 

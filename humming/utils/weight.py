@@ -185,11 +185,14 @@ def dequantize_weight(
     weight = weight.cuda()
 
     if packed:
-        weight = ops.unpack_weight(weight, dtype.num_bits)
+        use_byte_storage = dtype.is_integer_type and dtype.num_bits <= 8
+        unpack_dtype = torch.uint8 if use_byte_storage else torch.int32
+        weight = ops.unpack_weight(weight, dtype.num_bits, dtype=unpack_dtype)
         if zero_point is not None and zero_point.dtype == torch.int32:
             zero_point = zero_point.transpose(-1, -2).contiguous().cuda()
             zero_point = zero_point.view(*zero_point.shape)
-            zero_point = ops.unpack_weight(zero_point, dtype.num_bits)
+            unpack_dtype = torch.uint8 if dtype.num_bits <= 8 else torch.int32
+            zero_point = ops.unpack_weight(zero_point, dtype.num_bits, dtype=unpack_dtype)
             zero_point = zero_point.transpose(-1, -2).contiguous()
             zero_point = zero_point.view(*zero_point.shape).float()
 
