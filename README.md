@@ -68,6 +68,8 @@ pip install "humming-kernels[cu12]"  # CUDA 12
 pip install "humming-kernels[cu13]"  # CUDA 13
 ```
 
+On Linux, the extras install the CUDA compiler, headers and NVRTC at the toolkit version your PyTorch build pins, so they stay consistent with each other. There, `cu13` requires PyTorch 2.11 or newer.
+
 Or install from source:
 
 ```bash
