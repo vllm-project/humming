@@ -40,16 +40,19 @@ Documentation = "https://github.com/vllm-project/humming/tree/main/docs"
 
 [project.optional-dependencies]
 cu12 = [
-    "nvidia-cuda-runtime-cu12",
-    "nvidia-cuda-cccl-cu12",
-    "nvidia-cuda-nvcc-cu12",
-    "nvidia-cuda-nvrtc-cu12",
+    "cuda-toolkit[cudart,cccl,nvcc,nvrtc]>=12,<13; sys_platform != 'win32'",
+    "nvidia-cuda-runtime-cu12; sys_platform == 'win32'",
+    "nvidia-cuda-cccl-cu12; sys_platform == 'win32'",
+    "nvidia-cuda-nvcc-cu12; sys_platform == 'win32'",
+    "nvidia-cuda-nvrtc-cu12; sys_platform == 'win32'",
 ]
 cu13 = [
-    "nvidia-cuda-runtime",
-    "nvidia-cuda-cccl",
-    "nvidia-cuda-nvcc",
-    "nvidia-cuda-nvrtc",
+    "torch>=2.11; sys_platform != 'win32'",
+    "cuda-toolkit[cudart,cccl,nvcc,nvrtc]>=13,<14; sys_platform != 'win32'",
+    "nvidia-cuda-runtime; sys_platform == 'win32'",
+    "nvidia-cuda-cccl; sys_platform == 'win32'",
+    "nvidia-cuda-nvcc; sys_platform == 'win32'",
+    "nvidia-cuda-nvrtc; sys_platform == 'win32'",
 ]
 
 [tool.setuptools_scm]
