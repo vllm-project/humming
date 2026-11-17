@@ -383,6 +383,21 @@ WGMMA output with multiple output warpgroups and `output_chunk_rows=0` uses one 
 
 Layer-owned lock buffers contain 2048 int32 elements. The launcher checks supplied lock capacity against the grid and kernel's lock count per tile.
 
+#### `use_fp32_stream_k_reduce`
+
+Defaults to `False`. Opts dense A16 GEMM with FP16 output into FP32 Stream-K
+partial storage and reduction. Requires FP32 MMA accumulation, block-scaled
+FP8 E4M3 weights, MMA or WGMMA, and no secondary scales or zero points.
+`use_stream_k` must be `True`.
+
+The final slice adds bias after the FP32 reduction and converts to FP16 once.
+This avoids narrowing large, cancelling partials to FP16 before summation.
+The launcher allocates a separate `M * N * 4` byte CUDA workspace for each
+invocation, using the current stream's allocator lifetime, including graph capture.
+Input TMA settings are preserved; this path uses direct output stores and
+sets `use_tma_c=False`. Its allocation and output-store costs should be evaluated
+for the target workload before enabling it.
+
 #### `raster_group_m`
 
 Controls grouped traversal of M tiles for dense and grouped-contiguous GEMM.
