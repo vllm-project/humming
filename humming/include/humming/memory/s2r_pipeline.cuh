@@ -127,6 +127,9 @@ public:
     if constexpr (kIsChannelInputScale2) loader_as2.load(smem.as_c, epilogue.arith.regs_as_as_ptr(), -1);
     if constexpr (kIsChannelWeightScale) loader_bs.load(smem.bs_c, epilogue.arith.regs_bs_as_ptr(), -1);
     if constexpr (kIsChannelWeightScale2) loader_bias.load(smem.bs2_c, epilogue.arith.regs_bs2_as_ptr(), 1);
-    if constexpr (kHasBias) loader_bias.load(smem.bias, epilogue.arith.regs_bias_as_ptr(), slice_id == 0);
+    if constexpr (kHasBias) {
+      const bool has_bias = Ctx::kUseFp32StreamKReduce ? slice_id + 1 == epilogue.slice_count : slice_id == 0;
+      loader_bias.load(smem.bias, epilogue.arith.regs_bias_as_ptr(), has_bias);
+    }
   }
 };
