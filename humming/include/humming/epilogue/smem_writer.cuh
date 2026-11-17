@@ -112,7 +112,8 @@ public:
   }
 
   CUDA_INLINE
-  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t first_row) {
+  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t first_row,
+      uint32_t slice_id = 0, uint32_t row_offset = 0, uint32_t col_offset = 0) {
     if (ctx.k_warp_id() != 0) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
@@ -143,6 +144,15 @@ public:
         uint32_t even = __shfl_sync(0xffffffff, bits, source_lane, 4);
         uint32_t odd = __shfl_sync(0xffffffff, bits, source_lane + 2, 4);
         bits = __byte_perm(even, odd, (laneid & 1u) ? 0x7632 : 0x5410);
+      }
+      if constexpr (Ctx::kUseFp32StreamKReduce) {
+        static_assert(std::is_same<PackTypeC, float2>::value);
+        if constexpr (kUseWgmma)
+          arith.apply_fp32_stream_k_output(val, col_8x8block, row_8x8block);
+        else
+          arith.apply_fp32_stream_k_output(val, row_8x8block, col_8x8block);
+        write_fp32_partial(val, row_8x8block, col_8x8block, slice_id, slice_count, row_offset, col_offset);
+        return;
       }
       if constexpr (sizeof(ValTypeC) != 4) {
         val_half2 = val;
@@ -319,6 +329,51 @@ public:
 private:
   uint32_t output_chunk_phase = 0;
 
+  CUDA_INLINE void write_fp32_partial(float2 values, uint32_t row_group, uint32_t column_group,
+      uint32_t slice_id, uint32_t slice_count,
+      uint32_t row_offset, uint32_t col_offset) {
+    static_assert(Ctx::kIsDenseGemm && !Ctx::kUseTmaC);
+    constexpr uint32_t columns = Ctx::ProblemShape::N - Ctx::PadShape::N;
+    static_assert(columns % 2 == 0);
+    const uint32_t lane = ctx.lane_id();
+    const uint32_t bias_column_group = kUseWgmma ? row_group : column_group;
+    uint32_t row;
+    uint32_t column_pair;
+    if constexpr (!kUseWgmma) {
+      row = ctx.m_warp_offset() + 8 * row_group + lane / 4;
+      column_pair = column_group * 4 + WarpShape::N / 2 * ctx.n_warp_id() + lane % 4;
+    } else {
+      row = ctx.m_warp_offset() + 8 * column_group + (lane % 4) * 2 + (lane % 8) / 4;
+      uint32_t output_warp = ctx.n_warp_id();
+      if constexpr (Ctx::kUseWgmmaSsNLayout) {
+        output_warp = ctx.wgmma_ss_n_tile(row_group / 2);
+        row_group %= 2;
+      }
+      constexpr uint32_t count = Ctx::kUseWgmmaSsNLayout ? 4 : (64 / WarpShape::N);
+      column_pair = (output_warp / count) * 32;
+      column_pair += (output_warp % count * (8 / count) + row_group) * 4 + lane / 8;
+    }
+    row += row_offset;
+    const uint32_t column = col_offset + 2 * column_pair;
+    if (row >= ctx.params.shape_m || column + 1 >= columns) return;
+
+    const size_t offset = size_t(row) * columns + column;
+    float *partial = ctx.params.fp32_partials + offset;
+    if (slice_id != 0) {
+      // Bypass per-SM L1 when consuming another CTA's published partial.
+      values.x += __ldcg(partial);
+      values.y += __ldcg(partial + 1);
+    }
+    if (slice_id + 1 == slice_count) {
+      arith.apply_fp32_stream_k_bias(values, bias_column_group);
+      auto *output = reinterpret_cast<scalar_t2 *>(const_cast<void *>(ctx.params.c));
+      output[offset / 2] = this->float22num2(values);
+    } else {
+      __stcg(partial, values.x);
+      __stcg(partial + 1, values.y);
+    }
+  }
+
   CUDA_INLINE uint32_t convert_umma_pair(uint32_t first, uint32_t second, uint32_t row_group, uint32_t column_group) {
     float first_value = __uint_as_float(first);
     float second_value = __uint_as_float(second);
@@ -333,7 +388,7 @@ private:
   }
 
   CUDA_INLINE void apply_umma_packed_output_arithmetic(uint32_t first_row = 0, uint32_t rows = WarpShape::M,
-                                                       uint32_t buffer_offset = 0, uint32_t storage_rows = BlockShape::M) {
+      uint32_t buffer_offset = 0, uint32_t storage_rows = BlockShape::M) {
     uint32_t n_partition = ctx.math_group;
     uint32_t warp = ctx.math_thread_id() / 32;
     uint32_t lane = ctx.lane_id();
