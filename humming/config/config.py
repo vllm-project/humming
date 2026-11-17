@@ -539,6 +539,7 @@ class TuningConfig(BaseHummingConfig):
     warp_shape: tuple[int, int, int]
 
     use_stream_k: bool = True
+    use_fp32_stream_k_reduce: bool = False
 
     wgmma_use_late_as: bool = False
     wgmma_split_issue_wait: bool = False
@@ -660,6 +661,9 @@ class TuningConfig(BaseHummingConfig):
 
         if self.use_tma_as is None:
             self.use_tma_as = False
+
+        if self.use_fp32_stream_k_reduce:
+            self.use_tma_c = False
 
         for name in dir(self):
             if not name.startswith("use_tma_"):
