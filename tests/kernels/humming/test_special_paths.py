@@ -354,3 +354,88 @@ def test_output_chunk_rows(
     shape_ms = (17, 13 * block_m + 1)
     results = KernelTestRunner(case).run(shape_ms)
     assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.parametrize(
+    "mma_type,use_tma,case_name",
+    (
+        ("mma", False, "1.1x"),
+        ("mma", False, "1.5x"),
+        ("umma", True, "2x"),
+    ),
+)
+def test_stream_k_locks_boundary(mma_type, use_tma, case_name):
+    from humming import ops
+    from humming.device import current_device
+    from humming.kernel.humming import HummingKernel
+
+    skip_if_unsupported(a_dtype=dtypes.bfloat16, mma_type=mma_type, use_tma=use_tma)
+    is_umma = mma_type == "umma"
+    block_k = 128 if is_umma else 64
+    num_sms = min(10, current_device.sm_count)
+    if case_name == "1.5x":
+        m_tiles = num_sms + num_sms // 2
+    elif case_name == "2x":
+        m_tiles = 2 * num_sms - 1
+    else:
+        m_tiles = num_sms + num_sms // 10
+    shape_m = m_tiles * 128
+    expected_locks = 2 * num_sms - 1
+
+    layer = LayerConfig(
+        shape_n=256,
+        shape_k=32 * block_k,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        weight_scale_type="channel",
+    )
+    if is_umma and not layer.is_umma_supported:
+        pytest.skip("UMMA requires SM10x or SM11x")
+
+    compute = ComputeConfig(gemm_type=GemmType.DENSE)
+    tuning = {
+        "mma_type": mma_type,
+        "block_shape": (128, 256, block_k),
+        "warp_shape": (128 if is_umma else 64, 32 if is_umma else 64, block_k),
+        "num_stages": 3 if is_umma else 2,
+        "num_sms": num_sms,
+        "num_ctas_per_sm": 1,
+        "use_tma": use_tma,
+        "use_warp_spec": is_umma,
+        "use_stream_k": True,
+    }
+    kernel = HummingKernel.prepare_kernels(
+        layer.to_str(), compute.to_str(), tuning, device=torch.device("cuda", 0)
+    )
+    runner = KernelTestRunner(
+        KernelTestCase(name="stream-k-locks-boundary", layer_config=layer, compute_config=compute, seed=2026)
+    )
+    inputs_orig = generate_random_tensor(
+        (shape_m, layer.shape_k), dtype=layer.param_dtype, device=torch.device("cuda", 0)
+    )
+    inputs_ref, inputs, input_scale, input_scale_2 = runner.prepare_inputs(inputs_orig)
+    outputs_ref = runner.make_reference(inputs_ref, None, torch.arange(shape_m, device=inputs.device))
+    outputs = torch.empty((shape_m, layer.shape_n), dtype=torch.bfloat16, device=inputs.device)
+
+    sentinel = 0x12345678
+    locks_buf = torch.full((expected_locks + 32,), sentinel, dtype=torch.int32, device=inputs.device)
+    locks_buf[:expected_locks].zero_()
+    launch_kwargs = dict(
+        configs=kernel,
+        inputs=inputs,
+        input_scale=input_scale,
+        input_scale_2=input_scale_2,
+        outputs=outputs,
+        **runner.kernel_tensors,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match=f"locks requires at least {expected_locks} int32 elements, got {expected_locks - 1}",
+    ):
+        ops.launch_kernel(locks=locks_buf[: expected_locks - 1], **launch_kwargs)
+
+    ops.launch_kernel(locks=locks_buf[:expected_locks], **launch_kwargs)
+    torch.cuda.synchronize()
+    runner._assert_close(outputs, outputs_ref, use_stream_k=True)
+    assert (locks_buf[expected_locks:] == sentinel).all()
