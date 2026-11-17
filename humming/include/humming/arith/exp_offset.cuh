@@ -127,6 +127,14 @@ CUDA_INLINE constexpr uint2 get_mainloop_exp_offset() {
     offset.y = MIN(total_offset, 2);
   }
 
+  // Fold floating-point weight correction into native-decoded group scales, and
+  // cap E4M3 at 118 and E5M2 at 112 to keep finite scales within BF16 range
+  if constexpr (std::is_same<ElementA, BFloat16>::value && ElementQB::kIsFloatingPointType && ElementBS::kBits == 8 && kNativeDequantBS && !kHasZeroPoint) {
+    constexpr uint32_t max_scale_offset = std::is_same<ElementBS, Float8E4M3>::value ? 118 : 112;
+    offset.x = 0;
+    offset.y = MIN(total_offset, max_scale_offset);
+  }
+
   return offset;
 };
 
