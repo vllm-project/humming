@@ -246,9 +246,6 @@ public:
     }
 
     uint32_t mbar_index = kIsFirst && !kUseContinuousRing ? kNumStages : stage_id;
-    constexpr uint2 load_bytes = get_stage_load_bytes<kIsFirst>();
-    constexpr bool kHasTmaMBarrier = kIsFirst ? kHasFirstStageTmaMBarrier : kHasStageTmaMBarrier;
-
     uint64_t *mbar_ptr = nullptr;
     if constexpr (kUseMBarrier) mbar_ptr = &smem.load_mbar[mbar_index];
     if (pred) {
@@ -268,45 +265,50 @@ public:
       }
     }
 
-    if constexpr (kIsFirst) {
-      commit_cp_async_load<kHasFirstStageCpAsyncMBarrier>(mbar_index, pred);
-    } else {
-      commit_cp_async_load<kHasStageCpAsyncMBarrier>(mbar_index, pred);
-    }
-    if (pred) expect_tma_load<kHasTmaMBarrier>(mbar_ptr, load_bytes.x);
-    if constexpr (kUseContinuousRing) {
-      if (++ring_stage == kNumStages) {
-        ring_stage = 0;
-        ring_phase ^= 1;
-      }
-    }
+    commit_stage<kIsFirst>(stage_id, pred);
   }
 
-  template <bool kShouldAdvance = true>
+  // Non-UMMA callers finalize split loads together with commit_stage().
+  template <bool kShouldAdvance = true, bool kIsFirst = false>
   CUDA_INLINE void load_weight_stage(uint32_t stage_id) {
+    if constexpr (kUseContinuousRing) stage_id = ring_stage;
     auto &stage = ctx.smem.stages[stage_id];
-    constexpr bool kJoinActivation = Ctx::kUseUmmaCooperativeTma && !Ctx::kUseUmmaAsyncActivationLoads;
-    auto *weight_mbar = kJoinActivation ? &ctx.smem.load_mbar[stage_id] : &ctx.smem.umma_weight_ready[stage_id];
+    constexpr bool kJoinActivation = !Ctx::kUseUmma ||
+        (Ctx::kUseUmmaCooperativeTma && !Ctx::kUseUmmaAsyncActivationLoads);
+    const uint32_t mbar_index = kIsFirst && !kUseContinuousRing ? kNumStages : stage_id;
+    uint64_t *weight_mbar = nullptr;
+    if constexpr (kUseMBarrier) {
+      if constexpr (kJoinActivation) weight_mbar = &ctx.smem.load_mbar[mbar_index];
+      else weight_mbar = &ctx.smem.umma_weight_ready[stage_id];
+    }
     loader_b.template load<kShouldAdvance>(stage.b, weight_mbar);
     uint32_t bytes = SharedStorage::kStageLoadBytesB;
     if constexpr (kIsGroupWeightScale || kIsBlockWeightScale) {
       loader_bs.template load<kShouldAdvance, Ctx::kUseUmmaCooperativeTma ? 2 : 1>(stage.bs, weight_mbar);
       bytes += SharedStorage::kStageBytesBS;
     }
-    if constexpr (kHasZeroPoint && !kIsChannelWeightScale) {
-      loader_bzp.template load<kShouldAdvance>(stage.bzp, weight_mbar);
-      bytes += SharedStorage::kStageBytesBZP;
+    if constexpr (kHasZeroPoint && (kIsGroupWeightScale || kIsFirst)) {
+      if constexpr (kIsChannelWeightScale) {
+        loader_bzp.template load<kShouldAdvance>(ctx.smem.bzp_c, weight_mbar);
+        bytes += SharedStorage::kChannelBytesBZP;
+      } else {
+        loader_bzp.template load<kShouldAdvance>(stage.bzp, weight_mbar);
+        bytes += SharedStorage::kStageBytesBZP;
+      }
     }
-    if constexpr (Ctx::kUseUmmaCooperativeTma) {
-      if (ctx.load_thread_id() == 0 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(weight_mbar, bytes * 2);
-    } else if (ctx.load_thread_id() == 0) tma_expect_tx(weight_mbar, bytes);
+    if constexpr (kUseMBarrier && Ctx::kUseUmma) {
+      if constexpr (Ctx::kUseUmmaCooperativeTma) {
+        if (ctx.load_thread_id() == 0 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(weight_mbar, bytes * 2);
+      } else if (ctx.load_thread_id() == 0) tma_expect_tx(weight_mbar, bytes);
+    }
     // Both producer warps participate in the activation-stage arrival count.
     // B/BS completion is tracked independently by weight_mbar.
     if constexpr (Ctx::kUseUmmaSplitLoads && Ctx::kUseUmmaAsyncActivationLoads) commit_cp_async_load<true>(stage_id);
   }
 
-  template <bool kShouldAdvance = true>
+  template <bool kShouldAdvance = true, bool kIsFirst = false>
   CUDA_INLINE void load_activation_stage(uint32_t stage_id) {
+    if constexpr (kUseContinuousRing) stage_id = ring_stage;
     auto &stage = ctx.smem.stages[stage_id];
     if constexpr (Ctx::kUseUmmaAsyncActivationLoads) {
       loader_a.template load<kShouldAdvance>(stage.a, &ctx.smem.load_mbar[stage_id], stage_id);
@@ -314,7 +316,9 @@ public:
       commit_cp_async_load<true>(stage_id);
       return;
     }
-    auto *activation_mbar = &ctx.smem.load_mbar[stage_id];
+    const uint32_t mbar_index = kIsFirst && !kUseContinuousRing ? kNumStages : stage_id;
+    uint64_t *activation_mbar = nullptr;
+    if constexpr (kUseMBarrier) activation_mbar = &ctx.smem.load_mbar[mbar_index];
     loader_a.template load<kShouldAdvance>(stage.a, activation_mbar, stage_id);
     uint32_t bytes = SharedStorage::kStageBytesA;
     if constexpr (kIsGroupInputScale) {
@@ -327,9 +331,30 @@ public:
         bytes += SharedStorage::kStageTmaBytesAS;
       }
     }
-    if constexpr (Ctx::kUseUmmaCooperativeTma) {
-      if (ctx.load_thread_id() == 32 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(activation_mbar, bytes * 2);
-    } else if (ctx.load_thread_id() == 32) tma_expect_tx(activation_mbar, bytes);
+    if constexpr (kUseMBarrier && Ctx::kUseUmma) {
+      if constexpr (Ctx::kUseUmmaCooperativeTma) {
+        if (ctx.load_thread_id() == 32 && blockIdx.x % Ctx::kUmmaCtaGroupSize == 0) tma_expect_tx(activation_mbar, bytes * 2);
+      } else if (ctx.load_thread_id() == 32) tma_expect_tx(activation_mbar, bytes);
+    }
+  }
+
+  template <bool kIsFirst = false>
+  CUDA_INLINE void commit_stage(uint32_t stage_id, bool pred = true) {
+    if constexpr (kUseContinuousRing) stage_id = ring_stage;
+    const uint32_t mbar_index = kIsFirst && !kUseContinuousRing ? kNumStages : stage_id;
+    constexpr uint2 load_bytes = get_stage_load_bytes<kIsFirst>();
+    constexpr bool kHasCpAsyncMBarrier = kIsFirst ? kHasFirstStageCpAsyncMBarrier : kHasStageCpAsyncMBarrier;
+    constexpr bool kHasTmaMBarrier = kIsFirst ? kHasFirstStageTmaMBarrier : kHasStageTmaMBarrier;
+    commit_cp_async_load<kHasCpAsyncMBarrier>(mbar_index, pred);
+    uint64_t *mbar_ptr = nullptr;
+    if constexpr (kUseMBarrier) mbar_ptr = &ctx.smem.load_mbar[mbar_index];
+    if (pred) expect_tma_load<kHasTmaMBarrier>(mbar_ptr, load_bytes.x);
+    if constexpr (kUseContinuousRing) {
+      if (++ring_stage == kNumStages) {
+        ring_stage = 0;
+        ring_phase ^= 1;
+      }
+    }
   }
 
   CUDA_INLINE void load_channel() {
@@ -414,17 +439,27 @@ public:
     advance_phase(kNumStages);
   }
 
-  CUDA_INLINE void seek(
-      uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t k_block_id,
+  CUDA_INLINE void seek_activation(
+      uint32_t expert_id, uint32_t m_block_id, uint32_t k_block_id,
       uint32_t current_shape_m, uint32_t m_offset) {
     loader_a.seek(m_block_id, k_block_id, current_shape_m, m_offset);
-    loader_b.seek(expert_id, n_block_id, k_block_id);
     if constexpr (kHasInputScale && !kIsTensorInputScale) loader_as.seek(expert_id, m_block_id, k_block_id, current_shape_m, m_offset);
     if constexpr (kIsChannelInputScale2) loader_as2.seek(expert_id, m_block_id, k_block_id, current_shape_m, m_offset);
+  }
+
+  CUDA_INLINE void seek_weight(uint32_t expert_id, uint32_t n_block_id, uint32_t k_block_id) {
+    loader_b.seek(expert_id, n_block_id, k_block_id);
     loader_bs.seek(expert_id, n_block_id, k_block_id);
     loader_bs2.seek(expert_id, n_block_id);
     loader_bzp.seek(expert_id, n_block_id, k_block_id);
     loader_bias.seek(expert_id, n_block_id);
+  }
+
+  CUDA_INLINE void seek(
+      uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t k_block_id,
+      uint32_t current_shape_m, uint32_t m_offset) {
+    seek_activation(expert_id, m_block_id, k_block_id, current_shape_m, m_offset);
+    seek_weight(expert_id, n_block_id, k_block_id);
   }
 };
 
