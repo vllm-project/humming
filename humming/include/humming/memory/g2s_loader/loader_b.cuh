@@ -26,7 +26,9 @@ private:
 
   static constexpr uint32_t kWeightShapeN = Ctx::kWeightShapeN;
   static constexpr uint32_t kWeightShapeK = Ctx::kWeightShapeK;
-  static constexpr uint32_t kCoveredShapeN = CEIL_DIV(ProblemShape::N - PadShape::N, BlockShape::N) * BlockShape::N;
+  // The scheduler retains every CTA in the last N cluster, including padding-only CTAs.
+  static constexpr uint32_t kClusterShapeN = BlockShape::N * Ctx::kMultiCastSizeA * Ctx::kUmmaCtaGroupSize;
+  static constexpr uint32_t kCoveredShapeN = CEIL_DIV(ProblemShape::N - PadShape::N, kClusterShapeN) * kClusterShapeN;
   static constexpr uint32_t kCoveredShapeK = Ctx::kNumKBlocks * BlockShape::K;
   static constexpr bool kNeedsBoundsCheck = kWeightShapeN < kCoveredShapeN || kWeightShapeK < kCoveredShapeK;
   static constexpr uint32_t kWeightSmemBits = SharedStorage::kWeightSmemBits;

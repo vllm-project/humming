@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from humming import dtypes
+from humming import dtypes, ops
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
 from humming.config.mma import get_default_mma_type
 from humming.device import current_device
@@ -398,6 +398,77 @@ def test_partial_nk_tiles(shape_n, shape_k, use_tma, use_stream_k, weight_mode, 
     shape_ms = (17, 129)
     results = KernelTestRunner(case).run(shape_ms)
     assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.parametrize("shape_n", [128, 384])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize("use_tma_c", [False, True])
+@pytest.mark.parametrize(
+    "mma_type,use_tma_b",
+    [("wgmma", False), ("wgmma", True), ("umma", True)],
+)
+def test_padding_only_n_cta(shape_n, use_stream_k, use_tma_c, mma_type, use_tma_b, monkeypatch):
+    """Cover whole padding CTAs; run under memcheck to also detect invalid B reads."""
+    skip_if_unsupported(a_dtype=dtypes.bfloat16, mma_type=mma_type, use_tma=True)
+    is_umma = mma_type == "umma"
+    layer = LayerConfig(
+        shape_n=round_up(shape_n, 256),
+        pad_shape_n=128,
+        shape_k=1024,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        has_bias=True,
+    )
+    if is_umma and not layer.is_umma_supported:
+        pytest.skip("UMMA requires SM10x or SM11x")
+
+    block_k = 128 if is_umma else 64
+    tuning = dict(
+        mma_type=mma_type,
+        block_shape=(64, 128, block_k),
+        warp_shape=(64, 32, block_k),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=True,
+        use_tma_b=use_tma_b,
+        use_tma_c=use_tma_c,
+        use_warp_spec=True,
+        use_stream_k=use_stream_k,
+        multi_cast_size_a=1 if is_umma else 2,
+        umma_cta_group_size=2 if is_umma else 1,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+
+    launch_kernel = ops.launch_kernel
+
+    def launch_with_output_guard(**kwargs):
+        outputs = kwargs["outputs"]
+        # The padding CTA can write one full tile past the final output row.
+        storage = outputs.new_full((outputs.numel() + 128,), 42)
+        guarded_outputs = storage[: outputs.numel()].view_as(outputs)
+        guarded_outputs.copy_(outputs)
+        kwargs["outputs"] = guarded_outputs
+        result = launch_kernel(**kwargs)
+        guard = storage[outputs.numel() :]
+        torch.testing.assert_close(guard, torch.full_like(guard, 42), rtol=0, atol=0)
+        return result
+
+    monkeypatch.setattr(ops, "launch_kernel", launch_with_output_guard)
+    case = KernelTestCase(
+        name="padding-only-n-cta",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+    assert all(result.tuning_config.use_tma_b == use_tma_b for result in results)
+    assert all(result.tuning_config.use_tma_c == use_tma_c for result in results)
 
 
 FP8_TOKEN_MXFP4 = dict(
