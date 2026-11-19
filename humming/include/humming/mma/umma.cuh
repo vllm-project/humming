@@ -279,6 +279,12 @@ struct UMMA : WMMA<Ctx, ArithClass> {
     tcgen05_wait_ld();
   }
 
+  CUDA_INLINE static bool is_valid_k_offset(uint32_t k_block, uint32_t k_offset) {
+    constexpr uint32_t kValidK = Ctx::ProblemShape::K - Ctx::PadShape::K;
+    if constexpr (kValidK % BlockShape::K == 0) return true;
+    return k_block != Ctx::kNumKBlocks - 1 || k_offset < kValidK % BlockShape::K;
+  }
+
   // Called by one elected lane after operand readiness and proxy fencing.
   CUDA_INLINE void issue(uint32_t stage_id, uint32_t buffer, bool is_first, uint32_t k_block) {
     uint32_t base = tmem_column + ctx.math_group * kGroupColumns;
@@ -292,6 +298,7 @@ struct UMMA : WMMA<Ctx, ArithClass> {
       uint32_t k_offset = kUseDoubleK ? k * kDoubleK
                           : kUseK96   ? k / 3 * 256 + (k % 3 == 0 ? 0 : (k % 3 == 1 ? 64 : 160))
                                       : k * Ctx::kPartMmaShapeK;
+      if (!is_valid_k_offset(k_block, k_offset)) continue;
       uint32_t mma_k = kUseDoubleK ? kDoubleK : (use_k96 ? 96 : Ctx::kPartMmaShapeK);
       if constexpr (Ctx::kUseUmmaSs && kUseBlockScale) {
         // A K96 or double-K instruction can consume more than one scale word.

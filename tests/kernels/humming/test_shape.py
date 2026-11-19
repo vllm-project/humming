@@ -592,6 +592,82 @@ def test_padded_k_slabs(layer_values, tuning_values, expected_layout, monkeypatc
     assert_kernel_test_shape_coverage(results, shape_ms)
 
 
+@pytest.mark.parametrize("mma_type,k_warps", [("mma", 1), ("mma", 2), ("umma", 1)])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize("unpadded_k", [32, 96, 288, 352, 256])
+@pytest.mark.parametrize("weight_mode", ["group-zp", "fp8-channel", "fp8-input-group", "int8-fused", "mxfp4"])
+def test_mma_umma_padded_k_slabs(mma_type, k_warps, use_stream_k, unpadded_k, weight_mode, monkeypatch):
+    is_umma = mma_type == "umma"
+    if is_umma and current_device.sm_version // 10 not in (10, 11):
+        pytest.skip("UMMA requires SM10x or SM11x")
+    if is_umma and weight_mode in ("fp8-input-group", "int8-fused"):
+        pytest.skip("Software scale promotion and fused INT8 are MMA cases")
+    if not is_umma and weight_mode == "mxfp4":
+        pytest.skip("Block-scaled FP4 uses UMMA or MXMMA")
+    layer_values = dict(a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4, bs_dtype=dtypes.bfloat16)
+    if weight_mode == "group-zp":
+        layer_values.update(weight_scale_group_size=32, has_zero_point=True)
+    elif weight_mode == "int8-fused":
+        layer_values.update(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            weight_scale_group_size=32,
+            use_fused_e8m0_scale=True,
+        )
+    elif weight_mode == "mxfp4":
+        layer_values.update(
+            a_dtype=dtypes.float4e2m1,
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            input_scale_group_size=32,
+            weight_scale_group_size=32,
+        )
+    else:
+        layer_values.update(a_dtype=dtypes.float8e4m3, b_dtype=dtypes.float8e4m3)
+        if weight_mode == "fp8-input-group":
+            layer_values.update(input_scale_group_size=128)
+    skip_if_unsupported(a_dtype=layer_values["a_dtype"], mma_type=mma_type)
+    block_k = 256 if weight_mode == "mxfp4" else 128
+    padded_k = 256 if unpadded_k == 256 else round_up(unpadded_k, block_k) + block_k
+    layer = LayerConfig(
+        shape_n=256,
+        shape_k=padded_k,
+        pad_shape_k=padded_k - unpadded_k,
+        c_dtype=dtypes.bfloat16,
+        has_bias=True,
+        **layer_values,
+    )
+    if not is_umma and layer.use_block_scaled_mma:
+        pytest.skip("This device selects MXMMA for the FP8 scale layout")
+    warp_k = block_k // k_warps
+    tuning = dict(
+        mma_type=mma_type,
+        block_shape=(32, 128, block_k),
+        # Single-K-warp specialization and the split-K-warp fallback must both remain correct.
+        warp_shape=(32 if is_umma else 16, 32, warp_k),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=is_umma,
+        use_warp_spec=is_umma,
+        use_stream_k=use_stream_k,
+        umma_cta_group_size=2 if is_umma and unpadded_k in (32, 352) else 1,
+        umma_num_dequant_warpgroups=2 if is_umma and unpadded_k == 96 else 1,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+    case = KernelTestCase(
+        name="mma-umma-padded-k-slabs",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
 def test_shape_case_coverage():
     problem_configs = {case.name: case.layer_config for case in PROBLEM_SHAPE_CASES}
     minimum = problem_configs["minimum"]

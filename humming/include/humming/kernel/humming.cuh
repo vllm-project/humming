@@ -101,7 +101,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
     uint32_t &slice_iters = scheduler.slice_iters;
     constexpr bool kSkipPaddedK = [] {
-      if constexpr (Ctx::kUseWgmma) return MMA::should_skip_padded_k();
+      if constexpr (Ctx::kUseWgmma || Ctx::kUseWmma) return MMA::should_skip_padded_k();
       else return false;
     }();
     constexpr uint32_t kValidK = ProblemShape::K - PadShape::K;
@@ -138,7 +138,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     auto consume_stage = [&](uint32_t stage_id, uint32_t slice_iter, auto is_partial_k_block) {
       constexpr bool kInPartialKBlock = decltype(is_partial_k_block)::value != 0;
       auto run_mma = [&](uint32_t warp_iter_id) {
-        if constexpr (Ctx::kUseWgmma) mma.template run<kInPartialKBlock>(stage_id, warp_iter_id);
+        if constexpr (Ctx::kUseWgmma || Ctx::kUseWmma) mma.template run<kInPartialKBlock>(stage_id, warp_iter_id);
         else mma.run(stage_id, warp_iter_id);
       };
       debug_kernel_timeout_check(debug_start_clock);

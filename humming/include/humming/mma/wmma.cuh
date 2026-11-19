@@ -23,6 +23,7 @@ public:
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
   static constexpr uint32_t kNumWarpShapeNSplits = WarpShape::N == ElementA::kBits * 2 ? 2 : 1;
+  static constexpr uint32_t kLastKBlockValidK = (Ctx::ProblemShape::K - Ctx::PadShape::K - 1) % Ctx::BlockShape::K + 1;
 
   Ctx &ctx;
   ArithClass &arith;
@@ -78,11 +79,15 @@ public:
     }
   };
 
-  CUDA_INLINE
-  void run(uint32_t stage_id, uint32_t iter_id) {
+  template <bool kInPartialKBlock = false>
+  CUDA_INLINE void run(uint32_t stage_id, uint32_t iter_id) {
     uint32_t buffer_id = iter_id % 2;
     PRAGMA_UNROLL
     for (uint32_t k = 0; k < kPartMmaShapeK / MmaShape::K; k++) {
+      if constexpr (kInPartialKBlock) {
+        uint32_t k_offset = ctx.k_warp_offset() + iter_id * kPartMmaShapeK + k * MmaShape::K;
+        if (k_offset >= kLastKBlockValidK) continue;
+      }
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < WarpShape::N / MmaShape::N; j++) {
         PRAGMA_UNROLL
@@ -172,5 +177,11 @@ public:
     }
 
     return index;
+  }
+
+  static constexpr bool should_skip_padded_k() {
+    // Promotion must still reach the scale group's final MMA and reset its partial sum.
+    // Restrict specialization to one K warp: split-K warps need runtime predicates and can regress.
+    return !USE_PPU && Ctx::PadShape::K > 0 && Ctx::K_WARPS == 1 && final_regs_c_index() == 0 && !Ctx::kUseStreamK && !Ctx::kUseWarpSpec;
   }
 };
