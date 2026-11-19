@@ -182,6 +182,6 @@ public:
   static constexpr bool should_skip_padded_k() {
     // Promotion must still reach the scale group's final MMA and reset its partial sum.
     // Restrict specialization to one K warp: split-K warps need runtime predicates and can regress.
-    return !USE_PPU && Ctx::PadShape::K > 0 && Ctx::K_WARPS == 1 && final_regs_c_index() == 0 && !Ctx::kUseStreamK && !Ctx::kUseWarpSpec;
+    return Ctx::PadShape::K > 0 && Ctx::K_WARPS == 1 && final_regs_c_index() == 0 && !Ctx::kUseStreamK && !Ctx::kUseWarpSpec;
   }
 };

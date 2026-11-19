@@ -668,6 +668,53 @@ def test_mma_umma_padded_k_slabs(mma_type, k_warps, use_stream_k, unpadded_k, we
     assert_kernel_test_shape_coverage(results, shape_ms)
 
 
+@pytest.mark.skipif(not current_device.is_ppu, reason="Requires PPU AIU loads")
+@pytest.mark.parametrize("shape_n,shape_k", [(72, 96), (192, 192), (128, 128), (72, 128), (128, 96)])
+@pytest.mark.parametrize("use_raw_weight", [False, True])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize("gemm_type", list(GemmType))
+def test_ppu_padding(shape_n, shape_k, use_raw_weight, use_stream_k, gemm_type, monkeypatch):
+    padded_n = round_up(shape_n, 128)
+    padded_k = round_up(shape_k, 128)
+    layer = LayerConfig(
+        shape_n=padded_n,
+        shape_k=padded_k,
+        pad_shape_n=padded_n - shape_n,
+        pad_shape_k=padded_k - shape_k,
+        num_experts=0 if gemm_type == GemmType.DENSE else 4,
+        a_dtype=dtypes.int8 if use_raw_weight else dtypes.bfloat16,
+        b_dtype=dtypes.int8 if use_raw_weight else dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        has_bias=True,
+    )
+    assert layer.use_raw_weight == use_raw_weight
+    tuning = dict(
+        mma_type="mma",
+        block_shape=(16, 128, 128),
+        warp_shape=(16, 32, 64 if use_stream_k else 128),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=False,
+        use_warp_spec=False,
+        use_stream_k=use_stream_k,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+    case = KernelTestCase(
+        name="ppu-padding",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=gemm_type),
+        top_k=1 if gemm_type == GemmType.DENSE else 2,
+        seed=2026,
+        atol=0.2,
+    )
+    shape_ms = (1, 17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
 def test_shape_case_coverage():
     problem_configs = {case.name: case.layer_config for case in PROBLEM_SHAPE_CASES}
     minimum = problem_configs["minimum"]

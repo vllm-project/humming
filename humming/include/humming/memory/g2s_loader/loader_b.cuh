@@ -39,12 +39,14 @@ private:
   static constexpr uint32_t kGmemStride = kWeightShapeN * kPackSizeK * ElementQB::kBits / 32 / 4;
   static constexpr uint32_t kGmemExpertStride = kWeightShapeN * kWeightShapeK * ElementQB::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::K / kPackSizeK;
-  static constexpr bool kUsePackedBounds = kUseCpAsync && !kUseTma && !USE_PPU && kNeedsBoundsCheck &&
-                                           !Ctx::kUseRawWeight && !Ctx::kUseFlatWeight && kNumLoadThreads % kSmemStride == 0;
+  static constexpr bool kCanPrecomputeBounds = kUseCpAsync && !kUseTma && !kUseAiu && kNeedsBoundsCheck;
+  static constexpr bool kUsePackedBounds = kCanPrecomputeBounds && !Ctx::kUseRawWeight && !Ctx::kUseFlatWeight && kNumLoadThreads % kSmemStride == 0;
+
   static constexpr uint32_t kFlatChunkRows = MIN(64u, BlockShape::N);
   static constexpr uint32_t kFlatTileInt4s = kFlatChunkRows * BlockShape::K * ElementQB::kBits / 128;
-  static constexpr bool kUseFlatBounds = kUseCpAsync && !kUseTma && !USE_PPU && kNeedsBoundsCheck && Ctx::kUseFlatWeight &&
-                                         kNumLoadThreads % kFlatChunkRows == 0 && kFlatTileInt4s % kNumLoadThreads == 0;
+  // Each load iteration covers whole columns, and each chunk takes a whole number of iterations.
+  static constexpr bool kHasAlignedFlatLoads = kNumLoadThreads % kFlatChunkRows == 0 && kFlatTileInt4s % kNumLoadThreads == 0;
+  static constexpr bool kUsePrecomputedFlatBounds = kCanPrecomputeBounds && Ctx::kUseFlatWeight && kHasAlignedFlatLoads;
 
 public:
   Ctx &ctx;
@@ -76,7 +78,7 @@ public:
   CUDA_INLINE void load(int4 *smem_ptr, void *mbar_ptr) {
     if constexpr (Ctx::kUseFlatWeight && !kUseTma) load_flat(smem_ptr);
     else if constexpr (Ctx::kUseRawWeight && !kUseTma) load_raw(smem_ptr);
-    else if constexpr (kUseAiu && !kNeedsBoundsCheck) load_aiu(smem_ptr);
+    else if constexpr (kUseAiu) load_aiu(smem_ptr);
     else if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
     else load_legacy(smem_ptr);
     if constexpr (kShouldAdvance) advance();
@@ -154,7 +156,7 @@ public:
 
   CUDA_INLINE
   void load_raw(int4 *smem_ptr) {
-    if constexpr (kUseAiu && !kNeedsBoundsCheck) return load_raw_aiu(smem_ptr);
+    if constexpr (kUseAiu) return load_raw_aiu(smem_ptr);
     static_assert(ElementA::kBits == ElementQB::kBits);
     constexpr uint32_t kRowInt4s = BlockShape::K * ElementQB::kBits / 128;
     constexpr uint32_t kGlobalRowInt4s = kWeightShapeK * ElementQB::kBits / 128;
@@ -202,7 +204,7 @@ public:
       if constexpr (kNeedsBoundsCheck) {
         bool valid_n;
         bool valid_k;
-        if constexpr (kUseFlatBounds) {
+        if constexpr (kUsePrecomputedFlatBounds) {
           constexpr uint32_t kChunkIters = kFlatTileInt4s / kNumLoadThreads;
           valid_n = kWeightShapeN >= kCoveredShapeN || int32_t(i / kChunkIters * (64 / kFlatChunkRows)) < remaining_n_chunks;
           valid_k = kWeightShapeK >= kCoveredShapeK || int32_t(i % kChunkIters * (kNumLoadThreads / kFlatChunkRows)) < remaining_k_chunks;
@@ -228,12 +230,14 @@ public:
   CUDA_INLINE
   void load_raw_aiu(int4 *smem_ptr) {
     const uint32_t warp_id = ctx.load_thread_id() / 32;
+    uint64_t expert_offset = uint64_t(expert_index) * kWeightShapeN * kWeightShapeK * ElementQB::kBits / 128;
+    // AIU pads at descriptor boundaries, so each expert needs its own base and dimensions.
     PRAGMA_UNROLL
     for (uint32_t slab = warp_id; slab < CEIL_DIV(BlockShape::K, kSwizzleK); slab += kNumLoadThreads / 32) {
       aiu_load_gmem<ElementQB::kBits>(
-          gmem_ptr_raw, smem_ptr + slab * BlockShape::N * kSwizzleBytes / sizeof(int4),
-          kWeightShapeN * MAX(1u, Ctx::kNumExperts), kWeightShapeK,
-          expert_index * kWeightShapeN + col_offset, row_offset + slab * kSwizzleK,
+          gmem_ptr_raw + expert_offset, smem_ptr + slab * BlockShape::N * kSwizzleBytes / sizeof(int4),
+          kWeightShapeN, kWeightShapeK,
+          col_offset, row_offset + slab * kSwizzleK,
           BlockShape::N, kSwizzleK);
     }
   }
@@ -274,14 +278,14 @@ public:
   CUDA_INLINE
   void advance() {
     if constexpr (kUsePackedBounds) remaining_k_rows -= int32_t(BlockShape::K / kPackSizeK);
-    if constexpr (kUseFlatBounds) remaining_k_chunks -= int32_t(BlockShape::K * ElementQB::kBits / 128);
+    if constexpr (kUsePrecomputedFlatBounds) remaining_k_chunks -= int32_t(BlockShape::K * ElementQB::kBits / 128);
     if constexpr (Ctx::kUseRawWeight || Ctx::kUseFlatWeight) {
       row_offset += BlockShape::K;
       if constexpr (!kUseTma) gmem_ptr += BlockShape::K * ElementQB::kBits / 128 * (Ctx::kUseFlatWeight ? kWeightShapeN : 1);
       return;
     }
     row_offset += BlockShape::K / kPackSizeK;
-    if constexpr (!kUseAiu || kNeedsBoundsCheck) gmem_ptr += kGmemStride * BlockShape::K / kPackSizeK;
+    if constexpr (!kUseAiu) gmem_ptr += kGmemStride * BlockShape::K / kPackSizeK;
   }
 
   CUDA_INLINE
@@ -290,7 +294,7 @@ public:
     if constexpr (Ctx::kUseRawWeight || Ctx::kUseFlatWeight) {
       row_offset = k_block_id * BlockShape::K;
       col_offset = n_block_id * BlockShape::N;
-      if constexpr (kUseFlatBounds) {
+      if constexpr (kUsePrecomputedFlatBounds) {
         remaining_n_chunks = int32_t(kWeightShapeN / kFlatChunkRows) - int32_t(col_offset / kFlatChunkRows);
         uint32_t thread_column = ctx.load_thread_id() / kFlatChunkRows;
         remaining_k_chunks = int32_t(kWeightShapeK * ElementQB::kBits / 128) - int32_t(row_offset * ElementQB::kBits / 128 + thread_column);
@@ -316,7 +320,7 @@ public:
     }
 
     uint64_t gmem_offset = expert_id * kGmemExpertStride;
-    if constexpr (!kUseAiu || kNeedsBoundsCheck) gmem_offset += n_block_id * kSmemStride + k_block_id * (kGmemStride * BlockShape::K / kPackSizeK);
+    if constexpr (!kUseAiu) gmem_offset += n_block_id * kSmemStride + k_block_id * (kGmemStride * BlockShape::K / kPackSizeK);
     gmem_ptr = gmem_ptr_raw + gmem_offset;
   }
 };

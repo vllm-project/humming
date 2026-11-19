@@ -158,7 +158,7 @@ public:
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
       bool pred0;
-      if constexpr (kUseCpAsync && !USE_PPU) pred0 = int32_t(gmem_col) < remaining_k_vectors;
+      if constexpr (kUseCpAsync) pred0 = int32_t(gmem_col) < remaining_k_vectors;
       else pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
@@ -193,7 +193,7 @@ public:
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
       bool pred0;
-      if constexpr (kUseCpAsync && !USE_PPU) pred0 = int32_t(gmem_col) < remaining_k_vectors;
+      if constexpr (kUseCpAsync) pred0 = int32_t(gmem_col) < remaining_k_vectors;
       else pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
@@ -210,7 +210,7 @@ public:
   void advance() {
     col_offset += BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8);
     gmem_ptr += kSmemStride;
-    if constexpr (kUseCpAsync && !kUseTma && !USE_PPU) remaining_k_vectors -= int32_t(kSmemStride);
+    if constexpr (kUseCpAsync && !kUseTma) remaining_k_vectors -= int32_t(kSmemStride);
   }
 
   CUDA_INLINE
@@ -223,7 +223,7 @@ public:
     }
     if constexpr (Ctx::kUmmaCtaGroupSize == 2) row_offset += (blockIdx.x % 2) * (BlockShape::M / 2);
     col_offset = k_block_id * (BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8));
-    if constexpr (kUseCpAsync && !kUseTma && !USE_PPU) remaining_k_vectors = int32_t(kGmemStride) - int32_t(k_block_id * kSmemStride);
+    if constexpr (kUseCpAsync && !kUseTma) remaining_k_vectors = int32_t(kGmemStride) - int32_t(k_block_id * kSmemStride);
     block_shape_m = row_offset < shape_m ? MIN(shape_m - row_offset, kLoadRows) : 0;
 
     uint32_t gmem_offset = k_block_id * kSmemStride;
