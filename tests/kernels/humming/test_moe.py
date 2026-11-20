@@ -91,6 +91,13 @@ MOE_CASES = (
         weight_scale_group_size=64,
         has_zero_point=True,
     ),
+    _case(
+        "indexed-w4a8-channel-zp",
+        GemmType.INDEXED,
+        a_dtype=dtypes.int8,
+        b_dtype=dtypes.uint4,
+        has_zero_point=True,
+    ),
     _case("grouped-masked-fp6", GemmType.GROUPED_MASKED, b_dtype=dtypes.float6e3m2),
     _case("grouped-contiguous-fp8", GemmType.GROUPED_CONTIGUOUS, b_dtype=dtypes.float8e3m4),
     _case(
