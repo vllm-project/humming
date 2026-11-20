@@ -257,8 +257,11 @@ inline void check_tensor_locks(std::optional<Tensor> &tensor, KernelData &kernel
   ASSERT_CHECK(tensor.has_value(), "locks must not be none if use_stream_k");
   check_tensor_common(tensor.value(), "locks", dev, ScalarType::Int);
   const uint32_t cluster_size = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b * kernel_data.umma_cta_group_size;
+  ASSERT_CHECK(cluster_size > 0, "cluster_size must be positive");
   const uint32_t num_cta_groups = num_ctas / cluster_size;
-  const uint64_t max_stream_k_tiles = uint64_t(num_cta_groups + num_cta_groups / 10) * cluster_size;
+  // Wave merging in scheduler.cuh adds at most one full wave (num_cta_groups - 1 + num_cta_groups).
+  const uint64_t max_stream_k_cta_groups = num_cta_groups > 0 ? uint64_t(num_cta_groups) * 2 - 1 : 0;
+  const uint64_t max_stream_k_tiles = max_stream_k_cta_groups * cluster_size;
   const uint64_t required_locks = max_stream_k_tiles * kernel_data.num_stream_k_locks_per_tile;
   ASSERT_CHECK(uint64_t(tensor->numel()) >= required_locks, "locks requires at least ", required_locks, " int32 elements, got ", tensor->numel());
 };
