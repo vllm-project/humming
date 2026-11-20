@@ -1410,7 +1410,13 @@ def get_packed_wna8_config(
         resident_ctas = config["num_ctas_per_sm"]
         m_tiles = ((expert_rows + block_m - 1) // block_m).sum(axis=1)
         tiles = m_tiles * (layer_config.shape_n // block_n)
-        waves = np.ceil(tiles / (num_sms * resident_ctas))
+        raw_waves = tiles / (num_sms * resident_ctas)
+        # Stream-K splits sub-wave grids along K; rounding them up to one full
+        # wave makes narrower-N larger-M tiles look cheaper than wider-N small-M tiles.
+        if config["use_stream_k"]:
+            waves = np.where(raw_waves < 1, raw_waves, np.ceil(raw_waves))
+        else:
+            waves = np.ceil(raw_waves)
         return float(waves.mean() * resident_ctas * (block_m + 32) * block_n / 128)
 
     for block_m in range(8, max_block_m + 1, 8):
