@@ -135,7 +135,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     s2r_pipe.template load_stage_iter<true>(0, 0);
     mma.transform_b(0, 0);
 
-    auto consume_stage = [&](uint32_t stage_id, uint32_t slice_iter, auto is_partial_k_block) {
+    auto consume_stage = [&](uint32_t stage_id, uint32_t slice_iter, auto is_partial_k_block, auto is_steady) {
+      constexpr bool kSteady = decltype(is_steady)::value != 0;
       constexpr bool kInPartialKBlock = decltype(is_partial_k_block)::value != 0;
       auto run_mma = [&](uint32_t warp_iter_id) {
         if constexpr (Ctx::kUseWgmma) mma.template run<kInPartialKBlock>(stage_id, warp_iter_id);
@@ -143,7 +144,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       };
       debug_kernel_timeout_check(debug_start_clock);
       const uint32_t remaining_iters = num_slice_iters - slice_iter;
-      if (remaining_iters == 1) producer.load_channel();
+      if constexpr (!kSteady) {
+        if (remaining_iters == 1) producer.load_channel();
+      }
       PRAGMA_UNROLL
       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
         if constexpr (Ctx::kWgmmaSplitIssueWait) {
@@ -152,9 +155,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             // Refill a different stage; the current WGMMA stage stays live until wait.
             __syncthreads();
             if constexpr (kNumStages > 2)
-              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+              producer.load_stage(stage_id + kNumStages - 1, kSteady || remaining_iters >= kNumStages);
           }
-          if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1)
+          if (warp_iter_id == Ctx::kWarpIters - 1 && (kSteady || remaining_iters > 1))
             consumer.wait_stage((stage_id + 1) % kNumStages);
           const bool use_late_scale_prefetch = Ctx::kUseWgmmaLateScalePrefetch && warp_iter_id == Ctx::kWarpIters - 1;
           if (use_late_scale_prefetch)
@@ -168,17 +171,17 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
             __syncthreads();
             if constexpr (kNumStages > 2)
-              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+              producer.load_stage(stage_id + kNumStages - 1, kSteady || remaining_iters >= kNumStages);
           }
         } else {
           if constexpr (Ctx::kWarpIters == 1) {
             run_mma(warp_iter_id);
             __syncthreads();
             if constexpr (kNumStages > 2) {
-              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+              producer.load_stage(stage_id + kNumStages - 1, kSteady || remaining_iters >= kNumStages);
             }
           }
-          if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1) {
+          if (warp_iter_id == Ctx::kWarpIters - 1 && (kSteady || remaining_iters > 1)) {
             consumer.wait_stage((stage_id + 1) % kNumStages);
           }
           constexpr bool kDeferScalePrefetch = Ctx::kUseWgmma && ElementA::kBits < 16 &&
@@ -194,7 +197,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
             __syncthreads();
             if constexpr (kNumStages > 2) {
-              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+              producer.load_stage(stage_id + kNumStages - 1, kSteady || remaining_iters >= kNumStages);
             }
           }
         }
@@ -203,24 +206,39 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             (warp_iter_id + 1) % Ctx::kWarpIters);
       }
       if constexpr (kNumStages == 2) {
-        producer.load_stage(stage_id, remaining_iters > kNumStages);
+        producer.load_stage(stage_id, kSteady || remaining_iters > kNumStages);
       }
     };
 
     const uint32_t num_full_stage_cycles = num_loop_iters / kNumStages;
-    for (uint32_t cycle_id = 0; cycle_id < num_full_stage_cycles; cycle_id++) {
-      unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
-        consume_stage(stage_id, cycle_id * kNumStages + stage_id, CompileTimeConstant<0>{});
-      });
+    if constexpr (Ctx::kUseStreamK) {
+      // Only Stream-K has a runtime slice length; leave static K loops unchanged.
+      const uint32_t num_steady_cycles = num_full_stage_cycles > 0 ? num_full_stage_cycles - 1 : 0;
+      for (uint32_t cycle_id = 0; cycle_id < num_steady_cycles; cycle_id++) {
+        unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
+          consume_stage(stage_id, cycle_id * kNumStages + stage_id, CompileTimeConstant<0>{}, CompileTimeConstant<1>{});
+        });
+      }
+      for (uint32_t cycle_id = num_steady_cycles; cycle_id < num_full_stage_cycles; cycle_id++) {
+        unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
+          consume_stage(stage_id, cycle_id * kNumStages + stage_id, CompileTimeConstant<0>{}, CompileTimeConstant<0>{});
+        });
+      }
+    } else {
+      for (uint32_t cycle_id = 0; cycle_id < num_full_stage_cycles; cycle_id++) {
+        unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
+          consume_stage(stage_id, cycle_id * kNumStages + stage_id, CompileTimeConstant<0>{}, CompileTimeConstant<0>{});
+        });
+      }
     }
     const uint32_t tail_stage_iters = num_loop_iters % kNumStages;
     unroll_for<0, kNumStages, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
       if (stage_id < tail_stage_iters) {
-        consume_stage(stage_id, num_full_stage_cycles * kNumStages + stage_id, CompileTimeConstant<0>{});
+        consume_stage(stage_id, num_full_stage_cycles * kNumStages + stage_id, CompileTimeConstant<0>{}, CompileTimeConstant<0>{});
       }
     });
     if constexpr (kHasPartialKBlock) {
-      consume_stage((kStaticSliceIters - 1) % kNumStages, kStaticSliceIters - 1, CompileTimeConstant<1>{});
+      consume_stage((kStaticSliceIters - 1) % kNumStages, kStaticSliceIters - 1, CompileTimeConstant<1>{}, CompileTimeConstant<0>{});
     }
 
     consumer.wait_channel();
