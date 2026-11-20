@@ -116,7 +116,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         producer.load_stage(stage_id, stage_id < slice_iters);
       });
 
-      constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
+      constexpr uint32_t kStaticSliceIters = Ctx::kNumKBlocks;
       const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
       auto produce_stage = [&](uint32_t stage_id, uint32_t slice_iter) {
         debug_kernel_timeout_check(debug_start_clock);
@@ -173,7 +173,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       s2r_pipe.load_stage_iter<true>(consumer.get_stage_id(0), 0);
       mma.transform_b(0, 0);
 
-      constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
+      constexpr uint32_t kStaticSliceIters = Ctx::kNumKBlocks;
       const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
       auto consume_stage = [&](uint32_t logical_stage_id, uint32_t slice_iter) {
         const uint32_t stage_id = consumer.get_stage_id(logical_stage_id);

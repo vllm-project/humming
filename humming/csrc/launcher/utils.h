@@ -131,6 +131,8 @@ struct KernelData {
   uint32_t bs_dtype_id;
   uint32_t problem_shape_n;
   uint32_t problem_shape_k;
+  uint32_t weight_shape_n;
+  uint32_t weight_shape_k;
   uint32_t block_shape_m;
   uint32_t block_shape_n;
   uint32_t block_shape_k;

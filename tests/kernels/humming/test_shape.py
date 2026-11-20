@@ -1,15 +1,18 @@
 import pytest
+import torch
 
-from humming import dtypes
+from humming import dtypes, ops
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
 from humming.config.mma import get_default_mma_type
 from humming.device import current_device
+from humming.layer import HummingLayer
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
     assert_kernel_test_shape_coverage,
     skip_if_unsupported,
 )
+from humming.utils.math import round_up
 
 MIN_SHAPE_N = 64
 MIN_SHAPE_K = 32
@@ -262,6 +265,212 @@ def test_shape(test_case):
     assert_kernel_test_shape_coverage(results)
 
 
+def test_layer_preserves_explicit_padding_with_compact_weights():
+    torch.manual_seed(2026)
+    layer = HummingLayer(
+        shape_n=72,
+        shape_k=96,
+        weight_config={"quant_method": "humming", "dtype": "uint4"},
+        pad_n_to_multiple=256,
+        pad_k_to_multiple=128,
+        torch_dtype=torch.bfloat16,
+    ).cuda()
+    layer.load_from_unquantized(torch.randn(72, 96, device="cuda", dtype=torch.bfloat16))
+    reference_weight = layer.weight_schema.dequant_tensors(dict(layer.state_dict())).float()
+    layer.transform()
+    assert layer.humming_config.shape_n == 256
+    assert layer.humming_config.shape_k == 128
+    assert layer.humming_config.pad_shape_n == 184
+    assert layer.humming_config.pad_shape_k == 32
+    assert layer.humming_config.weight_shape_n == 128
+    assert layer.humming_config.weight_shape_k == 96
+    for shape_m in (1, 17, 129):
+        inputs = torch.randn(shape_m, 96, device="cuda", dtype=torch.bfloat16)
+        expected = inputs.float() @ reference_weight.T
+        outputs = layer(inputs)
+        assert outputs.shape == (shape_m, 72)
+        torch.testing.assert_close(outputs.float(), expected, rtol=0.02, atol=0.05)
+
+
+@pytest.mark.parametrize("shape_n,shape_k", [(72, 96), (96, 96), (192, 192), (320, 1088)])
+@pytest.mark.parametrize("use_tma", [False, True])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize(
+    "weight_mode",
+    [
+        "channel",
+        "tensor",
+        "group-zp",
+        "group-zp-a8",
+        "secondary",
+        "raw",
+        "input-group",
+        "block",
+        "mx",
+        "mx-wide",
+        "fused",
+    ],
+)
+def test_partial_nk_tiles(shape_n, shape_k, use_tma, use_stream_k, weight_mode, monkeypatch):
+    layer_values = dict(a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4, bs_dtype=dtypes.bfloat16)
+    if weight_mode in ("group-zp", "group-zp-a8") and shape_n % 32:
+        pytest.skip("packed source zero points require N aligned to 32")
+    if weight_mode == "tensor":
+        layer_values.update(weight_scale_type="tensor", bs_dtype=dtypes.float32)
+    elif weight_mode == "group-zp":
+        layer_values.update(weight_scale_group_size=32, has_zero_point=True)
+    elif weight_mode == "group-zp-a8":
+        layer_values.update(
+            a_dtype=dtypes.float8e4m3,
+            b_dtype=dtypes.uint3,
+            weight_scale_group_size=32,
+            has_zero_point=True,
+        )
+    elif weight_mode == "secondary":
+        layer_values.update(weight_scale_group_size=32, weight_scale_2_type="channel", has_bias=True)
+    elif weight_mode == "raw":
+        layer_values.update(a_dtype=dtypes.float8e4m3, b_dtype=dtypes.float8e4m3)
+    elif weight_mode == "input-group":
+        layer_values.update(a_dtype=dtypes.float8e4m3, b_dtype=dtypes.float8e4m3, input_scale_group_size=128)
+    elif weight_mode == "block":
+        if shape_n % 64 or shape_k % 64:
+            pytest.skip("block quantization requires complete source groups")
+        layer_values.update(weight_scale_group_size=64, weight_scale_group_size_n=64, bs_dtype=dtypes.float32)
+    elif weight_mode in ("mx", "mx-wide"):
+        layer_values.update(
+            a_dtype=dtypes.float4e2m1,
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            input_scale_group_size=32,
+            weight_scale_group_size=32,
+        )
+    elif weight_mode == "fused":
+        layer_values.update(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            weight_scale_group_size=32,
+            use_fused_e8m0_scale=True,
+        )
+    group_size = layer_values.get("weight_scale_group_size", 0)
+    if group_size and shape_k % group_size:
+        pytest.skip("weight quantization requires complete source groups")
+    padded_n = round_up(shape_n, 512 if weight_mode == "mx-wide" else 128)
+    padded_k = round_up(shape_k, 128)
+    layer = LayerConfig(
+        shape_n=padded_n,
+        shape_k=padded_k,
+        pad_shape_n=padded_n - shape_n,
+        pad_shape_k=padded_k - shape_k,
+        c_dtype=dtypes.bfloat16,
+        **layer_values,
+    )
+    mma_type = get_default_mma_type(layer)
+    skip_if_unsupported(a_dtype=layer.a_dtype, mma_type=mma_type.value, use_tma=use_tma)
+    if mma_type == MmaType.UMMA and not use_tma:
+        pytest.skip("UMMA requires TMA weight loading")
+    if mma_type == MmaType.UMMA:
+        block_shape = (32, 128, 128)
+        warp_shape = (32, 32, 128)
+    else:
+        block_shape = (16, 128, 128)
+        warp_shape = (16, 32, 512 // layer.a_dtype.num_bits)
+    if weight_mode == "mx-wide":
+        block_shape = (block_shape[0], 512, block_shape[2])
+    tuning = dict(
+        block_shape=block_shape,
+        warp_shape=warp_shape,
+        num_stages=2 if weight_mode == "mx-wide" else 3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=use_tma,
+        use_stream_k=use_stream_k,
+        use_warp_spec=False,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+    case = KernelTestCase(
+        name=f"partial-nk-{weight_mode}",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.parametrize("shape_n", [128, 384])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize("use_tma_c", [False, True])
+@pytest.mark.parametrize(
+    "mma_type,use_tma_b",
+    [("wgmma", False), ("wgmma", True), ("umma", True)],
+)
+def test_padding_only_n_cta(shape_n, use_stream_k, use_tma_c, mma_type, use_tma_b, monkeypatch):
+    """Cover whole padding CTAs; run under memcheck to also detect invalid B reads."""
+    skip_if_unsupported(a_dtype=dtypes.bfloat16, mma_type=mma_type, use_tma=True)
+    is_umma = mma_type == "umma"
+    layer = LayerConfig(
+        shape_n=round_up(shape_n, 256),
+        pad_shape_n=128,
+        shape_k=1024,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        has_bias=True,
+    )
+    if is_umma and not layer.is_umma_supported:
+        pytest.skip("UMMA requires SM10x or SM11x")
+
+    block_k = 128 if is_umma else 64
+    tuning = dict(
+        mma_type=mma_type,
+        block_shape=(64, 128, block_k),
+        warp_shape=(64, 32, block_k),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=True,
+        use_tma_b=use_tma_b,
+        use_tma_c=use_tma_c,
+        use_warp_spec=True,
+        use_stream_k=use_stream_k,
+        multi_cast_size_a=1 if is_umma else 2,
+        umma_cta_group_size=2 if is_umma else 1,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+
+    launch_kernel = ops.launch_kernel
+
+    def launch_with_output_guard(**kwargs):
+        outputs = kwargs["outputs"]
+        # The padding CTA can write one full tile past the final output row.
+        storage = outputs.new_full((outputs.numel() + 128,), 42)
+        guarded_outputs = storage[: outputs.numel()].view_as(outputs)
+        guarded_outputs.copy_(outputs)
+        kwargs["outputs"] = guarded_outputs
+        result = launch_kernel(**kwargs)
+        guard = storage[outputs.numel() :]
+        torch.testing.assert_close(guard, torch.full_like(guard, 42), rtol=0, atol=0)
+        return result
+
+    monkeypatch.setattr(ops, "launch_kernel", launch_with_output_guard)
+    case = KernelTestCase(
+        name="padding-only-n-cta",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+    assert all(result.tuning_config.use_tma_b == use_tma_b for result in results)
+    assert all(result.tuning_config.use_tma_c == use_tma_c for result in results)
+
+
 FP8_TOKEN_MXFP4 = dict(
     a_dtype=dtypes.float8e4m3,
     b_dtype=dtypes.float4e2m1,
@@ -379,6 +588,129 @@ def test_padded_k_slabs(layer_values, tuning_values, expected_layout, monkeypatc
     )
     # On 6 SMs, M=17 makes stream-K split K mid-tile; M=129 runs full data-parallel waves.
     shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.parametrize("mma_type,k_warps", [("mma", 1), ("mma", 2), ("umma", 1)])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize("unpadded_k", [32, 96, 288, 352, 256])
+@pytest.mark.parametrize("weight_mode", ["group-zp", "fp8-channel", "fp8-input-group", "int8-fused", "mxfp4"])
+def test_mma_umma_padded_k_slabs(mma_type, k_warps, use_stream_k, unpadded_k, weight_mode, monkeypatch):
+    is_umma = mma_type == "umma"
+    if is_umma and current_device.sm_version // 10 not in (10, 11):
+        pytest.skip("UMMA requires SM10x or SM11x")
+    if is_umma and weight_mode in ("fp8-input-group", "int8-fused"):
+        pytest.skip("Software scale promotion and fused INT8 are MMA cases")
+    if not is_umma and weight_mode == "mxfp4":
+        pytest.skip("Block-scaled FP4 uses UMMA or MXMMA")
+    layer_values = dict(a_dtype=dtypes.bfloat16, b_dtype=dtypes.uint4, bs_dtype=dtypes.bfloat16)
+    if weight_mode == "group-zp":
+        layer_values.update(weight_scale_group_size=32, has_zero_point=True)
+    elif weight_mode == "int8-fused":
+        layer_values.update(
+            a_dtype=dtypes.int8,
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            weight_scale_group_size=32,
+            use_fused_e8m0_scale=True,
+        )
+    elif weight_mode == "mxfp4":
+        layer_values.update(
+            a_dtype=dtypes.float4e2m1,
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e8m0,
+            input_scale_group_size=32,
+            weight_scale_group_size=32,
+        )
+    else:
+        layer_values.update(a_dtype=dtypes.float8e4m3, b_dtype=dtypes.float8e4m3)
+        if weight_mode == "fp8-input-group":
+            layer_values.update(input_scale_group_size=128)
+    skip_if_unsupported(a_dtype=layer_values["a_dtype"], mma_type=mma_type)
+    block_k = 256 if weight_mode == "mxfp4" else 128
+    padded_k = 256 if unpadded_k == 256 else round_up(unpadded_k, block_k) + block_k
+    layer = LayerConfig(
+        shape_n=256,
+        shape_k=padded_k,
+        pad_shape_k=padded_k - unpadded_k,
+        c_dtype=dtypes.bfloat16,
+        has_bias=True,
+        **layer_values,
+    )
+    if not is_umma and layer.use_block_scaled_mma:
+        pytest.skip("This device selects MXMMA for the FP8 scale layout")
+    warp_k = block_k // k_warps
+    tuning = dict(
+        mma_type=mma_type,
+        block_shape=(32, 128, block_k),
+        # Single-K-warp specialization and the split-K-warp fallback must both remain correct.
+        warp_shape=(32 if is_umma else 16, 32, warp_k),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=is_umma,
+        use_warp_spec=is_umma,
+        use_stream_k=use_stream_k,
+        umma_cta_group_size=2 if is_umma and unpadded_k in (32, 352) else 1,
+        umma_num_dequant_warpgroups=2 if is_umma and unpadded_k == 96 else 1,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+    case = KernelTestCase(
+        name="mma-umma-padded-k-slabs",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shape_ms = (17, 129)
+    results = KernelTestRunner(case).run(shape_ms)
+    assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.skipif(not current_device.is_ppu, reason="Requires PPU AIU loads")
+@pytest.mark.parametrize("shape_n,shape_k", [(72, 96), (192, 192), (128, 128), (72, 128), (128, 96)])
+@pytest.mark.parametrize("use_raw_weight", [False, True])
+@pytest.mark.parametrize("use_stream_k", [False, True])
+@pytest.mark.parametrize("gemm_type", list(GemmType))
+def test_ppu_padding(shape_n, shape_k, use_raw_weight, use_stream_k, gemm_type, monkeypatch):
+    padded_n = round_up(shape_n, 128)
+    padded_k = round_up(shape_k, 128)
+    layer = LayerConfig(
+        shape_n=padded_n,
+        shape_k=padded_k,
+        pad_shape_n=padded_n - shape_n,
+        pad_shape_k=padded_k - shape_k,
+        num_experts=0 if gemm_type == GemmType.DENSE else 4,
+        a_dtype=dtypes.int8 if use_raw_weight else dtypes.bfloat16,
+        b_dtype=dtypes.int8 if use_raw_weight else dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        has_bias=True,
+    )
+    assert layer.use_raw_weight == use_raw_weight
+    tuning = dict(
+        mma_type="mma",
+        block_shape=(16, 128, 128),
+        warp_shape=(16, 32, 64 if use_stream_k else 128),
+        num_stages=3,
+        num_sms=6,
+        num_ctas_per_sm=1,
+        use_tma=False,
+        use_warp_spec=False,
+        use_stream_k=use_stream_k,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: tuning)
+    case = KernelTestCase(
+        name="ppu-padding",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=gemm_type),
+        top_k=1 if gemm_type == GemmType.DENSE else 2,
+        seed=2026,
+        atol=0.2,
+    )
+    shape_ms = (1, 17, 129)
     results = KernelTestRunner(case).run(shape_ms)
     assert_kernel_test_shape_coverage(results, shape_ms)
 
