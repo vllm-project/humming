@@ -318,7 +318,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if current_device.is_ppu:
             mma_shape_n = 16
         mma_shape_k = 256 // self.a_dtype.num_bits
-        if self.sm_version == 75:
+        if self.sm_version in (70, 75):
             if self.a_dtype == dtypes.float16:
                 mma_shape_k = 8
             elif self.a_dtype in (dtypes.int8, dtypes.int4):
@@ -348,6 +348,33 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         elif self.is_group_weight_scale:
             scale_dtype = self.bs_dtype
 
+        # Mirror of Ctx::kVoltaDecode (utils/context.cuh): the Volta decode path holds two activation
+        # registers.
+        volta_decode = (
+            self.sm_version == 70
+            and mma_shape_m == 8
+            and self.warp_shape[0] == 8
+            and self.a_dtype == dtypes.float16
+            and self.b_dtype.is_integer_type
+            and self.b_dtype.num_bits in (4, 8)
+            and not self.has_zero_point
+            and not self.use_fused_e8m0_scale
+            and not self.use_ldmatrix_dequant
+            and self.warp_shape[1] != 32
+        )
+        # Mirror of Ctx::kVoltaPrefill: 16-row tiles hold two weight registers per k step.
+        volta_prefill = (
+            self.sm_version == 70
+            and mma_shape_m == 16
+            and mma_shape_n == 8
+            and self.a_dtype == dtypes.float16
+            and self.b_dtype.is_integer_type
+            and self.b_dtype.num_bits in (4, 8)
+            and not self.has_zero_point
+            and not self.use_fused_e8m0_scale
+            and not self.use_ldmatrix_dequant
+            and self.warp_shape[1] != 32
+        )
         return MmaOpClass.from_config(
             self.mma_type,
             mma_shape_m,
@@ -357,6 +384,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.mma_b_dtype,
             mma_cd_dtype,
             sf_dtype=scale_dtype,
+            volta_decode=volta_decode,
+            volta_prefill=volta_prefill,
         )
 
     def check_shape(self):
@@ -434,7 +463,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             dtypes.float8e4m3: 89,
             dtypes.float8e5m2: 89,
             dtypes.bfloat16: 80,
-            dtypes.float16: 75,
+            dtypes.float16: 70,
         }
         assert self.a_dtype in dtype_map
         assert self.sm_version >= dtype_map[self.a_dtype]

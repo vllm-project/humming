@@ -232,6 +232,9 @@ def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False, 
         return None
 
     accumulator_registers = warp_m * warp_n / (64 if use_f16_accum else 32)
+    if layer_config.sm_version == 70 and layer_config.a_dtype.num_bits == 16:
+        # Volta keeps the two K halves of each m8n8k4 product apart until the epilogue (utils/ptx/volta.cuh).
+        accumulator_registers *= 2
     has_group_accumulator = False
     if mma_type != MmaType.MXMMA and layer_config.a_dtype.num_bits < 16:
         has_group_scale = layer_config.input_scale_group_size > 0
@@ -261,7 +264,7 @@ def calc_reg_count(rows, cols, ptx_dtype):
 class MmaOpClassImpl:
     mma_type = MmaType.MMA
 
-    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype):
+    def __init__(self, m, n, k, a_dtype, b_dtype, cd_dtype, volta_decode=False, volta_prefill=False):
         self.shape = (m, n, k)
         self.a_dtype = a_dtype if isinstance(a_dtype, str) else DTYPE_MAP[a_dtype]
         self.b_dtype = b_dtype if isinstance(b_dtype, str) else DTYPE_MAP[b_dtype]
@@ -273,7 +276,13 @@ class MmaOpClassImpl:
 
         b_reg_dtype = "e4m3" if self.use_f8f6f4 else self.b_dtype
         self.reg_a_count = calc_reg_count(m, k, self.a_dtype)
+        if volta_decode:
+            # Volta decode: each lane holds four k values of its activation row (utils/ptx/volta.cuh).
+            self.reg_a_count = 2
         self.reg_b_count = calc_reg_count(k, n, b_reg_dtype)
+        if volta_prefill:
+            # Volta prompts: each lane holds four k values of its weight column (utils/ptx/volta.cuh).
+            self.reg_b_count = 2
         self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype)
         if self.cd_dtype == "f16":
             self.val_type_cd = "half"
@@ -324,6 +333,16 @@ class MmaOpClassImpl:
         return code
 
     def generate_ptx(self, indent=0):
+        if current_device.sm_version == 70:
+            # Volta has neither m16n8k8 nor ldmatrix; utils/ptx/volta.cuh supplies both with the same
+            # fragments. Shape (8, 16, 8) is the half-M trick: B.T @ A.T through the same 16x8x8 multiply,
+            # with C transposed later.
+            has_supported_shape = self.shape in ((16, 8, 8), (8, 16, 8))
+            has_supported_types = (self.a_dtype, self.b_dtype, self.cd_dtype) == ("f16", "f16", "f32")
+            operation = f"{self.shape} {self.a_dtype} x {self.b_dtype} -> {self.cd_dtype}"
+            assert has_supported_shape and has_supported_types, f"Volta: no MMA for {operation}"
+            operands = "a, b, d" if self.shape[0] == 16 else "b, a, d"
+            return " " * indent + f"volta_mma_m16n8k8_f32({operands});"
         uses_half_m_float = self.shape[0] == 8 and self.a_dtype in ("f16", "bf16")
         if uses_half_m_float and not current_device.is_ppu:
             return self.generate_half_m_ptx(indent)
@@ -742,11 +761,24 @@ class MxMmaOpClassImpl:
 
 class MmaOpClass:
     @classmethod
-    def from_config(cls, mma_type, m, n, k, a_dtype, b_dtype, cd_dtype, sf_dtype=None, scale_vec=None):
+    def from_config(
+        cls,
+        mma_type,
+        m,
+        n,
+        k,
+        a_dtype,
+        b_dtype,
+        cd_dtype,
+        sf_dtype=None,
+        scale_vec=None,
+        volta_decode=False,
+        volta_prefill=False,
+    ):
         mma_type = mma_type if isinstance(mma_type, MmaType) else getattr(MmaType, mma_type.upper())
 
         if mma_type == MmaType.MMA:
-            return MmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype)
+            return MmaOpClassImpl(m, n, k, a_dtype, b_dtype, cd_dtype, volta_decode, volta_prefill)
         elif mma_type == MmaType.UMMA:
             assert m in (8, 16) and (n, k) == (8, 256 // a_dtype.num_bits)
             assert a_dtype in (
