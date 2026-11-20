@@ -45,6 +45,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const uint32_t *expert_layout_ptr,
     CUtensorMap *tensor_map_buffer,
     int32_t *locks,
+    float *fp32_partials,
     uint32_t shape_m,
     uint32_t top_k,
     bool use_int64_expert_layout) {
@@ -78,7 +79,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(AS2), param_to_ptr(BS),
       param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), param_to_ptr(BS2),
       sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr,
-      tensor_map_buffer, locks};
+      tensor_map_buffer, locks, fp32_partials};
   auto ctx = Ctx(smem, params);
 
   auto scheduler = Scheduler(ctx);

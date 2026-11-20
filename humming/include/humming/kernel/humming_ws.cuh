@@ -44,6 +44,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const uint32_t *expert_layout_ptr,
     CUtensorMap *tensor_map_buffer,
     int32_t *locks,
+    float *fp32_partials,
     uint32_t shape_m,
     uint32_t top_k,
     bool use_int64_expert_layout) {
@@ -78,7 +79,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(AS2), param_to_ptr(BS),
       param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), param_to_ptr(BS2),
       sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr,
-      tensor_map_buffer, locks};
+      tensor_map_buffer, locks, fp32_partials};
   auto ctx = Ctx(smem, params);
 
   auto scheduler = Scheduler(ctx);
@@ -89,7 +90,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   bool pdl_waited = false;
 
   if (ctx.is_load_thread()) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(TuningConfig::kProducerRegisters));
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n"
+                 :
+                 : "n"(TuningConfig::kProducerRegisters));
 
     auto producer = ProducerPipeline(ctx);
     if constexpr (Ctx::kIsIndexedGemm) producer.wait_math_epilogue();
@@ -149,7 +152,9 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       }
     }
   } else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(TuningConfig::kConsumerRegisters));
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n"
+                 :
+                 : "n"(TuningConfig::kConsumerRegisters));
 
     auto mainloop_arith = MainloopArithmetic();
     auto epilogue_arith = EpilogueArithmetic();
@@ -192,7 +197,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if constexpr (!Ctx::kUseWgmma) {
             if (warp_iter_id == Ctx::kWarpIters - 1) {
               if constexpr (Ctx::kWarpIters > 1 && ProducerPipeline::kHasStageTmaMBarrier)
-                asm volatile("fence.acq_rel.cta;" ::: "memory");
+                asm volatile("fence.acq_rel.cta;" ::
+                                 : "memory");
               consumer.arrive(stage_id);
             }
           }

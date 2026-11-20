@@ -127,6 +127,7 @@ extern "C" __constant__ uint32_t BS_DTYPE_ID = {{bs_dtype}}::kId;
 @dataclasses.dataclass(kw_only=True)
 class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     name: ClassVar[str] = "humming"
+    supports_dense_fp32_stream_k_reduce: ClassVar[bool] = True
     disable_fast_math: ClassVar[bool] = True
     _str2kernel_cache: ClassVar[dict[tuple, torch.Tensor]] = {}
     _id2kernel: ClassVar[dict[int, "HummingKernel"]] = {}
@@ -626,6 +627,25 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
         assert self.gemm_type is not None, "gemm_type must be specify for MoE GEMM"
+
+        if self.use_fp32_stream_k_reduce:
+            assert self.gemm_type == GemmType.DENSE, "FP32 Stream-K reduction requires dense GEMM"
+            assert self.use_stream_k and not self.use_f16_accum, "requires Stream-K and FP32 accumulation"
+            assert self.a_dtype.num_bits == 16 and self.c_dtype == dtypes.float16, (
+                "requires A16 and FP16 output"
+            )
+            assert self.b_dtype == dtypes.float8e4m3 and self.is_block_weight_scale, (
+                "requires block-scaled FP8 E4M3"
+            )
+            assert not self.has_input_scale_2, "secondary input scales are unsupported"
+            assert not self.is_channel_weight_scale_2 and not self.is_tensor_weight_scale_2, (
+                "secondary weight scales are unsupported"
+            )
+            assert not self.has_zero_point, "zero points are unsupported"
+            assert self.mma_type in (MmaType.MMA, MmaType.WGMMA), "requires MMA or WGMMA"
+            # Direct FP32 accumulator stores require the actual output pointer.
+            # Input TMA loads are preserved.
+            self.use_tma_c = False
 
         if self.is_tensor_input_scale:
             self.use_tma_as = False
