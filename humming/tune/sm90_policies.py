@@ -21,6 +21,9 @@ from humming.tune.candidate import (
 from humming.tune.raster import get_moe_raster_group_m
 from humming.utils.smem import estimate_smem_size_layer
 
+PACKED_FP4_GROUPED_MIN_SHAPE_M = 768
+PACKED_FP4_GROUPED_MAX_ROWS_PER_EXPERT = 8
+
 
 def fit_sm90_tile(
     layer_config: LayerConfig,
@@ -343,6 +346,98 @@ def get_sm90_specialized_config(
     if packed_config is not None:
         return finalize_config(packed_config)
     return finalize_config(scaled_config)
+
+
+def get_small_m_packed_fp4_config(
+    layer_config: LayerConfig,
+    shape_m: int,
+    gemm_type: GemmType,
+    use_f16_accum: bool,
+    use_batch_invariant: bool,
+    *,
+    is_h20: bool = False,
+    use_m_major_input_scale: bool = False,
+) -> dict | None:
+    """Use non-Stream-K tiles for bandwidth-bound grouped FP4 experts.
+
+    At one to eight routed rows per expert, the generic grouped-scale policy
+    spends one or more waves on small N tiles and pays Stream-K fixups. A
+    wider N tile amortizes packed-FP4 dequantization. BF16 activations use
+    MMA to stay within the register budget; FP8 activations use a WGMMA tile
+    with TMA and warp specialization.
+    """
+    has_supported_runtime = (
+        not is_h20
+        and not use_f16_accum
+        and not use_batch_invariant
+        and not use_m_major_input_scale
+        and gemm_type == GemmType.GROUPED_CONTIGUOUS
+    )
+    has_supported_experts = bool(layer_config.num_experts)
+    has_supported_weight = (
+        layer_config.b_dtype == dtypes.float4e2m1 and layer_config.weight_scale_group_size == 32
+    )
+    has_supported_layout = (
+        not layer_config.use_packed_k_layout and not layer_config.has_zero_point and not layer_config.has_bias
+    )
+    is_tile_aligned = layer_config.shape_n % 256 == 0 and layer_config.shape_k % 128 == 0
+    # vLLM reports the padded CUDA-graph bucket as shape_m. Below this bound, a
+    # small real batch can leave the routed layout extremely sparse.
+    has_supported_shape_m = (
+        PACKED_FP4_GROUPED_MIN_SHAPE_M
+        <= shape_m
+        <= PACKED_FP4_GROUPED_MAX_ROWS_PER_EXPERT * layer_config.num_experts
+    )
+    if not (
+        has_supported_runtime
+        and has_supported_experts
+        and has_supported_weight
+        and has_supported_layout
+        and is_tile_aligned
+        and has_supported_shape_m
+    ):
+        return None
+
+    if layer_config.a_dtype == dtypes.bfloat16 and layer_config.input_scale_group_size == 0:
+        if layer_config.shape_n >= 2 * layer_config.shape_k:
+            return {
+                "mma_type": MmaType.MMA.value,
+                "block_shape": (8, 256, 128),
+                "warp_shape": (8, 64, 64),
+                "num_stages": 4,
+                "num_ctas_per_sm": 2,
+                "use_stream_k": False,
+                "use_tma": False,
+                "use_warp_spec": False,
+            }
+        return {
+            "mma_type": MmaType.MMA.value,
+            "block_shape": (8, 128, 128),
+            "warp_shape": (8, 64, 64),
+            "num_stages": 4,
+            "num_ctas_per_sm": 4,
+            "use_stream_k": False,
+            "use_tma": False,
+            "use_warp_spec": False,
+        }
+
+    if (
+        layer_config.a_dtype == dtypes.float8e4m3
+        and layer_config.input_scale_group_size == 32
+        and layer_config.use_fused_e8m0_scale
+    ):
+        return {
+            "mma_type": MmaType.WGMMA.value,
+            "block_shape": (8, 256, 128),
+            "warp_shape": (8, 32, 128),
+            "num_stages": 4,
+            "num_ctas_per_sm": 2,
+            "use_stream_k": False,
+            "use_tma": True,
+            "use_warp_spec": True,
+        }
+
+    return None
 
 
 def get_compact_scaled_moe_config(

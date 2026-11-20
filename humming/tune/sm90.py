@@ -18,6 +18,7 @@ from humming.tune.sm90_policies import (
     fit_sm90_tile,
     get_compact_moe_config,
     get_sm90_specialized_config,
+    get_small_m_packed_fp4_config,
     select_grouped_scale,
     select_moe_a16,
     select_sm90_small_m_schedule,
@@ -266,6 +267,17 @@ class Sm90Heuristics(Sm80Heuristics):
         gemm_type: GemmType = GemmType.DENSE,
         use_m_major_input_scale: bool = False,
     ):
+        packed_fp4_small_m_config = get_small_m_packed_fp4_config(
+            layer_config,
+            shape_m,
+            gemm_type,
+            use_f16_accum,
+            use_batch_invariant,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        if packed_fp4_small_m_config is not None:
+            return packed_fp4_small_m_config
+
         selected = cls._select_base_config(
             layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
         )
