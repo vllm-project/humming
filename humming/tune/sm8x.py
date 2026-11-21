@@ -110,7 +110,9 @@ class Sm80Heuristics(DeviceHeuristics):
         min_num_tiles = num_sms if shape_m <= 8 else math.ceil(0.55 * num_sms)
 
         shape_n = layer_config.shape_n
-        one_wave_block_n = [block_n for block_n in (128, 64) if shape_n // block_n <= max_num_tiles]
+        one_wave_block_n = [
+            block_n for block_n in (128, 64) if shape_n % block_n == 0 and shape_n // block_n <= max_num_tiles
+        ]
         filling_block_n = [block_n for block_n in one_wave_block_n if shape_n // block_n >= min_num_tiles]
         if filling_block_n:
             block_n = filling_block_n[0]

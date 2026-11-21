@@ -6,6 +6,7 @@ from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import DeviceInfo
 from humming.tune.base import DeviceHeuristics
+from humming.tune.candidate import DeviceProfile, ScheduleCandidate, TuningProblem, analyze_candidate
 from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
 from humming.utils.smem import estimate_smem_size_layer
 
@@ -94,6 +95,19 @@ def _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint4, sm_version=80):
     )
 
 
+def _assert_legal_on_a100(layer_config, shape_m, config):
+    device = DeviceProfile(
+        name="A100", sm_version=80, num_sms=108, max_smem_size=Sm80Heuristics.max_smem_size
+    )
+    problem = TuningProblem(
+        layer_config=layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE, device=device
+    )
+    schedule_fields = ("block_shape", "warp_shape", "use_stream_k", "num_stages", "num_ctas_per_sm")
+    candidate = ScheduleCandidate.from_config("decode", {name: config[name] for name in schedule_fields})
+    analysis = analyze_candidate(problem, candidate)
+    assert analysis.legal, analysis.rejection_reasons
+
+
 @pytest.mark.usefixtures("_mock_a100_device")
 @pytest.mark.parametrize(
     "shape_n,shape_k,shape_m",
@@ -117,6 +131,7 @@ def test_sm80_decode_uses_one_wave_data_parallel_tiles(shape_n, shape_k, shape_m
     assert block_m >= min(shape_m, 8) and block_m <= 32
     assert block_n in (64, 128)
     assert num_tiles <= config["num_sms"] * config["num_ctas_per_sm"] <= 108 * config["num_ctas_per_sm"]
+    _assert_legal_on_a100(layer_config, shape_m, config)
     smem_size = estimate_smem_size_layer(
         layer_config,
         config["block_shape"],
@@ -172,3 +187,24 @@ def test_sm80_interval_table_uses_data_parallel_tiles_for_decode():
     larger_intervals = [config for min_shape_m, _, config in intervals if 32 <= min_shape_m < 4096]
     assert decode_intervals and not any(config["use_stream_k"] for config in decode_intervals)
     assert larger_intervals and all(config["use_stream_k"] for config in larger_intervals)
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize(
+    "num_sms,shape_n,expected_block_n",
+    [(108, 6208, 64), (74, 9536, None), (74, 19008, None), (108, 13888, None), (108, 27712, None)],
+)
+def test_sm80_decode_uses_only_block_n_dividing_n(monkeypatch, num_sms, shape_n, expected_block_n):
+    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: num_sms))
+    layer_config = _w4a16_layer_config(shape_n, 4096)
+
+    config = Sm80Heuristics.get_config(layer_config, shape_m=1, gemm_type=GemmType.DENSE)
+
+    base_config = DeviceHeuristics.get_config.__func__(
+        Sm80Heuristics, layer_config, 1, gemm_type=GemmType.DENSE
+    )
+    if expected_block_n is None:
+        assert config == base_config
+        return
+    assert not config["use_stream_k"] and config["block_shape"][1] == expected_block_n
+    assert config["num_sms"] * config["num_ctas_per_sm"] >= shape_n // expected_block_n
