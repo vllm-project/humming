@@ -38,6 +38,10 @@ private:
   static constexpr bool kHasTensorWeightScale = Ctx::kHasTensorWeightScale;
   static constexpr bool kUseNativeChannelScale = Ctx::kUseUmma && ElementA::kBits <= 8 && kHasChannelWeightScale;
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
+  // An unscaled f32 dot product can exceed FP16's range even when the scaled
+  // output is representable, so apply channel scales before narrowing.
+  static constexpr bool kApplyChannelScaleOnF32 =
+      kHasChannelWeightScale && !Ctx::kUseUmma && !kIsF16Accum && std::is_same<ElementC, Float16>::value;
   static constexpr bool kUseNativeDequantB =
       Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementQB, ElementB>;
   static constexpr bool kUseNativeDequantBS =
@@ -148,6 +152,18 @@ public:
       regs.x = regs.x * gs_f32;
       regs.y = regs.y * gs_f32;
     }
+    if constexpr (kApplyChannelScaleOnF32) {
+      may_process_on_smem_write(row, col);
+      const uint32_t *bs_regs = ElementBS::kBits == 8 ? dq_bs : bs;
+      const scalar_t2 *cs_half2 = reinterpret_cast<const scalar_t2 *>(kIsChannelWeightScale2 ? bs2 : bs_regs);
+      float2 scale = this->num22float2(cs_half2[col]);
+      if constexpr (kExpOffset.x && !kHasTensorWeightScale) {
+        scale.x *= prepare_exp_scale_factor<float, kExpOffset.x>();
+        scale.y *= prepare_exp_scale_factor<float, kExpOffset.x>();
+      }
+      regs.x = regs.x * scale.x;
+      regs.y = regs.y * scale.y;
+    }
   };
 
   CUDA_INLINE
@@ -196,7 +212,7 @@ public:
     may_process_on_smem_write(row, col);
 
     auto apply_exp_offset = [&]() {
-      if constexpr (!kHasTensorWeightScale) apply_packed_output_exp_offset(regs);
+      if constexpr (!kHasTensorWeightScale && !kApplyChannelScaleOnF32) apply_packed_output_exp_offset(regs);
     };
 
     if constexpr (!kIsF16Accum) apply_exp_offset();
@@ -214,9 +230,10 @@ public:
       regs_half2[0] = __hmul2(regs_half2[0], gs_half2[0]);
     }
 
-    if constexpr (kHasChannelWeightScale && !kUseNativeChannelScale && kHasBias && !kIsF16Accum) {
+    constexpr bool kApplyChannelScale = kHasChannelWeightScale && !kUseNativeChannelScale && !kApplyChannelScaleOnF32;
+    if constexpr (kApplyChannelScale && kHasBias && !kIsF16Accum) {
       regs_half2[0] = __hfma2(regs_half2[0], cs_half2[col], bias_half2[col]);
-    } else if constexpr (kHasChannelWeightScale && !kUseNativeChannelScale) {
+    } else if constexpr (kApplyChannelScale) {
       regs_half2[0] = __hmul2(regs_half2[0], cs_half2[col]);
     } else if constexpr (kHasBias && !kIsF16Accum) {
       regs_half2[0] = __hadd2(regs_half2[0], bias_half2[col]);
