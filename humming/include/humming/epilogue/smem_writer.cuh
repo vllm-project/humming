@@ -1,5 +1,7 @@
 #pragma once
 
+#include <humming/kernel/process_input/activation.cuh>
+#include <humming/kernel/process_input/quantization.cuh>
 #include <humming/utils/all.cuh>
 #include <humming/utils/ptx/tcgen05.cuh>
 
@@ -78,6 +80,7 @@ private:
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
   using ElementC = typename Ctx::ElementC;
+  static constexpr bool kIsBinaryActivation = Ctx::kActivationFuncType == ActivationType::BinaryInterleaved;
 
   static constexpr bool kUseWgmma = Ctx::kUseWgmma;
 
@@ -89,6 +92,7 @@ private:
 
   static constexpr uint32_t kOutputRows = SharedStorage::kOutputRows;
   static constexpr uint32_t kNumMathThreads = Ctx::kNumMathThreads;
+  static constexpr bool kApplyUmmaActivationInRegisters = Ctx::kHasFusedOutput && !Ctx::kRequantizeOutput;
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsGroupInputScale = kHasInputScale && Ctx::kInputScaleGroupSize > 0;
   static constexpr bool kIsGroupWeightScale = Ctx::kIsGroupWeightScale;
@@ -112,7 +116,7 @@ public:
   }
 
   CUDA_INLINE
-  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t first_row) {
+  void write(uint32_t *regs_ptr, uint32_t first_row) {
     if (ctx.k_warp_id() != 0) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
@@ -170,6 +174,8 @@ public:
         arith.may_apply_on_smem_write(val_uint, row_8x8block, col_8x8block);
       }
 
+      apply_output_activation(val_uint);
+
       if constexpr (!kUseWgmma) {
         uint32_t sub_row = laneid / 4;
         uint32_t row = warp_delta_row + 8 * row_8x8block + sub_row - first_row;
@@ -218,6 +224,139 @@ public:
     }
   }
 
+  template <uint32_t kColumns, class GmemWriter>
+  CUDA_INLINE void prepare_output(GmemWriter &writer, uint32_t first_row, uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
+    constexpr bool kUseTmaC = Ctx::kUseTmaC;
+    constexpr bool kIsIndexedGemm = Ctx::kIsIndexedGemm;
+    constexpr uint32_t kOutputWidth = GmemWriter::kOutputWidth;
+    using Activation = typename Ctx::LayerConfig::ActivationFunc;
+    using OutputType = typename Ctx::LayerConfig::OutputType;
+    using ScaleType = typename Ctx::LayerConfig::OutputScaleType;
+    constexpr uint32_t kDivisor = (kIsBinaryActivation ? 2 : 1);
+    constexpr uint32_t kColumnsOut = kColumns / kDivisor;
+    constexpr uint32_t kValues = []() {
+      if constexpr (Ctx::kRequantizeOutput) {
+        // Smaller vectors keep math threads active for narrow output tiles.
+        if constexpr (Ctx::kUseMxmma && !kUseTmaC && Ctx::kInputScaleGroupSize <= 128 && kOutputRows * kColumnsOut < kNumMathThreads * 8) return 4u;
+        return kOutputRows * kColumnsOut < kNumMathThreads * 16 ? 8u : 16u;
+      }
+      if constexpr (!kUseTmaC && kOutputWidth % 8 == 0) return 8u;
+      return 2u;
+    }();
+    constexpr uint32_t kBits = Ctx::kOutputBits;
+    constexpr uint32_t kStoreBytes = SharedStorage::kOutputTileColumns / kDivisor * kBits / 8;
+    constexpr uint32_t kGroupSize = Ctx::kInputScaleGroupSize;
+    uint32_t thread = ctx.math_thread_id();
+    uint32_t smem_base = offsetof(SharedStorage, reduce) / 128 % 8;
+    // Callers have already synchronized the shared output. Only TMA needs another
+    // barrier after each issuing thread drains its previous stores.
+    if constexpr (kUseTmaC) {
+      tma_wait_store_group<0, true>();
+      ctx.sync_math_threads();
+    }
+    constexpr uint32_t kIterations = CEIL_DIV(kOutputRows * kColumnsOut, kNumMathThreads * kValues);
+    scalar_t staged[kUseTmaC ? kIterations * kValues * kDivisor : 1];
+    if constexpr (kUseTmaC) {
+      // Preserve this chunk before changing its layout in place for TMA.
+      PRAGMA_UNROLL
+      for (uint32_t iter = 0; iter < kIterations; iter++) {
+        uint32_t index = (thread + iter * kNumMathThreads) * kValues;
+        if (index >= kOutputRows * kColumnsOut) continue;
+        uint32_t row = index / kColumnsOut;
+        uint32_t column = index % kColumnsOut;
+        PRAGMA_UNROLL
+        for (uint32_t item = 0; item < kValues * kDivisor; item++) {
+          uint32_t source_col = first_column + column * kDivisor + item;
+          uint32_t source_row = source_col / 64 * kOutputRows + row;
+          uint32_t word = (source_col % 64 / 8) ^ ((source_row + smem_base) % 8);
+          uint32_t offset = (buffer_offset + source_row * 8 + word) * 8 + source_col % 8;
+          staged[iter * kValues * kDivisor + item] = reinterpret_cast<const scalar_t *>(ctx.smem.reduce)[offset];
+        }
+      }
+      ctx.sync_math_threads();
+    }
+    auto output_smem = reinterpret_cast<uint8_t *>(ctx.smem.reduce + buffer_offset);
+    constexpr uint32_t kOutputUnroll = kUseTmaC ? kIterations : 1;
+    PRAGMA_UNROLL_COUNT(kOutputUnroll)
+    for (uint32_t index = thread * kValues; index < kOutputRows * kColumnsOut; index += kNumMathThreads * kValues) {
+      uint32_t row = index / kColumnsOut;
+      uint32_t column = index % kColumnsOut;
+      uint32_t output_row = first_row + row;
+      if constexpr (kIsIndexedGemm) output_row = writer.get_output_row_index(output_row);
+      else output_row += writer.row_offset;
+      uint32_t output_column = (writer.col_offset + first_column) / kDivisor + column;
+      bool valid = row < rows && output_row < writer.output_shape_m && output_column < kOutputWidth;
+      float values[kValues] = {};
+      float source_values[!kUseTmaC ? kValues * kDivisor : 1] = {};
+      if constexpr (!kUseTmaC) {
+        constexpr uint32_t kLoadValues = MIN(8u, kValues * kDivisor);
+        PRAGMA_UNROLL
+        for (uint32_t item = 0; item < kValues * kDivisor; item += kLoadValues) {
+          uint32_t source_col = first_column + column * kDivisor + item;
+          uint32_t source_row = source_col / 64 * kOutputRows + row;
+          uint32_t word = (source_col % 64 / 8) ^ ((source_row + smem_base) % 8);
+          uint32_t offset = (buffer_offset + source_row * 8 + word) * 8 + source_col % 8;
+          auto source = reinterpret_cast<const scalar_t *>(ctx.smem.reduce) + offset;
+          load_values<scalar_t, kLoadValues>(source_values + item, source);
+        }
+      }
+      PRAGMA_UNROLL
+      for (uint32_t item = 0; item < kValues; item++) {
+        float pair[kDivisor];
+        PRAGMA_UNROLL
+        for (uint32_t part = 0; part < kDivisor; part++) {
+          if constexpr (!kUseTmaC) {
+            pair[part] = source_values[item * kDivisor + part];
+          } else {
+            scalar_t value = staged[index / (kNumMathThreads * kValues) * kValues * kDivisor + item * kDivisor + part];
+            pair[part] = static_cast<float>(value);
+          }
+        }
+        if constexpr (!Ctx::kRequantizeOutput) values[item] = pair[0];
+        else if constexpr (kIsBinaryActivation) values[item] = Activation::apply(pair[0], pair[1]);
+        else if constexpr (Activation::kType == ActivationType::Unary) values[item] = Activation::apply(pair[0]);
+        else values[item] = pair[0];
+        if (!valid) values[item] = 0.f;
+      }
+      uint8_t *destination = nullptr;
+      if constexpr (kUseTmaC) {
+        uint32_t byte = column * kBits / 8;
+        destination = output_smem + (byte / kStoreBytes * kOutputRows + row) * kStoreBytes + byte % kStoreBytes;
+      }
+      if constexpr (Ctx::kRequantizeOutput) {
+        auto result = quant_dynamic_group<OutputType, ScaleType, kValues, kGroupSize, kNumMathThreads / 32>(values, nullptr);
+        if constexpr (kUseTmaC) store_packed<kValues * kBits / 8>(destination, result.packed, !valid);
+        else if (valid) writer.template store_output_packed<kValues * kBits / 8>(output_row, output_column, result.packed);
+        if (valid && output_column % kGroupSize == 0) {
+          constexpr uint32_t kGroups = CEIL_DIV(kOutputWidth, kGroupSize);
+          constexpr bool kPackedScale = !std::is_same<ScaleType, Float32>::value;
+          constexpr uint32_t kScaleColumns = kPackedScale ? CEIL_DIV(kGroups, 4) * 4 : kGroups;
+          uint64_t scale_index;
+          uint32_t group = output_column / kGroupSize;
+          uint64_t scale_rows = CEIL_DIV(ctx.params.shape_m * (kIsIndexedGemm ? ctx.params.top_k : 1), 4) * 4;
+          if constexpr (!Ctx::kUseMMajorInputScale) scale_index = uint64_t(output_row) * kScaleColumns + group;
+          else if constexpr (!kPackedScale) scale_index = uint64_t(group) * scale_rows + output_row;
+          else scale_index = uint64_t(group / 4) * scale_rows * 4 + output_row * 4 + group % 4;
+          store_scale<ScaleType>(ctx.params.output_scales, scale_index, result.scale);
+          if constexpr (kPackedScale && kScaleColumns > kGroups) {
+            if (group + 1 == kGroups) {
+              PRAGMA_UNROLL
+              for (uint32_t pad = 1; pad <= kScaleColumns - kGroups; pad++)
+                store_scale<ScaleType>(ctx.params.output_scales, scale_index + pad, ScaleStorage<ScaleType>{});
+            }
+          }
+        }
+      } else {
+        if constexpr (kUseTmaC) store_values<scalar_t, kValues>(reinterpret_cast<scalar_t *>(destination), values, !valid);
+        else if (valid) {
+          alignas(16) scalar_t packed[kValues];
+          store_values<scalar_t, kValues>(packed, values, false);
+          writer.template store_output_packed<kValues * sizeof(scalar_t)>(output_row, output_column, reinterpret_cast<const uint8_t *>(packed));
+        }
+      }
+    }
+  }
+
   template <class WriteChunk>
   CUDA_INLINE void write_umma(MMA &mma, uint32_t slice_id, uint32_t slice_count, WriteChunk write_chunk) {
     // Overlapped accumulators can emit other rows before row zero. Prepare
@@ -235,21 +374,28 @@ public:
     constexpr bool kChunked = Ctx::kOutputChunkRows != 0;
     constexpr uint32_t kStorageRows = kOutputRows;
     uint32_t lane = ctx.lane_id();
-    uint32_t warp = ctx.math_thread_id() / 32;
+    uint32_t warp = (ctx.math_thread_id() % 128) / 32;
     uint32_t n_partition = ctx.math_group;
     uint32_t column = n_partition * 128 + warp * 32 + (lane / 8) * 8;
     uint32_t row_in_matrix = Ctx::kUmmaCtaGroupSize == 2 ? lane % 8 : (lane % 8) / 2 + (lane % 2) * 4;
     uint32_t smem_base = offsetof(SharedStorage, reduce) / 128 % 8;
     uint32_t output_base = cast_smem_ptr_to_uint(ctx.smem.reduce);
     uint32_t chunk_step = 0;
+    constexpr bool kSplitRows = kNumMathThreads == 256;
+    uint32_t row_group_offset = kSplitRows ? ctx.math_thread_id() / 128 * 2 : 0;
 
-    PRAGMA_UNROLL
+    // Share fused output code across chunks instead of duplicating activation
+    // and requantization expressions for every chunk.
+    constexpr uint32_t kChunkUnroll = Ctx::kHasFusedOutput ? 1 : CEIL_DIV(WarpShape::M, 32);
+    PRAGMA_UNROLL_COUNT(kChunkUnroll)
     for (uint32_t step = 0; step < CEIL_DIV(WarpShape::M, 32); step++) {
       uint32_t m = kRotate ? (step + MMA::kAccumulatorStride / 32) % CEIL_DIV(WarpShape::M, 32) : step;
       uint32_t lower[16];
       uint32_t upper[16];
-      uint32_t rows = MIN(32, WarpShape::M - m * 32);
-      mma.load_output_chunk(m, rows, lower, upper);
+      uint32_t tile_rows = MIN(32, WarpShape::M - m * 32);
+      uint32_t row_offset = row_group_offset * 8;
+      uint32_t rows = row_offset < tile_rows ? MIN(kSplitRows ? 16u : 32u, tile_rows - row_offset) : 0;
+      if (rows != 0) mma.load_output_chunk(m, rows, lower, upper, row_offset);
       if constexpr (kChunked && (!Ctx::kIsIndexedGemm || MMA::kCanOverlapAccumulators)) {
         if (step + 1 == MMA::kAccumulatorReleaseChunks && ctx.math_group + 1 == MMA::kOutputGroups) {
           tcgen05_fence_before_thread_sync();
@@ -261,48 +407,56 @@ public:
           }
         }
       }
-      PRAGMA_UNROLL
-      for (uint32_t group = 0; group < rows / 8; group++) {
-        uint32_t first_row = m * 32 + group * 8;
-        uint32_t local_row = kChunked ? first_row % kStorageRows : first_row;
-        uint32_t buffer_offset = 0;
-        if constexpr (kChunked) {
-          buffer_offset = ((chunk_step + output_chunk_phase) % 2) * kStorageRows * BlockShape::N;
-          if (local_row == 0) {
-            if constexpr (Ctx::kUseTmaC) tma_wait_store_group<1, true>();
-            ctx.sync_math_threads();
-          }
+      uint32_t buffer_offset = 0;
+      if constexpr (kChunked) {
+        buffer_offset = ((chunk_step + output_chunk_phase) % 2) * kStorageRows * BlockShape::N;
+        if (m * 32 % kStorageRows == 0) {
+          if constexpr (Ctx::kUseTmaC) tma_wait_store_group<1, true>();
+          ctx.sync_math_threads();
         }
+      }
+      PRAGMA_UNROLL
+      for (uint32_t group = 0; group < (kSplitRows ? 2 : 4); group++) {
+        // Keep fragment indices static even when the final chunk is partial.
+        // A runtime loop bound can materialize the TMEM fragments in local memory.
+        if (group * 8 >= rows) continue;
+        uint32_t first_row = m * 32 + (group + row_group_offset) * 8;
+        uint32_t local_row = kChunked ? first_row % kStorageRows : first_row;
         uint32_t values[4];
         // TMEM holds N in rows and M in columns. stmatrix writes four 8-column
         // matrices from the two 16-row TMEM loads.
         if constexpr (Ctx::kUmmaCtaGroupSize == 2) {
-          values[0] = convert_umma_pair(lower[group * 4], lower[group * 4 + 1], m * 4 + group, 0);
-          values[1] = convert_umma_pair(lower[group * 4 + 2], lower[group * 4 + 3], m * 4 + group, 1);
-          values[2] = convert_umma_pair(upper[group * 4], upper[group * 4 + 1], m * 4 + group, 2);
-          values[3] = convert_umma_pair(upper[group * 4 + 2], upper[group * 4 + 3], m * 4 + group, 3);
+          values[0] = convert_umma_pair(lower[group * 4], lower[group * 4 + 1], m * 4 + group + row_group_offset, 0);
+          values[1] = convert_umma_pair(lower[group * 4 + 2], lower[group * 4 + 3], m * 4 + group + row_group_offset, 1);
+          values[2] = convert_umma_pair(upper[group * 4], upper[group * 4 + 1], m * 4 + group + row_group_offset, 2);
+          values[3] = convert_umma_pair(upper[group * 4 + 2], upper[group * 4 + 3], m * 4 + group + row_group_offset, 3);
         } else {
-          values[0] = convert_umma_pair(lower[group * 4], lower[group * 4 + 2], m * 4 + group, 0);
-          values[1] = convert_umma_pair(lower[group * 4 + 1], lower[group * 4 + 3], m * 4 + group, 1);
-          values[2] = convert_umma_pair(upper[group * 4], upper[group * 4 + 2], m * 4 + group, 2);
-          values[3] = convert_umma_pair(upper[group * 4 + 1], upper[group * 4 + 3], m * 4 + group, 3);
+          values[0] = convert_umma_pair(lower[group * 4], lower[group * 4 + 2], m * 4 + group + row_group_offset, 0);
+          values[1] = convert_umma_pair(lower[group * 4 + 1], lower[group * 4 + 3], m * 4 + group + row_group_offset, 1);
+          values[2] = convert_umma_pair(upper[group * 4], upper[group * 4 + 2], m * 4 + group + row_group_offset, 2);
+          values[3] = convert_umma_pair(upper[group * 4 + 1], upper[group * 4 + 3], m * 4 + group + row_group_offset, 3);
         }
+        if constexpr (kApplyUmmaActivationInRegisters)
+          apply_umma_register_output_arithmetic(values, m * 4 + group + row_group_offset);
         uint32_t row = local_row + row_in_matrix;
         uint32_t swizzled_column = ((column % 64 / 8) ^ ((row + smem_base) % 8)) * 8;
         uint32_t output_offset = buffer_offset + (row + kStorageRows * (column / 64)) * 64 + swizzled_column;
         st_shared<4, true>(output_base + output_offset * 2, values);
-        if constexpr (kChunked) {
-          if (local_row + 8 == kStorageRows || first_row + 8 == WarpShape::M) {
-            uint32_t chunk_first_row = first_row - local_row;
-            uint32_t chunk_rows = local_row + 8;
-            if constexpr (ArithClass::kNeedsPackedOutputTransform)
-              apply_umma_packed_output_arithmetic(chunk_first_row, chunk_rows, buffer_offset / 8, kStorageRows);
-            if constexpr (Ctx::kUseTmaC) tma_fence_async_shared();
-            ctx.sync_math_threads();
-            write_chunk(chunk_first_row, chunk_rows, buffer_offset / 8);
-            if constexpr (!Ctx::kUseTmaC) ctx.sync_math_threads();
-            chunk_step++;
+      }
+      if constexpr (kChunked) {
+        uint32_t chunk_end = m * 32 + tile_rows;
+        if (chunk_end % kStorageRows == 0 || chunk_end == WarpShape::M) {
+          uint32_t chunk_first_row = m * 32 / kStorageRows * kStorageRows;
+          uint32_t chunk_rows = chunk_end - chunk_first_row;
+          if constexpr (ArithClass::kNeedsPackedOutputTransform && !kApplyUmmaActivationInRegisters) {
+            if constexpr (kSplitRows) ctx.sync_math_threads();
+            apply_umma_packed_output_arithmetic(chunk_first_row, chunk_rows, buffer_offset / 8, kStorageRows);
           }
+          if constexpr (Ctx::kUseTmaC) tma_fence_async_shared();
+          ctx.sync_math_threads();
+          write_chunk(chunk_first_row, chunk_rows, buffer_offset / 8);
+          if constexpr (!Ctx::kUseTmaC) ctx.sync_math_threads();
+          chunk_step++;
         }
       }
     }
@@ -311,12 +465,25 @@ public:
       if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
     }
     if constexpr (kChunked) output_chunk_phase ^= CEIL_DIV(WarpShape::M, kStorageRows) % 2;
-    else if constexpr (ArithClass::kNeedsPackedOutputTransform) {
+    else if constexpr (ArithClass::kNeedsPackedOutputTransform && !kApplyUmmaActivationInRegisters) {
+      if constexpr (kSplitRows) ctx.sync_math_threads();
       apply_umma_packed_output_arithmetic();
     }
   }
 
 private:
+  CUDA_INLINE void apply_output_activation(uint32_t &value) {
+    if constexpr (Ctx::kHasFusedOutput && !Ctx::kRequantizeOutput) {
+      using Activation = typename Ctx::LayerConfig::ActivationFunc;
+      auto pair = this->num22float2(*reinterpret_cast<scalar_t2 *>(&value));
+      if constexpr (kIsBinaryActivation) pair = {Activation::apply(pair.x, pair.y), 0.f};
+      else if constexpr (Activation::kType == ActivationType::Unary)
+        pair = {Activation::apply(pair.x), Activation::apply(pair.y)};
+      auto converted = this->float22num2(pair);
+      value = *reinterpret_cast<uint32_t *>(&converted);
+    }
+  }
+
   uint32_t output_chunk_phase = 0;
 
   CUDA_INLINE uint32_t convert_umma_pair(uint32_t first, uint32_t second, uint32_t row_group, uint32_t column_group) {
@@ -326,14 +493,70 @@ private:
       first_value = float(int32_t(first));
       second_value = float(int32_t(second));
     }
-    arith.apply_native_f32_output_scale(first_value, second_value, row_group, column_group);
+    arith.apply_native_f32_output_arithmetic(first_value, second_value, row_group, column_group);
     float2 values = {first_value, second_value};
     auto packed = this->float22num2(values);
     return *reinterpret_cast<uint32_t *>(&packed);
   }
 
+  CUDA_INLINE void apply_umma_register_output_arithmetic(uint32_t (&values)[4], uint32_t row_group) {
+    if constexpr (!ArithClass::kNeedsPackedOutputTransform && kIsBinaryActivation) {
+      // Adjacent N channels occupy lanes separated by four. Each lane computes
+      // one of the pair's M rows so GLU uses the whole warp, then repacks the
+      // two results in the gate lane and zeros the interleaved up channel.
+      bool is_gate_lane = (ctx.lane_id() & 4) == 0;
+      uint32_t shift = is_gate_lane ? 0 : 16;
+      PRAGMA_UNROLL
+      for (uint32_t pair = 0; pair < 4; pair++) {
+        uint32_t value = values[pair];
+        uint32_t neighbor = __shfl_xor_sync(0xffffffff, value, 4);
+        uint32_t gate = is_gate_lane ? value : neighbor;
+        uint32_t up = is_gate_lane ? neighbor : value;
+        uint32_t adjacent = ((gate >> shift) & 0xffffu) | ((up >> shift) << 16);
+        apply_output_activation(adjacent);
+        uint32_t other_row = __shfl_xor_sync(0xffffffff, adjacent, 4);
+        values[pair] = is_gate_lane ? (adjacent & 0xffffu) | (other_row << 16) : 0;
+      }
+      return;
+    }
+    // Unary activation without packed scales/bias is independent of the TMEM
+    // fragment layout. Apply it directly to the already-rounded output values.
+    constexpr bool kNeedsRowLayout = ArithClass::kNeedsPackedOutputTransform || kIsBinaryActivation;
+    uint32_t lane = ctx.lane_id();
+    uint32_t source_row = lane / 4;
+    if constexpr (Ctx::kUmmaCtaGroupSize == 1) source_row = (source_row % 4) * 2 + source_row / 4;
+    uint32_t source_lane = (lane % 4) * 8 + source_row / 2;
+    uint32_t source_shift = (source_row % 2) * 16;
+    uint32_t first_row = Ctx::kUmmaCtaGroupSize == 2 ? (lane % 4) * 2 : lane % 4;
+    uint32_t second_row = first_row + (Ctx::kUmmaCtaGroupSize == 2 ? 1 : 4);
+    uint32_t restore_shift = (lane / 4 % 2) * 16;
+
+    PRAGMA_UNROLL
+    for (uint32_t pair = 0; pair < 4; pair++) {
+      uint32_t value = values[pair];
+      if constexpr (kNeedsRowLayout) {
+        // Match the row-wise, adjacent-N pairs formerly read after stmatrix.trans.
+        uint32_t first = __shfl_sync(0xffffffff, value, source_lane);
+        uint32_t second = __shfl_sync(0xffffffff, value, source_lane + 4);
+        value = ((first >> source_shift) & 0xffffu) | ((second >> source_shift) << 16);
+      }
+      if constexpr (ArithClass::kNeedsPackedOutputTransform)
+        arith.may_apply_on_smem_write(value, row_group, pair);
+      apply_output_activation(value);
+      if constexpr (kNeedsRowLayout) {
+        // Restore the fragment distribution expected by the existing store.
+        uint32_t first = __shfl_sync(0xffffffff, value, first_row * 4 + lane / 8);
+        uint32_t second = __shfl_sync(0xffffffff, value, second_row * 4 + lane / 8);
+        value = ((first >> restore_shift) & 0xffffu) | ((second >> restore_shift) << 16);
+      }
+      values[pair] = value;
+    }
+  }
+
   CUDA_INLINE void apply_umma_packed_output_arithmetic(uint32_t first_row = 0, uint32_t rows = WarpShape::M,
-                                                       uint32_t buffer_offset = 0, uint32_t storage_rows = BlockShape::M) {
+      uint32_t buffer_offset = 0, uint32_t storage_rows = BlockShape::M) {
+    if constexpr (kNumMathThreads == 256)
+      if (ctx.math_thread_id() >= 128) return;
     uint32_t n_partition = ctx.math_group;
     uint32_t warp = ctx.math_thread_id() / 32;
     uint32_t lane = ctx.lane_id();

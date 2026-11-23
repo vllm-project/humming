@@ -254,12 +254,17 @@ struct UMMA : WMMA<Ctx, ArithClass> {
     return step;
   }
 
-  CUDA_INLINE void load_output_chunk(uint32_t m, uint32_t rows, uint32_t *lower, uint32_t *upper) {
+  CUDA_INLINE void load_output_chunk(uint32_t m, uint32_t rows, uint32_t *lower, uint32_t *upper, uint32_t row_offset = 0) {
     uint32_t address = tmem_column + ctx.math_group * kGroupColumns +
-                       kAccumulatorColumn + accumulator_phase * kAccumulatorStride + m * 32;
+                       kAccumulatorColumn + accumulator_phase * kAccumulatorStride + m * 32 + row_offset;
     if constexpr (Ctx::kUmmaCtaGroupSize == 2) {
-      tcgen05_ld_16x256b_x4(address, lower);
-      tcgen05_ld_16x256b_x4(address | (16u << 16), upper);
+      if constexpr (Ctx::kNumMathThreads == 256) {
+        tcgen05_ld_16x256b_x2(address, lower);
+        tcgen05_ld_16x256b_x2(address | (16u << 16), upper);
+      } else {
+        tcgen05_ld_16x256b_x4(address, lower);
+        tcgen05_ld_16x256b_x4(address | (16u << 16), upper);
+      }
     } else {
       if (rows == 8) {
         tcgen05_ld_16x128b_x2(address, lower);

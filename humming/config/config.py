@@ -59,6 +59,28 @@ class LayerConfig(BaseHummingConfig):
     has_zero_point: bool = False
     is_fp_zero_point: bool = False
 
+    # Output activation uses the same expressions and logical layouts as process_input.
+    activation_func_type: ActivationType = ActivationType.None_
+    activation_func_impl: str | None = None
+    requantize_output: bool = False
+
+    @property
+    def has_fused_output(self) -> bool:
+        return self.activation_func_type != ActivationType.None_ or self.requantize_output
+
+    @property
+    def output_dtype(self) -> dtypes.DataType:
+        return self.a_dtype if self.requantize_output else self.c_dtype
+
+    @property
+    def output_bits(self) -> int:
+        return self.output_dtype.num_bits
+
+    @property
+    def output_shape_n(self) -> int:
+        width = self.shape_n - self.pad_shape_n
+        return width // 2 if self.activation_func_type.is_binary else width
+
     # bias config
     has_bias: bool = False
 
@@ -66,6 +88,8 @@ class LayerConfig(BaseHummingConfig):
     use_packed_k_layout: bool | None = None
 
     _cpp_extra_names: ClassVar[tuple[str, ...]] = (
+        "has_fused_output",
+        "output_bits",
         "is_channel_weight_scale",
         "is_block_weight_scale",
         "is_group_weight_scale",
@@ -285,6 +309,7 @@ class LayerConfig(BaseHummingConfig):
         return False
 
     def __post_init__(self):
+        self.activation_func_type = ActivationType(self.activation_func_type)
         if self.sm_version is None:
             self.sm_version = current_device.sm_version
 
@@ -454,6 +479,25 @@ class LayerConfig(BaseHummingConfig):
         if type(self) is LayerConfig:
             self._config_str = self.to_str()
 
+        self.check_fused_output()
+
+    def check_fused_output(self) -> None:
+        if not self.has_fused_output:
+            return
+        if self.is_block_weight_scale:
+            raise ValueError("fused output does not support blockwise weights")
+        if self.has_input_scale and self.input_scale_group_size not in (16, 32):
+            raise ValueError("fused output requires input group size 16 or 32")
+        if self.activation_func_type != ActivationType.None_ and not self.activation_func_impl:
+            raise ValueError("activation_func_impl is required")
+        if self.activation_func_type.is_binary and (self.shape_n - self.pad_shape_n) % 2:
+            raise ValueError("GLU requires an even number of output channels")
+        if self.requantize_output:
+            if self.input_quant_mode != InputQuantizationMode.DynamicGroup:
+                raise ValueError("requantization requires DynamicGroup input quantization")
+            if self.output_shape_n % self.input_scale_group_size:
+                raise ValueError("output channels must contain complete quantization groups")
+
     def _update_weight_scale_flags(self):
         self.is_group_weight_scale = self.weight_scale_type == WeightScaleType.GROUP
         self.is_block_weight_scale = self.weight_scale_type == WeightScaleType.BLOCK
@@ -566,6 +610,7 @@ class TuningConfig(BaseHummingConfig):
     producer_registers: int | None = None
     num_ctas_per_sm: int = 1
     umma_num_dequant_warpgroups: int = 1
+    umma_num_epilogue_warpgroups: int = 1
     umma_cta_group_size: int = 1
     umma_split_async_loads: bool = False
     output_chunk_rows: int = 0

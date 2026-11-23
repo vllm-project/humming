@@ -38,6 +38,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBZP>::Type BZP,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBias>::Type Bias,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBS2>::Type BS2,
+    void *output_scales,
     const uint32_t *sorted_ids_ptr,
     const uint32_t *expert_ids_ptr,
     const uint32_t *num_tokens_padded_ptr,
@@ -66,7 +67,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr uint32_t kDequantGroups = TuningConfig::kUmmaNumDequantWarpgroups;
   constexpr uint32_t kNumDequantThreads = Ctx::kUseUmmaSs ? 0 : 128 * kDequantGroups;
   static_assert(kDequantGroups == 1 || kDequantGroups == 2);
-  static_assert(TuningConfig::kNumThreads == 256 + kNumDequantThreads);
+  static_assert(TuningConfig::kNumThreads == 128 + Ctx::kNumMathThreads + kNumDequantThreads);
   constexpr bool kCooperative = Ctx::kUmmaCtaGroupSize == 2;
   constexpr bool kHasChannelZeroPoint = Ctx::kHasZeroPoint && Ctx::kIsChannelWeightScale;
   constexpr bool kEarlyAsyncScales = Ctx::kUseUmmaAsyncActivationLoads && Ctx::kCanPrepareScalesBeforeWeights &&
@@ -88,7 +89,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   const KernelParams params{
       shape_m, top_k, use_int64_expert_layout,
       param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(AS2), param_to_ptr(BS),
-      param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), param_to_ptr(BS2),
+      param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), param_to_ptr(BS2), output_scales,
       sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr, tensor_map_buffer, locks};
   Ctx ctx(smem, params);
   Scheduler<Ctx> scheduler(ctx);
@@ -97,7 +98,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   // contribute to that stage's next ready phase.
   constexpr uint32_t kNumReadinessThreads = 128 - Ctx::kNumLoadThreads - 32;
   constexpr bool kEarlyWeightReuse = !Ctx::kUseUmmaSs && Ctx::kUseUmmaSplitLoads && kNumOperandBuffers <= kNumStages;
-  if (ctx.is_load_thread()) Producer::template init_mbarrier<1, 128>(ctx);
+  if (ctx.is_load_thread()) Producer::template init_mbarrier<1, Ctx::kNumMathThreads>(ctx);
   if (threadIdx.x < kNumStages) {
     __mbarrier_init(&smem.umma_operand_ready[threadIdx.x], (kNumDequantThreads + kNumReadinessThreads) * Ctx::kUmmaCtaGroupSize);
     if constexpr (Ctx::kUseUmmaSeparateInputScale && Ctx::kIsGroupInputScale)
@@ -420,7 +421,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
           auto write_chunk = [&](uint32_t first_row, uint32_t rows, uint32_t buffer_offset) {
             if constexpr (Ctx::kOutputChunkRows)
-              epilogue.gmem_writer.template write_chunk<128>(scheduler.slice_id, scheduler.slice_count, first_row, rows, buffer_offset, ctx.math_group * 128);
+              epilogue.template write_output_chunk<128>(first_row, rows, buffer_offset, ctx.math_group * 128);
           };
           epilogue.smem_writer.write_umma(mma, scheduler.slice_id, scheduler.slice_count, write_chunk);
         }
@@ -430,8 +431,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         if constexpr (!Ctx::kOutputChunkRows && (!Ctx::kIsIndexedGemm || kOverlapIndexedEpilogue)) release_accumulator();
         if constexpr (Ctx::kUseTmaC) tma_fence_async_shared();
         ctx.sync_math_threads();
-        if constexpr (!Ctx::kOutputChunkRows)
-          epilogue.gmem_writer.write(scheduler.slice_id, scheduler.slice_count, 0);
+        if constexpr (!Ctx::kOutputChunkRows) {
+          if constexpr (Ctx::kRequantizeOutput || Ctx::kActivationFuncType == ActivationType::BinaryInterleaved)
+            epilogue.template write_output_chunk<BlockShape::N>(0, BlockShape::M, 0);
+          else epilogue.gmem_writer.write(scheduler.slice_id, scheduler.slice_count, 0);
+        }
         if constexpr (kOverlapIndexedEpilogue && !GmemWriter::kCacheIndexedRows) {
           // Accumulators may be reused before output scatter finishes. Return
           // the row-index slot only after all epilogue threads stop reading it.

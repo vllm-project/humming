@@ -282,6 +282,7 @@ def test_special_weight_path_coverage():
     assert odd_bit_fallback.use_packed_k_layout is False
 
 
+@pytest.mark.parametrize("epilogue_warpgroups", (1, 2))
 @pytest.mark.parametrize(
     "mma_type,block_m,chunk_rows,shape_n,gemm_type,use_tma,cta_group_size",
     (
@@ -307,9 +308,19 @@ def test_special_weight_path_coverage():
     ),
 )
 def test_output_chunk_rows(
-    mma_type, block_m, chunk_rows, shape_n, gemm_type, use_tma, cta_group_size, monkeypatch
+    mma_type,
+    block_m,
+    chunk_rows,
+    shape_n,
+    gemm_type,
+    use_tma,
+    cta_group_size,
+    epilogue_warpgroups,
+    monkeypatch,
 ):
     """Cover N slab stores, descriptor bounds, buffer reuse, scatter, and K reduction."""
+    if epilogue_warpgroups == 2 and mma_type != "umma":
+        pytest.skip("two epilogue warpgroups apply only to UMMA")
     skip_if_unsupported(a_dtype=dtypes.bfloat16, mma_type=mma_type, use_tma=use_tma)
     layer = LayerConfig(
         shape_n=512,
@@ -339,6 +350,7 @@ def test_output_chunk_rows(
         use_stream_k=True,
         smem_reuse_mode="last_stage" if is_mma else "none",
         umma_cta_group_size=cta_group_size,
+        umma_num_epilogue_warpgroups=epilogue_warpgroups,
         output_chunk_rows=chunk_rows,
     )
     if mma_type == "wgmma":

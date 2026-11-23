@@ -22,9 +22,9 @@
 #define HUMMING_UMMA_DIRECT_WEIGHT_SCALE 0
 #endif
 
-#if HUMMING_USE_UMMA_SS && HUMMING_USE_BLOCK_SCALED_MMA && \
+#if HUMMING_USE_UMMA_SS && HUMMING_USE_BLOCK_SCALED_MMA &&                  \
     ((HUMMING_IS_GROUP_INPUT_SCALE && !HUMMING_UMMA_INPLACE_INPUT_SCALE) || \
-     (HUMMING_IS_GROUP_WEIGHT_SCALE && !HUMMING_UMMA_DIRECT_WEIGHT_SCALE))
+        (HUMMING_IS_GROUP_WEIGHT_SCALE && !HUMMING_UMMA_DIRECT_WEIGHT_SCALE))
 #define IF_HAS_UMMA_SCALE_SCRATCH(x) x
 #else
 #define IF_HAS_UMMA_SCALE_SCRATCH(x)
@@ -156,11 +156,14 @@ public:
   static constexpr uint32_t kWarpReduceSize = M_WARPS * 16 * BlockShape::N * kMmaCTypeBits / 128 * kWarpReduceBuffers;
   static constexpr uint32_t kOutputRows = TuningConfig::kOutputChunkRows ? MIN(TuningConfig::kOutputChunkRows, BlockShape::M) : BlockShape::M;
   static constexpr uint32_t kNumOutputWarpgroups = M_WARPS * (BlockShape::N / WarpShape::N) / 4;
-  static constexpr bool kUseWarpgroupOutput = TuningConfig::kMmaType == MmaType::WGMMA && kNumOutputWarpgroups > 1 && !TuningConfig::kOutputChunkRows;
+  static constexpr bool kUseWarpgroupOutput = !LayerConfig::kHasFusedOutput && TuningConfig::kMmaType == MmaType::WGMMA && kNumOutputWarpgroups > 1 && !TuningConfig::kOutputChunkRows;
   static constexpr uint32_t kNumStreamKLocksPerTile = kUseWarpgroupOutput ? kNumOutputWarpgroups : 1;
   static constexpr uint32_t kOutputTileRows = kUseWarpgroupOutput ? WarpShape::M : kOutputRows;
   static constexpr uint32_t kWarpgroupStoreColumns = M_WARPS == 1 ? WarpShape::N * 4 : 64;
-  static constexpr uint32_t kOutputTileColumns = kUseWarpgroupOutput ? kWarpgroupStoreColumns : (TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 128 : BlockShape::N);
+  static constexpr bool kIsBinaryActivation = LayerConfig::kActivationFuncType == ActivationType::BinaryInterleaved;
+  static constexpr bool kUse64ColumnOutputTiles = LayerConfig::kRequantizeOutput || kIsBinaryActivation;
+  static constexpr uint32_t kDefaultOutputColumns = TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 128 : BlockShape::N;
+  static constexpr uint32_t kOutputTileColumns = kUse64ColumnOutputTiles ? 64 : (kUseWarpgroupOutput ? kWarpgroupStoreColumns : kDefaultOutputColumns);
   static constexpr bool kUseDynamicOutputMap = TuningConfig::kUseTmaC && (kIsGroupedGemm || BlockShape::M % kOutputRows != 0);
   static constexpr uint32_t kOutputBuffers = TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 2 : 1;
   static constexpr uint32_t kBlockOutputSize = kOutputBuffers * kOutputRows * BlockShape::N / 8;
@@ -269,7 +272,7 @@ public:
   IF_IS_INDEXED_GEMM(uint32_t wr_row_index_next[BlockShape::M];)
 #endif
 
-#if HUMMING_IS_GROUPED_GEMM || (HUMMING_USE_TMA_C && HUMMING_OUTPUT_CHUNK_ROWS > 0 && HUMMING_BLOCK_SHAPE_M % HUMMING_OUTPUT_CHUNK_ROWS != 0 && HUMMING_OUTPUT_CHUNK_ROWS < HUMMING_BLOCK_SHAPE_M)
+#if (HUMMING_HAS_FUSED_OUTPUT && HUMMING_USE_STREAM_K && HUMMING_USE_TMA_C) || HUMMING_IS_GROUPED_GEMM || (HUMMING_USE_TMA_C && HUMMING_OUTPUT_CHUNK_ROWS > 0 && HUMMING_BLOCK_SHAPE_M % HUMMING_OUTPUT_CHUNK_ROWS != 0 && HUMMING_OUTPUT_CHUNK_ROWS < HUMMING_BLOCK_SHAPE_M)
   CUtensorMap tensor_map_buffer[1];
 #endif
   IF_IS_GROUPED_GEMM(uint32_t expert_tokens[kNumExperts];)

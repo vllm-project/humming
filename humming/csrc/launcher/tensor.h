@@ -12,7 +12,9 @@ inline Tensor may_make_tensor_c(std::optional<Tensor> &c, const Tensor &a, Kerne
   int64_t shape_n = kernel_data.problem_shape_n - kernel_data.pad_shape_n;
   if (kernel_data.gemm_type_id == 1) shape_m = shape_m * top_k;
 
-  auto c_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
+  if (is_binary_activation(kernel_data.activation_func_type)) shape_n /= 2;
+  shape_n = shape_n * std::min(8u, get_dtype_num_bits(kernel_data.output_dtype_id)) / 8;
+  auto c_dtype = dtype_id_to_tensor_dtype(kernel_data.output_dtype_id);
   return torch_empty({shape_m, shape_n}, c_dtype, a.device());
 }
 
@@ -99,10 +101,28 @@ inline void check_tensor_b(Tensor &tensor, KernelData &kernel_data, int64_t dev)
 
 inline void check_tensor_c(Tensor &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m, int64_t top_k) {
   std::vector<int64_t> expected_shape = {shape_m * (kernel_data.gemm_type_id == 1 ? top_k : 1)};
-  expected_shape.push_back(kernel_data.problem_shape_n - kernel_data.pad_shape_n);
-  auto expected_dtype = dtype_id_to_tensor_dtype(kernel_data.c_dtype_id);
+  uint32_t columns = kernel_data.problem_shape_n - kernel_data.pad_shape_n;
+  if (is_binary_activation(kernel_data.activation_func_type)) columns /= 2;
+  columns = columns * std::min(8u, get_dtype_num_bits(kernel_data.output_dtype_id)) / 8;
+  expected_shape.push_back(columns);
+  auto expected_dtype = dtype_id_to_tensor_dtype(kernel_data.output_dtype_id);
   check_tensor_common(tensor, "c", dev, expected_dtype, expected_shape);
 };
+
+inline void check_tensor_output_scales(std::optional<Tensor> &tensor, KernelData &kernel_data,
+    int64_t dev, int64_t shape_m, int64_t top_k) {
+  if (kernel_data.requantize_output) {
+    ASSERT_CHECK(tensor.has_value(), "requantization requires output_scales");
+    int64_t rows = shape_m * (kernel_data.gemm_type_id == 1 ? top_k : 1);
+    int64_t groups = (kernel_data.problem_shape_n - kernel_data.pad_shape_n) / kernel_data.input_scale_group_size;
+    if (is_binary_activation(kernel_data.activation_func_type)) groups /= 2;
+    bool packed = get_dtype_num_bits(kernel_data.output_scale_dtype_id) == 8;
+    int64_t columns = packed ? (groups + 3) / 4 : groups;
+    std::vector<int64_t> scale_shape = {rows, columns};
+    if (kernel_data.use_m_major_input_scale) scale_shape = {columns, (rows + 3) / 4 * 4};
+    check_tensor_common(*tensor, "output_scales", dev, packed ? ScalarType::Int : ScalarType::Float, scale_shape);
+  } else ASSERT_CHECK(!tensor.has_value(), "output_scales requires requantization");
+}
 
 inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, int64_t shape_m, int64_t top_k) {
   if (get_dtype_num_bits(kernel_data.a_dtype_id) == 16) {
@@ -452,6 +472,22 @@ inline CUtensorMap make_tma_desc_c(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_c) return CUtensorMap();
   tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
   const uint32_t rows = kernel_data.output_tile_rows;
+  const bool is_binary = is_binary_activation(kernel_data.activation_func_type);
+  if (kernel_data.requantize_output || is_binary) {
+    const uint32_t bits = get_dtype_num_bits(kernel_data.output_dtype_id);
+    const uint32_t row_bytes = (kernel_data.problem_shape_n - kernel_data.pad_shape_n) / (is_binary ? 2 : 1) * bits / 8;
+    const uint32_t tile_bytes = kernel_data.output_tile_columns / (is_binary ? 2 : 1) * bits / 8;
+    CUtensorMap descriptor = {};
+    uint64_t dimensions[] = {row_bytes, uint64_t(tensor.size(0))};
+    uint64_t strides[] = {row_bytes};
+    uint32_t box[] = {tile_bytes, rows};
+    uint32_t element_strides[] = {1, 1};
+    CUresult status = cuTensorMapEncodeTiled(&descriptor, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+        tensor.data_ptr(), dimensions, strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    ASSERT_CHECK(status == CUDA_SUCCESS, "TMA Encode Failed for fused C: ", int(status));
+    return descriptor;
+  }
   if (tensor.size(-1) % 64 != 0) return make_tma_desc(tensor, {64, rows}, 128, "c");
 
   const uint32_t columns = kernel_data.output_tile_columns;

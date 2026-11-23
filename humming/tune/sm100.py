@@ -473,7 +473,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
     def _get_deepest_stages(
         cls, layer_config, block_shape, cta_group_size, max_stages, use_m_major_input_scale
     ):
-        output_chunk_rows = 32 if cta_group_size == 2 or block_shape[0] > 32 else 0
+        output_chunk_rows = 32 if block_shape[0] > 32 else 0
         for num_stages in range(max_stages, 1, -1):
             fits_resources = cls._fits_resources(
                 layer_config,
@@ -554,7 +554,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             "use_tma_a": True,
             "use_tma_c": True,
             "umma_cta_group_size": cta_group_size,
-            "output_chunk_rows": 32 if cta_group_size == 2 or block_m > 32 else 0,
+            "output_chunk_rows": 32 if block_m > 32 else 0,
         }
 
     @staticmethod
@@ -613,7 +613,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
             "use_tma_a": True,
             "use_tma_c": True,
             "umma_cta_group_size": cta_group_size,
-            "output_chunk_rows": 32 if cta_group_size == 2 or block_m > 32 else 0,
+            "output_chunk_rows": 32 if block_m > 32 else 0,
         }
         candidate.pop("umma_num_dequant_warpgroups", None)
         candidate = cls._select_dequant_warpgroups(layer_config, shape_m, candidate)
@@ -798,7 +798,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
         if not is_short_reduction or not has_persistent_work:
             return config
 
-        output_chunk_rows = 32
+        output_chunk_rows = 32 if block_m > 32 else 0
         if not cls._fits_resources(
             layer_config,
             config["block_shape"],
@@ -870,7 +870,7 @@ class Sm100UmmaHeuristics(DeviceHeuristics):
                         for block_m in range(8 * cta_group_size, max_block_m + 1, 8 * cta_group_size):
                             use_chunks = use_output_chunks and layer_config.a_dtype.num_bits == 16
                             use_chunks |= layer_config.use_raw_weight
-                            use_chunks &= block_m > 32 or cta_group_size == 2
+                            use_chunks &= block_m > 32
                             output_chunk_rows = 32 if use_chunks else 0
                             shape = (block_m, block_n, block_k)
                             can_split_loads = use_deep_pipeline and cta_group_size == 2 and block_m >= 64

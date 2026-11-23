@@ -16,6 +16,7 @@ struct KernelParams {
   const void *bias;
   const void *c;
   const void *bs2;
+  void *output_scales;
   const uint32_t *sorted_ids_ptr;
   const uint32_t *expert_ids_ptr;
   const uint32_t *num_tokens_padded_ptr;
@@ -42,6 +43,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   using LayerConfig = LayerConfig_;
   using ComputeConfig = ComputeConfig_;
   using TuningConfig = TuningConfig_;
+  static_assert(!(LayerConfig::kHasFusedOutput && TuningConfig::kUseStreamK), "Fused output requires non-Stream-K scheduling");
   using MmaShape = typename MmaOpClass::MmaShape;
 
   using SharedStorage = ::SharedStorage<
@@ -186,12 +188,16 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
                                                  Base::kMultiCastSizeA == 1 && Base::kMultiCastSizeB == 1;
   static constexpr uint32_t kLoadThreadOffset = 0;
   static constexpr uint32_t kNumLoadThreads = TuningConfig::kNumLoadThreads;
-  static constexpr uint32_t kNumMathThreads = 128;
+  static constexpr uint32_t kNumMathThreads = TuningConfig::kNumMathThreads;
+  static constexpr uint32_t kDequantThreadEnd = 256 + (Base::kUseUmmaSs ? 0 : 128 * TuningConfig::kUmmaNumDequantWarpgroups);
   uint32_t math_group = 0;
 
-  CUDA_INLINE uint32_t math_thread_id() { return threadIdx.x % 128; }
+  CUDA_INLINE uint32_t math_thread_id() {
+    if constexpr (kNumMathThreads == 128) return threadIdx.x % 128;
+    else return threadIdx.x < kDequantThreadEnd ? threadIdx.x % 128 : 128 + threadIdx.x - kDequantThreadEnd;
+  }
   CUDA_INLINE uint32_t load_thread_id() { return threadIdx.x; }
-  CUDA_INLINE uint32_t warp_id() { return math_group * 4 + math_thread_id() / 32; }
+  CUDA_INLINE uint32_t warp_id() { return math_group * 4 + (math_thread_id() % 128) / 32; }
   CUDA_INLINE uint32_t m_warp_id() { return 0; }
   CUDA_INLINE uint32_t n_warp_id() { return warp_id() % Base::N_WARPS; }
   CUDA_INLINE uint32_t k_warp_id() { return 0; }
@@ -199,15 +205,29 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
   CUDA_INLINE uint32_t n_warp_offset() { return n_warp_id() * WarpShape::N; }
   CUDA_INLINE uint32_t k_warp_offset() { return 0; }
   CUDA_INLINE bool is_load_thread() { return threadIdx.x < kNumLoadThreads; }
-  CUDA_INLINE bool is_math_thread() { return threadIdx.x >= 128 && threadIdx.x < 256; }
+  CUDA_INLINE bool is_math_thread() {
+    if constexpr (kNumMathThreads == 128) return threadIdx.x >= 128 && threadIdx.x < 256;
+    else return (threadIdx.x >= 128 && threadIdx.x < 256) || threadIdx.x >= kDequantThreadEnd;
+  }
 
-  CUDA_INLINE bool is_dequant_thread() { return threadIdx.x >= 256; }
+  CUDA_INLINE bool is_dequant_thread() {
+    if constexpr (kNumMathThreads == 128) return threadIdx.x >= 256;
+    else return threadIdx.x >= 256 && threadIdx.x < kDequantThreadEnd;
+  }
   CUDA_INLINE uint32_t dequant_group_id() { return (threadIdx.x - 256) / 128; }
 
   CUDA_INLINE bool is_issuer_thread() { return threadIdx.x >= kNumLoadThreads && threadIdx.x < kNumLoadThreads + 32; }
 
   CUDA_INLINE static void sync_math_threads() {
-    if constexpr (TuningConfig::kNumCtasPerSm > 2) {
+    if constexpr (kNumMathThreads == 256) {
+      if ((threadIdx.x >= 128 && threadIdx.x < 256) || threadIdx.x >= kDequantThreadEnd) {
+        sync_part_threads<256, Base::kNumThreads, 1>();
+      } else if (threadIdx.x < 384) {
+        sync_part_threads<128, Base::kNumThreads, 3>();
+      } else {
+        sync_part_threads<128, Base::kNumThreads, 4>();
+      }
+    } else if constexpr (TuningConfig::kNumCtasPerSm > 2) {
       // A dynamic barrier ID reserves all named barriers, limiting residency to two CTAs.
       if (threadIdx.x < 256) sync_part_threads<128, Base::kNumThreads, 1>();
       else if (threadIdx.x < 384) sync_part_threads<128, Base::kNumThreads, 3>();

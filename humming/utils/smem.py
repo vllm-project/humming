@@ -126,6 +126,7 @@ def estimate_smem_size_layer(
     use_tma: bool = False,
     use_warp_spec: bool = False,
     use_tma_c: bool = False,
+    use_stream_k: bool = True,
     raster_group_m: int = 1,
     mma_accum_bits: int = 32,
     mma_type: MmaType | str = MmaType.MMA,
@@ -143,6 +144,8 @@ def estimate_smem_size_layer(
     if mma_type == MmaType.UMMA:
         use_warp_spec = True
     block_m, block_n, block_k = block_shape
+    if mma_type == MmaType.UMMA and output_chunk_rows >= block_m:
+        output_chunk_rows = 0
     is_mxmma = layer_config.use_block_scaled_mma
     is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
     scale_block_m = block_m + (4 if is_grouped else 0)
@@ -275,6 +278,7 @@ def estimate_smem_size_config(
         use_tma=bool(tuning_config.use_tma),
         use_warp_spec=bool(tuning_config.use_warp_spec),
         use_tma_c=bool(tuning_config.use_tma_c),
+        use_stream_k=tuning_config.use_stream_k,
         raster_group_m=tuning_config.raster_group_m,
         mma_accum_bits=16 if compute_config.use_f16_accum else 32,
         umma_cta_group_size=tuning_config.umma_cta_group_size,

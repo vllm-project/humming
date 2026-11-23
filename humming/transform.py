@@ -4,7 +4,7 @@ import warnings
 import torch
 
 from humming import dtypes, ops
-from humming.config import LayerConfig, WeightScale2Type, WeightScaleType
+from humming.config import ActivationType, LayerConfig, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo, current_device
 from humming.schema import HummingInputSchema, HummingWeightSchema
 from humming.utils.math import round_up
@@ -63,6 +63,9 @@ def prepare_layer_config(
     device: int | torch.device | None = None,
     tensors: dict[str, torch.Tensor] | None = None,
     allow_inplace: bool = False,
+    activation_func_type: ActivationType | str = ActivationType.None_,
+    activation_func_impl: str | None = None,
+    requantize_output: bool = False,
 ) -> LayerConfig:
     info = DeviceInfo(device)
     sm_version = info.sm_version
@@ -122,6 +125,9 @@ def prepare_layer_config(
         pad_shape_k=pad_shape_k,
         num_experts=num_experts or 0,
         has_bias=has_bias,
+        activation_func_type=activation_func_type,
+        activation_func_impl=activation_func_impl,
+        requantize_output=requantize_output,
         input_scale_group_size=input_schema.input_scale_group_size,
         weight_scale_group_size=get_kernel_weight_scale_group_size(weight_schema, input_schema, a_dtype),
         weight_scale_group_size_n=weight_schema.weight_scale_group_size_n,
@@ -180,6 +186,9 @@ def prepare_and_transform_humming_tensors(
     torch_dtype: torch.dtype | None = None,
     device: int | torch.device | None = None,
     allow_inplace: bool = False,
+    activation_func_type: ActivationType | str = ActivationType.None_,
+    activation_func_impl: str | None = None,
+    requantize_output: bool = False,
 ) -> tuple[LayerConfig, dict[str, torch.Tensor]]:
     tensors = tensors.copy()
     config = prepare_layer_config(
@@ -195,6 +204,9 @@ def prepare_and_transform_humming_tensors(
         device=device,
         tensors=tensors,
         allow_inplace=allow_inplace,
+        activation_func_type=activation_func_type,
+        activation_func_impl=activation_func_impl,
+        requantize_output=requantize_output,
     )
     return config, transform_humming_tensors(config, tensors, allow_inplace=allow_inplace)
 
@@ -691,6 +703,43 @@ def transform_humming_bias(bias: torch.Tensor) -> torch.Tensor:
     return transform_humming_weight_scale(bias.unsqueeze(-1), True).squeeze(-2)
 
 
+def interleave_glu_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Convert logical [gate, up] channels before backend-specific packing."""
+    if config.activation_func_type != ActivationType.BinarySplit:
+        return tensors
+    tensors = tensors.copy()
+    channels = config.shape_n - config.pad_shape_n
+    half = channels // 2
+    device = tensors["weight"].device
+    pairs = torch.stack((torch.arange(half, device=device), torch.arange(half, device=device) + half), -1)
+
+    def reorder(tensor: torch.Tensor, axis: int) -> torch.Tensor:
+        padding = torch.arange(channels, tensor.shape[axis], device=device)
+        indices = torch.cat((pairs.flatten(), padding))
+        # Index the storage bytes: not all torch versions implement FP8 index_select.
+        if tensor.element_size() == 1:
+            return tensor.view(torch.uint8).index_select(axis, indices).view(tensor.dtype)
+        return tensor.index_select(axis, indices)
+
+    tensors["weight"] = reorder(tensors["weight"], -2)
+    if not config.is_tensor_weight_scale:
+        tensors["weight_scale"] = reorder(tensors["weight_scale"], -2)
+    if config.has_bias:
+        tensors["bias"] = reorder(tensors["bias"], -1)
+    if config.is_channel_weight_scale_2:
+        tensors["weight_scale_2"] = reorder(tensors["weight_scale_2"], -1)
+    if config.has_zero_point:
+        zero_point = tensors["zero_point"]
+        if config.is_fp_zero_point:
+            tensors["zero_point"] = reorder(zero_point, -2)
+        else:
+            unpacked = ops.unpack_weight(zero_point.transpose(-1, -2).contiguous(), config.b_dtype.num_bits)
+            unpacked = reorder(unpacked, -1)
+            packed_zero_point = ops.pack_weight(unpacked, config.b_dtype.num_bits)
+            tensors["zero_point"] = packed_zero_point.transpose(-1, -2).contiguous()
+    return tensors
+
+
 def transform_humming_tensors(
     config: LayerConfig,
     tensors: dict[str, torch.Tensor],
@@ -702,6 +751,7 @@ def transform_humming_tensors(
     else:
         tensors = tensors.copy()
 
+    tensors = interleave_glu_tensors(config, tensors)
     weight = tensors["weight"]
     weight_words = config.weight_shape_k * config.b_dtype.num_bits // 32
     weight = weight[..., : config.weight_shape_n, :weight_words].contiguous()

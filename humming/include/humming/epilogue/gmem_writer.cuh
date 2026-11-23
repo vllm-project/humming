@@ -1,5 +1,6 @@
 #pragma once
 
+#include <humming/kernel/process_input/quantization.cuh>
 #include <humming/utils/all.cuh>
 
 
@@ -37,6 +38,7 @@ private:
   using WarpShape = typename Ctx::WarpShape;
   using PadShape = typename Ctx::PadShape;
   using ElementC = typename Ctx::ElementC;
+  static constexpr bool kIsBinaryActivation = Ctx::kActivationFuncType == ActivationType::BinaryInterleaved;
 
   static constexpr bool kUseStreamK = Ctx::kUseStreamK;
   static constexpr bool kUseTmaC = Ctx::kUseTmaC;
@@ -102,13 +104,12 @@ public:
   CUDA_INLINE
   EpilogueGmemWriter(Ctx &ctx, ArithClass &arith) : ctx(ctx), arith(arith) {
     const void *ptr = ctx.params.c;
+    if constexpr (!kUseTmaC) gmem_ptr_raw = reinterpret_cast<int4 *>(const_cast<void *>(ptr));
     if constexpr (kUseTmaC) {
       tensor_map_ptr = reinterpret_cast<const CUtensorMap *>(ptr);
       if constexpr (SharedStorage::kUseDynamicOutputMap) {
         if (ctx.math_thread_id() == 0) ctx.smem.tensor_map_buffer[0] = tensor_map_ptr[0];
       }
-    } else {
-      gmem_ptr_raw = reinterpret_cast<int4 *>(const_cast<void *>(ptr));
     }
 
     output_shape_m = ctx.params.shape_m * (kIsIndexedGemm ? ctx.params.top_k : 1);
@@ -126,10 +127,11 @@ public:
         write_legacy<WarpShape::M, kWarpgroupColumns, kOutputRows, 128>(
             slice_id, slice_count, first_row + first_partition_row, first_column, first_partition_row * 8);
       }
-    } else if constexpr (kUseTmaC) {
-      write_tma(slice_id, slice_count);
     } else {
-      write_legacy(slice_id, slice_count, first_row);
+      write_chunk(slice_id, slice_count, first_row, BlockShape::M, 0);
+      if constexpr (kUseTmaC && kUseStreamK) {
+        if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
+      }
     }
   };
 
@@ -242,13 +244,33 @@ public:
     tma_commit_store_group();
   }
 
-  CUDA_INLINE
-  void write_tma(uint32_t slice_id, uint32_t slice_count) {
-    static_assert(!kIsIndexedGemm);
-    write_chunk(slice_id, slice_count, 0, BlockShape::M, 0);
-    if constexpr (kUseStreamK) {
-      if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
+  static constexpr uint32_t kOutputWidth = (ProblemShape::N - PadShape::N) / (kIsBinaryActivation ? 2 : 1);
+
+  template <uint32_t kBytes>
+  CUDA_INLINE void store_output_packed(uint64_t row, uint32_t column, const uint8_t *values) {
+    uint64_t byte = (row * kOutputWidth + column) * Ctx::kOutputBits / 8;
+    store_packed<kBytes>(reinterpret_cast<uint8_t *>(gmem_ptr_raw) + byte, values, false);
+  }
+
+  template <uint32_t kColumns>
+  CUDA_INLINE void write_packed_tile(uint32_t first_row, uint32_t buffer_offset, uint32_t first_column) {
+    static_assert(kUseTmaC);
+    constexpr uint32_t kDivisor = kIsBinaryActivation ? 2 : 1;
+    constexpr uint32_t kBits = Ctx::kOutputBits;
+    constexpr uint32_t kStoreBytes = SharedStorage::kOutputTileColumns / kDivisor * kBits / 8;
+    auto output_smem = reinterpret_cast<uint8_t *>(ctx.smem.reduce + buffer_offset);
+    tma_fence_async_shared();
+    ctx.sync_math_threads();
+    if (ctx.math_thread_id() == 0) {
+      PRAGMA_UNROLL
+      for (uint32_t slab = 0; slab < kColumns / kDivisor * kBits / 8 / kStoreBytes; slab++) {
+        uint32_t column_bytes = (col_offset + first_column) / kDivisor * kBits / 8 + slab * kStoreBytes;
+        tma_store_2d(output_smem + slab * kOutputRows * kStoreBytes, tensor_map_ptr, column_bytes, row_offset + first_row);
+      }
+      tma_commit_store_group();
+      tma_wait_store_group<0>();
     }
+    ctx.sync_math_threads();
   }
 
   CUDA_INLINE

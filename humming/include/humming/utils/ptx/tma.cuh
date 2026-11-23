@@ -344,6 +344,15 @@ CUDA_INLINE void tma_wait_store_group() {
   }
 };
 
+
+CUDA_INLINE void tensor_map_replace_global_address(void *smem_desc_ptr, const void *address) {
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_desc_ptr);
+  asm volatile("tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;\n"
+               :
+               : "r"(smem_int_ptr), "l"(address)
+               : "memory");
+}
+
 template <uint32_t ord>
 CUDA_INLINE void tensor_map_replace_global_dim(void *smem_desc_ptr, uint32_t value) {
   uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_desc_ptr);

@@ -424,6 +424,13 @@ def _get_tile_rejection_reasons(
     schedule: ScheduleCandidate,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
+    layer = problem.layer_config
+    if layer.requantize_output:
+        minimum_n = layer.input_scale_group_size
+        if layer.activation_func_type.is_binary:
+            minimum_n *= 2
+        if schedule.block_shape[1] < minimum_n:
+            reasons.append("block_n must cover a complete output quantization group")
     for scale_name, group_size in (
         ("input scale group", problem.layer_config.input_scale_group_size),
         ("weight scale group", problem.layer_config.weight_scale_group_size),

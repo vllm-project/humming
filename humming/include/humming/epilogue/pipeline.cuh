@@ -21,6 +21,7 @@ private:
   static constexpr bool kIsGroupedGemm = Ctx::kIsGroupedGemm;
   static constexpr bool kHasTensorInputScale = Ctx::kIsTensorInputScale || Ctx::kIsTensorInputScale2;
   static constexpr uint32_t kOutputRows = SharedStorage::kOutputRows;
+  static constexpr bool kPackOutput = Ctx::kRequantizeOutput || Ctx::kActivationFuncType == ActivationType::BinaryInterleaved;
   static constexpr uint32_t kNumStreamKSyncThreads = GmemWriter::kUseWarpgroupEpilogue ? 128 : Ctx::kNumMathThreads;
 
   CUDA_INLINE uint32_t get_output_barrier_id() {
@@ -77,13 +78,13 @@ public:
     if (slice_count > 1) acquire_gmem_barrier();
     PRAGMA_UNROLL
     for (uint32_t first_row = 0; first_row < BlockShape::M; first_row += kOutputRows) {
-      smem_writer.write(regs_c_ptr, slice_count, first_row);
+      smem_writer.write(regs_c_ptr, first_row);
       if constexpr (Ctx::kUseTmaC) {
         if (ctx.is_math_thread()) tma_fence_async_shared();
       }
       sync_output_threads();
-      if constexpr (Ctx::kOutputChunkRows) {
-        gmem_writer.write_chunk(slice_id, slice_count, first_row, MIN(kOutputRows, BlockShape::M - first_row), 0);
+      if constexpr (Ctx::kOutputChunkRows || kPackOutput) {
+        write_output_chunk<BlockShape::N>(first_row, MIN(kOutputRows, BlockShape::M - first_row), 0);
         // This path reuses one buffer. Wait before the next chunk overwrites it.
         if constexpr (Ctx::kUseTmaC) tma_wait_store_group<0, true>();
       } else {
@@ -103,6 +104,16 @@ public:
     if constexpr (GmemWriter::kUseWarpgroupEpilogue &&
                   (BlockShape::K > WarpShape::K || Ctx::kIsIndexedGemm || Ctx::kSmemReuseMode != SmemReuseMode::NONE || (Ctx::kUseTmaC && !Ctx::kUseWarpSpec)))
       ctx.sync_math_threads();
+  }
+
+  template <uint32_t kColumns = BlockShape::N>
+  CUDA_INLINE void write_output_chunk(uint32_t first_row, uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
+    if constexpr (kPackOutput) {
+      smem_writer.template prepare_output<kColumns>(gmem_writer, first_row, rows, buffer_offset, first_column);
+      if constexpr (Ctx::kUseTmaC) gmem_writer.template write_packed_tile<kColumns>(first_row, buffer_offset, first_column);
+    } else {
+      gmem_writer.template write_chunk<kColumns>(slice_id, slice_count, first_row, rows, buffer_offset, first_column);
+    }
   }
 
   CUDA_INLINE
@@ -125,6 +136,7 @@ public:
       if (ctx.k_warp_id() != 0) return;
     }
     const uint32_t thread_id = GmemWriter::kUseWarpgroupEpilogue ? ctx.math_thread_id() % 128 : ctx.math_thread_id();
+
     if (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3)) {
       int32_t val = slice_id == 0 ? 1 - static_cast<int32_t>(slice_count) : 0;
       barrier_release2<kNumStreamKSyncThreads, Ctx::kNumThreads>(&locks[locks_offset], val, thread_id, get_output_barrier_id());

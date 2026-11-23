@@ -383,8 +383,9 @@ def unpack_group_scales(
     if use_m_major_input_scale:
         group_scales = group_scales.T.contiguous()
     group_scale_dtype = dtypes.DataType.from_any(group_scale_dtype)
-    group_scales = group_scales.view(dtypes.torch_dtype_map[group_scale_dtype])
-    return group_scales[:num_rows, :num_groups]
+    scale_rows = group_scales.shape[0]
+    group_scales = group_scales.reshape(-1).view(dtypes.torch_dtype_map[group_scale_dtype])
+    return group_scales.reshape(scale_rows, -1)[:num_rows, :num_groups]
 
 
 def assert_process_input_close(
