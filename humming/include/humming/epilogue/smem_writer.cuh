@@ -115,7 +115,7 @@ public:
   }
 
   CUDA_INLINE
-  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t first_row) {
+  void write(uint32_t *regs_ptr, uint32_t first_row) {
     if (ctx.k_warp_id() != 0) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
@@ -173,7 +173,7 @@ public:
         arith.may_apply_on_smem_write(val_uint, row_8x8block, col_8x8block);
       }
 
-      apply_output_activation(val_uint, slice_count);
+      apply_output_activation(val_uint);
 
       if constexpr (!kUseWgmma) {
         uint32_t sub_row = laneid / 4;
@@ -303,7 +303,7 @@ public:
           values[3] = convert_umma_pair(upper[group * 4 + 1], upper[group * 4 + 3], m * 4 + group + row_group_offset, 3);
         }
         if constexpr (kApplyUmmaActivationInRegisters)
-          apply_umma_register_output_arithmetic(values, m * 4 + group + row_group_offset, slice_count);
+          apply_umma_register_output_arithmetic(values, m * 4 + group + row_group_offset);
         uint32_t row = local_row + row_in_matrix;
         uint32_t swizzled_column = ((column % 64 / 8) ^ ((row + smem_base) % 8)) * 8;
         uint32_t output_offset = buffer_offset + (row + kStorageRows * (column / 64)) * 64 + swizzled_column;
@@ -338,9 +338,8 @@ public:
   }
 
 private:
-  CUDA_INLINE void apply_output_activation(uint32_t &value, uint32_t slice_count) {
+  CUDA_INLINE void apply_output_activation(uint32_t &value) {
     if constexpr (Ctx::kHasFusedOutput && !Ctx::kRequantizeOutput) {
-      if (slice_count != 1) return;
       using Activation = typename Ctx::LayerConfig::ActivationFunc;
       auto pair = this->num22float2(*reinterpret_cast<scalar_t2 *>(&value));
       if constexpr (kIsBinaryActivation) pair = {Activation::apply(pair.x, pair.y), 0.f};
@@ -366,10 +365,7 @@ private:
     return *reinterpret_cast<uint32_t *>(&packed);
   }
 
-  CUDA_INLINE void apply_umma_register_output_arithmetic(uint32_t (&values)[4], uint32_t row_group, uint32_t slice_count) {
-    if constexpr (!ArithClass::kNeedsPackedOutputTransform) {
-      if (slice_count != 1) return;
-    }
+  CUDA_INLINE void apply_umma_register_output_arithmetic(uint32_t (&values)[4], uint32_t row_group) {
     if constexpr (!ArithClass::kNeedsPackedOutputTransform && kIsBinaryActivation) {
       // Adjacent N channels occupy lanes separated by four. Each lane computes
       // one of the pair's M rows so GLU uses the whole warp, then repacks the
@@ -383,7 +379,7 @@ private:
         uint32_t gate = is_gate_lane ? value : neighbor;
         uint32_t up = is_gate_lane ? neighbor : value;
         uint32_t adjacent = ((gate >> shift) & 0xffffu) | ((up >> shift) << 16);
-        apply_output_activation(adjacent, slice_count);
+        apply_output_activation(adjacent);
         uint32_t other_row = __shfl_xor_sync(0xffffffff, adjacent, 4);
         values[pair] = is_gate_lane ? (adjacent & 0xffffu) | (other_row << 16) : 0;
       }
@@ -412,7 +408,7 @@ private:
       }
       if constexpr (ArithClass::kNeedsPackedOutputTransform)
         arith.may_apply_on_smem_write(value, row_group, pair);
-      apply_output_activation(value, slice_count);
+      apply_output_activation(value);
       if constexpr (kNeedsRowLayout) {
         // Restore the fragment distribution expected by the existing store.
         uint32_t first = __shfl_sync(0xffffffff, value, first_row * 4 + lane / 8);

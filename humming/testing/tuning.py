@@ -335,6 +335,8 @@ def _generate_scheduling_candidates(
                     continue
         if mma_type == MmaType.WGMMA and signature["num_stages"] < 3:
             continue
+        if layer_config.has_fused_output and signature["use_stream_k"]:
+            continue
         if compute_config.use_batch_invariant and signature["use_stream_k"]:
             continue
         if mma_type == MmaType.MXMMA and layer_config.has_zero_point and signature["use_stream_k"]:
@@ -458,6 +460,8 @@ def _try_combine_candidate(
     if mma_type == MmaType.WGMMA and config["num_stages"] < 3:
         return None
     if layer_config.shape_n % (block_shape[1] * config["multi_cast_size_a"]):
+        return None
+    if layer_config.has_fused_output and config["use_stream_k"]:
         return None
     if compute_config.use_batch_invariant and (config["use_stream_k"] or block_shape[2] != warp_shape[2]):
         return None

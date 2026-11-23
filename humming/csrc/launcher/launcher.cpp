@@ -184,14 +184,6 @@ Tensor launch_kernel_impl(
   void *locks_ptr = locks_.has_value() ? locks_->data_ptr() : nullptr;
   void *tensor_map_buffer_ptr = tensor_map_buffer.data_ptr();
   void *output_scales_ptr = output_scales.has_value() ? output_scales->data_ptr() : nullptr;
-  uint64_t workspace_elements = 0;
-  if (kernel_data.has_fused_output && kernel_data.use_stream_k) {
-    const uint32_t cluster = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b * kernel_data.umma_cta_group_size;
-    const uint64_t slots = (num_ctas / cluster + (num_ctas / cluster) / 10) * cluster;
-    workspace_elements = slots * kernel_data.block_shape_m * kernel_data.block_shape_n;
-  }
-  Tensor output_workspace = torch_empty({static_cast<int64_t>(workspace_elements)}, dtype_id_to_tensor_dtype(kernel_data.c_dtype_id), a.device());
-  void *output_workspace_ptr = output_workspace.data_ptr();
 
   auto tensor_map_a = make_tma_desc_a(a, kernel_data);
   auto tensor_map_as = make_tma_desc_as(as_, kernel_data);
@@ -230,7 +222,6 @@ Tensor launch_kernel_impl(
       &expert_layout_ptr,
       &tensor_map_buffer_ptr,
       &locks_ptr,
-      &output_workspace_ptr,
       &shape_m_u32,
       &top_k_u32,
       &use_int64_expert_layout};

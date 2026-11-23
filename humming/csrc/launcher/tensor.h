@@ -27,7 +27,6 @@ inline Tensor make_tensor_map_buffer(const Tensor &a, KernelData &kernel_data, u
     size = 32; // 32 int32 = 128 bytes
   }
 
-  if (kernel_data.use_tma_c && kernel_data.use_stream_k && kernel_data.has_fused_output) size = 64;
   return torch_empty({size * num_ctas}, ScalarType::Int, a.device());
 }
 
@@ -474,7 +473,7 @@ inline CUtensorMap make_tma_desc_c(Tensor tensor, KernelData &kernel_data) {
   tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
   const uint32_t rows = kernel_data.output_tile_rows;
   const bool is_binary = is_binary_activation(kernel_data.activation_func_type);
-  if (kernel_data.requantize_output || is_binary || (kernel_data.has_fused_output && kernel_data.use_stream_k)) {
+  if (kernel_data.requantize_output || is_binary) {
     const uint32_t bits = get_dtype_num_bits(kernel_data.output_dtype_id);
     const uint32_t row_bytes = (kernel_data.problem_shape_n - kernel_data.pad_shape_n) / (is_binary ? 2 : 1) * bits / 8;
     const uint32_t tile_bytes = kernel_data.output_tile_columns / (is_binary ? 2 : 1) * bits / 8;

@@ -135,6 +135,8 @@ def _get_heuristics_config(
             gemm_type=gemm_type,
             use_m_major_input_scale=use_m_major_input_scale,
         )
+        if layer_config.has_fused_output:
+            config["use_stream_k"] = False
         config.setdefault("mma_type", get_default_mma_type(layer_config).value)
         _apply_input_scale_tma(config, use_m_major_input_scale, layer_config, gemm_type)
         _disable_indexed_input_scale_tma(config, gemm_type)
@@ -149,6 +151,8 @@ def _get_heuristics_config(
             use_m_major_input_scale=use_m_major_input_scale,
         )
         for entry in configs:
+            if layer_config.has_fused_output:
+                entry[2]["use_stream_k"] = False
             entry[2].setdefault("mma_type", get_default_mma_type(layer_config).value)
             _apply_input_scale_tma(entry[2], use_m_major_input_scale, layer_config, gemm_type)
             _disable_indexed_input_scale_tma(entry[2], gemm_type)

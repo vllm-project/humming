@@ -227,8 +227,7 @@ def estimate_smem_size_layer(
         row_index_buffers = 4 if use_warp_spec else 2
         add(block_m * 4 * row_index_buffers, 4)
     is_grouped = gemm_type in (GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED)
-    needs_workspace_map = layer_config.has_fused_output and use_stream_k and use_tma_c
-    if is_grouped or (use_tma_c and block_m % output_rows != 0) or needs_workspace_map:
+    if is_grouped or (use_tma_c and block_m % output_rows != 0):
         add(128, 64)  # tensor_map_buffer[1] (CUtensorMap)
     if is_grouped:
         add(layer_config.num_experts * 4, 4)  # expert_tokens

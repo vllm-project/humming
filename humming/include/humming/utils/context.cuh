@@ -23,7 +23,6 @@ struct KernelParams {
   const uint32_t *expert_layout_ptr;
   CUtensorMap *tensor_map_buffer;
   int32_t *locks;
-  void *output_workspace;
 };
 
 template <
@@ -44,6 +43,7 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   using LayerConfig = LayerConfig_;
   using ComputeConfig = ComputeConfig_;
   using TuningConfig = TuningConfig_;
+  static_assert(!(LayerConfig::kHasFusedOutput && TuningConfig::kUseStreamK), "Fused output requires non-Stream-K scheduling");
   using MmaShape = typename MmaOpClass::MmaShape;
 
   using SharedStorage = ::SharedStorage<

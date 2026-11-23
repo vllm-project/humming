@@ -161,8 +161,7 @@ public:
   static constexpr uint32_t kOutputTileRows = kUseWarpgroupOutput ? WarpShape::M : kOutputRows;
   static constexpr uint32_t kWarpgroupStoreColumns = M_WARPS == 1 ? WarpShape::N * 4 : 64;
   static constexpr bool kIsBinaryActivation = LayerConfig::kActivationFuncType == ActivationType::BinaryInterleaved;
-  static constexpr bool kUseWorkspaceTma = LayerConfig::kHasFusedOutput && TuningConfig::kUseStreamK && TuningConfig::kUseTmaC;
-  static constexpr bool kUse64ColumnOutputTiles = LayerConfig::kRequantizeOutput || kIsBinaryActivation || kUseWorkspaceTma;
+  static constexpr bool kUse64ColumnOutputTiles = LayerConfig::kRequantizeOutput || kIsBinaryActivation;
   static constexpr uint32_t kDefaultOutputColumns = TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 128 : BlockShape::N;
   static constexpr uint32_t kOutputTileColumns = kUse64ColumnOutputTiles ? 64 : (kUseWarpgroupOutput ? kWarpgroupStoreColumns : kDefaultOutputColumns);
   static constexpr bool kUseDynamicOutputMap = TuningConfig::kUseTmaC && (kIsGroupedGemm || BlockShape::M % kOutputRows != 0);

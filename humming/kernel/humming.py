@@ -159,6 +159,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         if self.use_umma_pipeline:
             self.use_warp_spec = True
         TuningConfig.__post_init__(self)
+        assert not (self.has_fused_output and self.use_stream_k), "fused output requires use_stream_k=False"
         if self.use_umma_pipeline:
             if self.output_chunk_rows >= self.block_shape[0]:
                 self.output_chunk_rows = 0
