@@ -1,6 +1,5 @@
 #pragma once
 
-#include <humming/kernel/process_input/activation.cuh>
 #include <humming/kernel/process_input/quantization.cuh>
 #include <humming/utils/all.cuh>
 
@@ -211,10 +210,6 @@ public:
   CUDA_INLINE void write_chunk(uint32_t slice_id, uint32_t slice_count, uint32_t first_row,
       uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
     constexpr uint32_t kRows = kOutputRows;
-    if constexpr (Ctx::kRequantizeOutput || kIsBinaryActivation) {
-      write_fused<kColumns>(first_row, rows, buffer_offset, first_column);
-      return;
-    }
     if constexpr (kUseTmaC) {
       if constexpr (kUseTma3d) {
         if (ctx.math_thread_id() == 0) {
@@ -251,141 +246,31 @@ public:
 
   static constexpr uint32_t kOutputWidth = (ProblemShape::N - PadShape::N) / (kIsBinaryActivation ? 2 : 1);
 
+  template <uint32_t kBytes>
+  CUDA_INLINE void store_output_packed(uint64_t row, uint32_t column, const uint8_t *values) {
+    uint64_t byte = (row * kOutputWidth + column) * Ctx::kOutputBits / 8;
+    store_packed<kBytes>(reinterpret_cast<uint8_t *>(gmem_ptr_raw) + byte, values, false);
+  }
+
   template <uint32_t kColumns>
-  CUDA_INLINE void write_fused(uint32_t first_row, uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
-    using Activation = typename Ctx::LayerConfig::ActivationFunc;
-    using OutputType = typename Ctx::LayerConfig::OutputType;
-    using ScaleType = typename Ctx::LayerConfig::OutputScaleType;
-    constexpr uint32_t kDivisor = (kIsBinaryActivation ? 2 : 1);
-    constexpr uint32_t kColumnsOut = kColumns / kDivisor;
-    constexpr uint32_t kValues = []() {
-      if constexpr (Ctx::kRequantizeOutput) {
-        // Smaller vectors keep math threads active for narrow output tiles.
-        if constexpr (Ctx::kUseMxmma && !kUseTmaC && Ctx::kInputScaleGroupSize <= 128 && kOutputRows * kColumnsOut < kNumMathThreads * 8) return 4u;
-        return kOutputRows * kColumnsOut < kNumMathThreads * 16 ? 8u : 16u;
-      }
-      if constexpr (!kUseTmaC && kOutputWidth % 8 == 0) return 8u;
-      return 2u;
-    }();
+  CUDA_INLINE void write_packed_tile(uint32_t first_row, uint32_t buffer_offset, uint32_t first_column) {
+    static_assert(kUseTmaC);
+    constexpr uint32_t kDivisor = kIsBinaryActivation ? 2 : 1;
     constexpr uint32_t kBits = Ctx::kOutputBits;
-    constexpr uint32_t kRowBytes = kOutputWidth * kBits / 8;
     constexpr uint32_t kStoreBytes = SharedStorage::kOutputTileColumns / kDivisor * kBits / 8;
-    constexpr uint32_t kGroupSize = Ctx::kInputScaleGroupSize;
-    uint32_t thread = ctx.math_thread_id();
-    uint32_t smem_base = offsetof(SharedStorage, reduce) / 128 % 8;
-    // Callers have already synchronized the shared output. Only TMA needs another
-    // barrier after each issuing thread drains its previous stores.
-    if constexpr (kUseTmaC) {
-      tma_wait_store_group<0, true>();
-      ctx.sync_math_threads();
-    }
-    constexpr uint32_t kIterations = CEIL_DIV(kOutputRows * kColumnsOut, kNumMathThreads * kValues);
-    scalar_t staged[kUseTmaC ? kIterations * kValues * kDivisor : 1];
-    if constexpr (kUseTmaC) {
-      // Preserve this chunk before changing its layout in place for TMA.
-      PRAGMA_UNROLL
-      for (uint32_t iter = 0; iter < kIterations; iter++) {
-        uint32_t index = (thread + iter * kNumMathThreads) * kValues;
-        if (index >= kOutputRows * kColumnsOut) continue;
-        uint32_t row = index / kColumnsOut;
-        uint32_t column = index % kColumnsOut;
-        PRAGMA_UNROLL
-        for (uint32_t item = 0; item < kValues * kDivisor; item++) {
-          uint32_t source_col = first_column + column * kDivisor + item;
-          uint32_t source_row = source_col / 64 * kOutputRows + row;
-          uint32_t word = (source_col % 64 / 8) ^ ((source_row + smem_base) % 8);
-          uint32_t offset = (buffer_offset + source_row * 8 + word) * 8 + source_col % 8;
-          staged[iter * kValues * kDivisor + item] = reinterpret_cast<const scalar_t *>(ctx.smem.reduce)[offset];
-        }
-      }
-      ctx.sync_math_threads();
-    }
     auto output_smem = reinterpret_cast<uint8_t *>(ctx.smem.reduce + buffer_offset);
-    constexpr uint32_t kOutputUnroll = kUseTmaC ? kIterations : 1;
-    PRAGMA_UNROLL_COUNT(kOutputUnroll)
-    for (uint32_t index = thread * kValues; index < kOutputRows * kColumnsOut; index += kNumMathThreads * kValues) {
-      uint32_t row = index / kColumnsOut;
-      uint32_t column = index % kColumnsOut;
-      uint32_t output_row = first_row + row;
-      if constexpr (kIsIndexedGemm) output_row = get_output_row_index(output_row);
-      else output_row += row_offset;
-      uint32_t output_column = (col_offset + first_column) / kDivisor + column;
-      bool valid = row < rows && output_row < output_shape_m && output_column < kOutputWidth;
-      float values[kValues] = {};
-      float source_values[!kUseTmaC ? kValues * kDivisor : 1] = {};
-      if constexpr (!kUseTmaC) {
-        constexpr uint32_t kLoadValues = MIN(8u, kValues * kDivisor);
-        PRAGMA_UNROLL
-        for (uint32_t item = 0; item < kValues * kDivisor; item += kLoadValues) {
-          uint32_t source_col = first_column + column * kDivisor + item;
-          uint32_t source_row = source_col / 64 * kOutputRows + row;
-          uint32_t word = (source_col % 64 / 8) ^ ((source_row + smem_base) % 8);
-          uint32_t offset = (buffer_offset + source_row * 8 + word) * 8 + source_col % 8;
-          auto source = reinterpret_cast<const scalar_t *>(ctx.smem.reduce) + offset;
-          load_values<scalar_t, kLoadValues>(source_values + item, source);
-        }
-      }
+    tma_fence_async_shared();
+    ctx.sync_math_threads();
+    if (ctx.math_thread_id() == 0) {
       PRAGMA_UNROLL
-      for (uint32_t item = 0; item < kValues; item++) {
-        float pair[kDivisor];
-        PRAGMA_UNROLL
-        for (uint32_t part = 0; part < kDivisor; part++) {
-          if constexpr (!kUseTmaC) {
-            pair[part] = source_values[item * kDivisor + part];
-          } else {
-            scalar_t value = staged[index / (kNumMathThreads * kValues) * kValues * kDivisor + item * kDivisor + part];
-            pair[part] = static_cast<float>(value);
-          }
-        }
-        if constexpr (!Ctx::kRequantizeOutput) values[item] = pair[0];
-        else if constexpr (kIsBinaryActivation) values[item] = Activation::apply(pair[0], pair[1]);
-        else if constexpr (Activation::kType == ActivationType::Unary) values[item] = Activation::apply(pair[0]);
-        else values[item] = pair[0];
-        if (!valid) values[item] = 0.f;
+      for (uint32_t slab = 0; slab < kColumns / kDivisor * kBits / 8 / kStoreBytes; slab++) {
+        uint32_t column_bytes = (col_offset + first_column) / kDivisor * kBits / 8 + slab * kStoreBytes;
+        tma_store_2d(output_smem + slab * kOutputRows * kStoreBytes, tensor_map_ptr, column_bytes, row_offset + first_row);
       }
-      uint8_t *destination;
-      if constexpr (kUseTmaC) {
-        uint32_t byte = column * kBits / 8;
-        destination = output_smem + (byte / kStoreBytes * kOutputRows + row) * kStoreBytes + byte % kStoreBytes;
-      } else destination = reinterpret_cast<uint8_t *>(gmem_ptr_raw) + uint64_t(output_row) * kRowBytes + output_column * kBits / 8;
-      if constexpr (Ctx::kRequantizeOutput) {
-        auto result = quant_dynamic_group<OutputType, ScaleType, kValues, kGroupSize, kNumMathThreads / 32>(values, nullptr);
-        if (valid || kUseTmaC) store_packed<kValues * kBits / 8>(destination, result.packed, !valid);
-        if (valid && output_column % kGroupSize == 0) {
-          constexpr uint32_t kGroups = CEIL_DIV(kOutputWidth, kGroupSize);
-          constexpr bool kPackedScale = !std::is_same<ScaleType, Float32>::value;
-          constexpr uint32_t kScaleColumns = kPackedScale ? CEIL_DIV(kGroups, 4) * 4 : kGroups;
-          uint64_t scale_index;
-          uint32_t group = output_column / kGroupSize;
-          uint64_t scale_rows = CEIL_DIV(ctx.params.shape_m * (kIsIndexedGemm ? ctx.params.top_k : 1), 4) * 4;
-          if constexpr (!Ctx::kUseMMajorInputScale) scale_index = uint64_t(output_row) * kScaleColumns + group;
-          else if constexpr (!kPackedScale) scale_index = uint64_t(group) * scale_rows + output_row;
-          else scale_index = uint64_t(group / 4) * scale_rows * 4 + output_row * 4 + group % 4;
-          store_scale<ScaleType>(ctx.params.output_scales, scale_index, result.scale);
-          if constexpr (kPackedScale && kScaleColumns > kGroups) {
-            if (group + 1 == kGroups) {
-              PRAGMA_UNROLL
-              for (uint32_t pad = 1; pad <= kScaleColumns - kGroups; pad++)
-                store_scale<ScaleType>(ctx.params.output_scales, scale_index + pad, ScaleStorage<ScaleType>{});
-            }
-          }
-        }
-      } else if (valid || kUseTmaC) store_values<scalar_t, kValues>(reinterpret_cast<scalar_t *>(destination), values, !valid);
+      tma_commit_store_group();
+      tma_wait_store_group<0>();
     }
-    if constexpr (kUseTmaC) {
-      tma_fence_async_shared();
-      ctx.sync_math_threads();
-      if (thread == 0) {
-        PRAGMA_UNROLL
-        for (uint32_t slab = 0; slab < kColumnsOut * kBits / 8 / kStoreBytes; slab++) {
-          uint32_t column_bytes = (col_offset + first_column) / kDivisor * kBits / 8 + slab * kStoreBytes;
-          tma_store_2d(output_smem + slab * kOutputRows * kStoreBytes, tensor_map_ptr, column_bytes, row_offset + first_row);
-        }
-        tma_commit_store_group();
-        tma_wait_store_group<0>();
-      }
-      ctx.sync_math_threads();
-    }
+    ctx.sync_math_threads();
   }
 
   CUDA_INLINE

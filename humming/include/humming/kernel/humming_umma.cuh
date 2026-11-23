@@ -421,7 +421,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
           auto write_chunk = [&](uint32_t first_row, uint32_t rows, uint32_t buffer_offset) {
             if constexpr (Ctx::kOutputChunkRows)
-              epilogue.gmem_writer.template write_chunk<128>(scheduler.slice_id, scheduler.slice_count, first_row, rows, buffer_offset, ctx.math_group * 128);
+              epilogue.template write_output_chunk<128>(first_row, rows, buffer_offset, ctx.math_group * 128);
           };
           epilogue.smem_writer.write_umma(mma, scheduler.slice_id, scheduler.slice_count, write_chunk);
         }
@@ -431,10 +431,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         if constexpr (!Ctx::kOutputChunkRows && (!Ctx::kIsIndexedGemm || kOverlapIndexedEpilogue)) release_accumulator();
         if constexpr (Ctx::kUseTmaC) tma_fence_async_shared();
         ctx.sync_math_threads();
-        if constexpr (!Ctx::kOutputChunkRows)
-          epilogue.gmem_writer.write(scheduler.slice_id, scheduler.slice_count, 0);
-        if constexpr (Ctx::kHasFusedOutput) {
-          if (scheduler.slice_count > 1) epilogue.release_gmem_barrier();
+        if constexpr (!Ctx::kOutputChunkRows) {
+          if constexpr (Ctx::kRequantizeOutput || Ctx::kActivationFuncType == ActivationType::BinaryInterleaved)
+            epilogue.template write_output_chunk<BlockShape::N>(0, BlockShape::M, 0);
+          else epilogue.gmem_writer.write(scheduler.slice_id, scheduler.slice_count, 0);
         }
         if constexpr (kOverlapIndexedEpilogue && !GmemWriter::kCacheIndexedRows) {
           // Accumulators may be reused before output scatter finishes. Return
@@ -442,9 +442,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           ctx.sync_math_threads();
           if (ctx.math_thread_id() == 0) mbarrier_arrive(&smem.umma_row_index_free[tile_index % 2]);
         } else if constexpr (Ctx::kIsIndexedGemm && !kOverlapIndexedEpilogue) release_accumulator();
-        if constexpr (!Ctx::kHasFusedOutput) {
-          if (scheduler.slice_count > 1) epilogue.release_gmem_barrier();
-        }
+        if (scheduler.slice_count > 1) epilogue.release_gmem_barrier();
         if constexpr (!kSeparateOutputStorage) {
           if constexpr (Ctx::kUseTmaC) tma_wait_store_group<0, true>();
           ctx.sync_math_threads();
