@@ -1,4 +1,6 @@
 import dataclasses
+import itertools
+import random
 
 import pytest
 
@@ -736,3 +738,66 @@ def test_mxmma_compiler_version_matches_scale_format(
     else:
         with pytest.raises(RuntimeError, match="reached tuning generation"):
             runner.prepare_kernels((1,))
+
+
+@pytest.mark.parametrize("seed", [0, 17, 2026])
+@pytest.mark.parametrize("max_count", [None, 0, 1, 4, 100])
+def test_pairwise_selection_covers_pairs_within_budget(seed, max_count):
+    from humming.testing.tuning import _get_covered_pairs, _select_pairwise
+
+    fields = ("mma_type", "use_stream_k", "num_ctas_per_sm", "output_chunk_rows")
+    values = itertools.product(("mma", "umma"), (False, True), (1, 2), (None, 32))
+    signatures = (dict(zip(fields, item, strict=True)) for item in values)
+    candidates = [({"index": index}, signature) for index, signature in enumerate(signatures)]
+    selected = _select_pairwise(candidates, random.Random(seed), max_count=max_count)
+
+    assert selected == _select_pairwise(candidates, random.Random(seed), max_count=max_count)
+    assert len({config["index"] for config, _ in selected}) == len(selected)
+    if max_count is not None:
+        assert len(selected) <= max_count
+    if max_count is None or max_count >= len(candidates):
+        available = set().union(*(_get_covered_pairs(candidate) for candidate in candidates))
+        covered = set().union(*(_get_covered_pairs(candidate) for candidate in selected))
+        assert covered == available
+
+
+def test_pairwise_selection_without_pairs():
+    from humming.testing.tuning import _select_pairwise
+
+    assert _select_pairwise([], random.Random(0)) == []
+    candidates = [({}, {}), ({"num_stages": 2}, {"num_stages": 2})]
+    assert _select_pairwise(candidates, random.Random(0)) == []
+
+
+def test_sampled_pool_bounds_work_without_losing_parameter_values(monkeypatch):
+    from humming.config import MmaType
+    from humming.testing import tuning
+
+    def group(name, count):
+        return [({}, {"mma_type": "mma", name: value}) for value in range(count)]
+
+    sizes = {"geometry": 40, "transfer": 12, "scheduling": 24}
+    for name, count in sizes.items():
+        candidates = group(name, count)
+        monkeypatch.setattr(tuning, f"_generate_{name}_candidates", lambda *args, rows=candidates: rows)
+    monkeypatch.setattr(tuning, "_get_seed", lambda *args: 2026)
+    attempts = 0
+
+    def combine(layer, compute, items):
+        nonlocal attempts
+        attempts += 1
+        signature = {}
+        for _, values in items:
+            signature.update(values)
+        if signature["geometry"] % 4 == signature["scheduling"] % 4:
+            return None
+        return signature, signature
+
+    monkeypatch.setattr(tuning, "_try_combine_candidate", combine)
+    pool = tuning._enumerate_backend_candidates(None, None, MmaType.MMA, sample_size=20)
+    assert len(pool) == 512
+    assert attempts < 5000  # The reduced Cartesian product has over 100,000 combinations.
+    assert len({tuple(sorted(signature.items())) for _, signature in pool}) == len(pool)
+    for name, count in sizes.items():
+        assert {signature[name] for _, signature in pool} == set(range(count))
+    assert all(config["geometry"] % 4 != config["scheduling"] % 4 for config, _ in pool)
