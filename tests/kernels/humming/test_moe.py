@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ from humming.testing import (
     assert_kernel_test_shape_coverage,
     skip_if_unsupported,
 )
+from humming.testing.data import generate_random_tensor, generate_random_topk_ids
 from humming.tune import get_heuristics_config
 
 SHAPE_N = 1024
@@ -528,3 +531,78 @@ def test_grouped_skips_unused_capacity(use_stream_k, offset_dtype, raster_group_
             reference = (expert_input @ runner.weight_ref[expert].float().T).bfloat16()
             torch.testing.assert_close(output[start : start + count], reference, atol=0.01, rtol=0.01)
         assert (output[~valid_rows] == -123).all()
+
+
+@pytest.mark.parametrize("use_pdl", [False, True])
+def test_grouped_reuses_output_descriptors(use_pdl):
+    if current_device.sm_version != 120:
+        pytest.skip("Regression uses SM120 warp-specialized MMA launch geometries")
+    shape_m = 4096
+    compute = ComputeConfig(gemm_type=GemmType.GROUPED_CONTIGUOUS)
+    launches, references, runners = [], [], []
+    for shape_n in (512, 1024):
+        layer = LayerConfig(
+            shape_n=shape_n,
+            shape_k=4096,
+            num_experts=8,
+            a_dtype=dtypes.bfloat16,
+            b_dtype=dtypes.uint4,
+            c_dtype=dtypes.bfloat16,
+            bs_dtype=dtypes.bfloat16,
+            weight_scale_group_size=128,
+            has_bias=True,
+        )
+        test_case = KernelTestCase(
+            name="grouped-pdl-descriptors", layer_config=layer, compute_config=compute, top_k=2, seed=219
+        )
+        runner = KernelTestRunner(test_case)
+        torch.manual_seed(test_case.seed + shape_m)
+        inputs = generate_random_tensor((shape_m, layer.shape_k), dtype=layer.param_dtype, device="cuda")
+        topk_ids = generate_random_topk_ids(shape_m, layer.num_experts, test_case.top_k, device="cuda")
+        routed, routing, _ = runner._prepare_problem(shape_m, inputs, topk_ids, 128)
+        _, inputs, input_scale, input_scale_2 = runner.prepare_inputs(routed)
+        outputs = torch.empty((routed.shape[0], shape_n), dtype=layer.param_dtype, device="cuda")
+        is_narrow_output = shape_n == 512
+        tuning = dict(
+            mma_type="mma",
+            block_shape=[128, 128 if is_narrow_output else 256, 64],
+            warp_shape=[128, 32, 32 if is_narrow_output else 64],
+            num_stages=4 if is_narrow_output else 3,
+            use_stream_k=not is_narrow_output,
+            use_pdl=use_pdl,
+            use_tma=True,
+            use_warp_spec=True,
+            evict_weights_first=False,
+        )
+        launch_args = dict(
+            layer_config=runner.layer_config.to_str(),
+            compute_config=compute.to_str(),
+            tuning_config=json.dumps(tuning),
+            inputs=inputs,
+            input_scale=input_scale,
+            input_scale_2=input_scale_2,
+            outputs=outputs,
+            locks=torch.zeros(2048, dtype=torch.int32, device="cuda"),
+            top_k=test_case.top_k,
+            valid_shape_m=shape_m * test_case.top_k,
+            **routing,
+            **runner.kernel_tensors,
+        )
+
+        def launch(launch_args=launch_args):
+            return ops.humming_gemm(**launch_args)
+
+        references.append(launch().clone())
+        torch.cuda.synchronize()
+        launches.append(launch)
+        runners.append(runner)
+
+    # Alternate descriptors with different output strides and addresses. A host
+    # synchronization between launches would hide reuse of an in-flight descriptor.
+    for _ in range(20):
+        for _ in range(20):
+            narrow_output = launches[0]()
+            wide_output = launches[1]()
+        torch.cuda.synchronize()
+        runners[0]._assert_close(narrow_output, references[0], use_stream_k=False)
+        runners[1]._assert_close(wide_output, references[1], use_stream_k=True)
