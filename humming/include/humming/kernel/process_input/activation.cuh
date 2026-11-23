@@ -6,14 +6,6 @@
 #include <humming/utils/all.cuh>
 
 
-enum class ActivationType : uint32_t {
-  None = 0,
-  Unary = 1,
-  BinarySplit = 2,
-  BinaryInterleaved = 3,
-};
-
-
 template <class SourceType, uint32_t kValues>
 CUDA_INLINE void load_values(float *values, const SourceType *input) {
   static_assert(std::is_same<SourceType, float>::value || std::is_same<SourceType, __half>::value || std::is_same<SourceType, __nv_bfloat16>::value);

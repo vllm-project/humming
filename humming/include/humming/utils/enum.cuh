@@ -1,6 +1,14 @@
 #pragma once
 
 
+enum class ActivationType : uint32_t {
+  None = 0,
+  Unary = 1,
+  BinarySplit = 2,  // process_input only; GEMM weights use interleaved GLU channels.
+  BinaryInterleaved = 3,
+};
+
+
 enum class ProcessInputLayoutType : uint32_t {
   Normal = 0,
   GroupedMask = 3,

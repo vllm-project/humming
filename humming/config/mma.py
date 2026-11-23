@@ -187,7 +187,7 @@ def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False, 
             dequant_threads = 0
         else:
             dequant_threads = 128 * tuning_config.umma_num_dequant_warpgroups
-        num_threads = 256 + dequant_threads
+        num_threads = 128 * (1 + tuning_config.umma_num_epilogue_warpgroups) + dequant_threads
     launch_budget = registers_per_sm // (num_threads * tuning_config.num_ctas_per_sm) // 8 * 8
     if launch_budget < 56:
         return (

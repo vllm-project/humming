@@ -270,6 +270,7 @@ class HummingLayerMethod:
         layer: torch.nn.Module,
         inputs: torch.Tensor,
         outputs: torch.Tensor | None = None,
+        output_scales: torch.Tensor | None = None,
         input_scale: torch.Tensor | None = None,
         input_scale_2: torch.Tensor | None = None,
         sorted_ids: torch.Tensor | None = None,
@@ -283,7 +284,7 @@ class HummingLayerMethod:
         sublayer_name: str = "",
         hadamard_block_size: int | None = None,
         use_pdl: bool | None = None,
-    ):
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         meta = cls._get_meta(layer, sublayer_name)
         if input_scale is None:
             input_scale = getattr(layer, meta.input_scale_name, None)
@@ -298,6 +299,7 @@ class HummingLayerMethod:
             bias=getattr(layer, meta.bias_name, None),
             weight_scale_2=getattr(layer, meta.weight_scale_2_name, None),
             outputs=outputs,
+            output_scales=output_scales,
             input_scale=input_scale,
             input_scale_2=input_scale_2,
             sorted_ids=sorted_ids,
@@ -678,6 +680,7 @@ class HummingLayer(torch.nn.Module):
         self,
         inputs: torch.Tensor,
         outputs: torch.Tensor | None = None,
+        output_scales: torch.Tensor | None = None,
         input_scale: torch.Tensor | None = None,
         input_scale_2: torch.Tensor | None = None,
         sorted_ids: torch.Tensor | None = None,
@@ -690,7 +693,7 @@ class HummingLayer(torch.nn.Module):
         tuning_config: dict | list | str | None = None,
         hadamard_block_size: int | None = None,
         use_pdl: bool | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.humming_config is not None, "call transform() before forward()"
         if input_scale is None:
             input_scale = getattr(self, "input_scale", None)
@@ -705,6 +708,7 @@ class HummingLayer(torch.nn.Module):
             bias=getattr(self, "bias", None),
             weight_scale_2=getattr(self, "weight_scale_2", None),
             outputs=outputs,
+            output_scales=output_scales,
             input_scale=input_scale,
             input_scale_2=input_scale_2,
             sorted_ids=sorted_ids,

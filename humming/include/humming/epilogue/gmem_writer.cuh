@@ -1,5 +1,7 @@
 #pragma once
 
+#include <humming/kernel/process_input/activation.cuh>
+#include <humming/kernel/process_input/quantization.cuh>
 #include <humming/utils/all.cuh>
 
 
@@ -37,9 +39,11 @@ private:
   using WarpShape = typename Ctx::WarpShape;
   using PadShape = typename Ctx::PadShape;
   using ElementC = typename Ctx::ElementC;
+  static constexpr bool kIsBinaryActivation = Ctx::kActivationFuncType == ActivationType::BinaryInterleaved;
 
   static constexpr bool kUseStreamK = Ctx::kUseStreamK;
   static constexpr bool kUseTmaC = Ctx::kUseTmaC;
+  static constexpr bool kUseWorkspaceTma = Ctx::kHasFusedOutput && kUseStreamK && kUseTmaC;
   static constexpr uint32_t kClusterShapeN = BlockShape::N * Ctx::kMultiCastSizeA * Ctx::kUmmaCtaGroupSize;
 
   static constexpr bool kIsIndexedGemm = Ctx::kIsIndexedGemm;
@@ -49,6 +53,7 @@ private:
   static constexpr uint32_t kOutputRows = SharedStorage::kOutputRows;
   static constexpr bool kUseTma3d = (ProblemShape::N - PadShape::N) % 64 == 0;
   uint32_t descriptor_rows = 0;
+  uint32_t workspace_slot = 0;
 
   using scalar_t = typename F16Conversion<ElementC>::scalar_t;
   using scalar_t2 = typename F16Conversion<ElementC>::scalar_t2;
@@ -116,6 +121,10 @@ public:
 
   CUDA_INLINE
   void write(uint32_t slice_id, uint32_t slice_count, uint32_t first_row) {
+    if constexpr (Ctx::kHasFusedOutput) {
+      write_chunk(slice_id, slice_count, first_row, BlockShape::M, 0);
+      return;
+    }
     if constexpr (kUseWarpgroupEpilogue) {
       if (ctx.k_warp_id() != 0) return;
       if constexpr (kUseTmaC) {
@@ -189,6 +198,19 @@ public:
         uint32_t gmem_col = first_column / 8 + column_block * 8 + smem_col;
         bool valid_row = gmem_row < (kIsIndexedGemm ? output_shape_m : block_output_shape_m);
         bool valid_column = (ProblemShape::N - PadShape::N) % kClusterShapeN == 0 || col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N;
+        if constexpr (Ctx::kHasFusedOutput) {
+          if (slice_count > 1) {
+            int4 val = ctx.smem.reduce[smem_offset];
+            uint32_t local_index = (first_row + local_row) * (BlockShape::N / 8) + gmem_col;
+            auto partial = reinterpret_cast<int4 *>(ctx.params.output_workspace);
+            partial += uint64_t(workspace_slot) * BlockShape::M * BlockShape::N / 8;
+            if (slice_id == 0) partial[local_index] = val;
+            else if (kHasNativeAtomicAdd && slice_count > 3)
+              atomic_reduce_add_f162<scalar_t2>(val, partial[local_index]);
+            else partial[local_index] = reduce_add_f162<scalar_t2>(val, partial[local_index]);
+            continue;
+          }
+        }
         if (!valid_row || !valid_column) continue;
 
         int4 val = ctx.smem.reduce[smem_offset];
@@ -208,6 +230,24 @@ public:
   CUDA_INLINE void write_chunk(uint32_t slice_id, uint32_t slice_count, uint32_t first_row,
       uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
     constexpr uint32_t kRows = kOutputRows;
+    if constexpr (Ctx::kHasFusedOutput) {
+      if (slice_count > 1) {
+        if constexpr (kUseWorkspaceTma) {
+          if (ctx.math_thread_id() == 0) {
+            auto descriptor = ctx.params.tensor_map_buffer + gridDim.x + blockIdx.x;
+            uint32_t offset = buffer_offset + first_column / 64 * kRows * 8;
+            if (slice_id == 0) tma_store_3d(ctx.smem.reduce + offset, descriptor, 0, first_row, first_column / 64);
+            else tma_reduce_add_3d(ctx.smem.reduce + offset, descriptor, 0, first_row, first_column / 64);
+            tma_commit_store_group();
+          }
+        } else write_legacy<kRows, kColumns>(slice_id, slice_count, first_row, first_column, buffer_offset, rows);
+        return;
+      }
+      if constexpr (Ctx::kRequantizeOutput || kIsBinaryActivation || kUseWorkspaceTma) {
+        write_fused<kColumns, false>(first_row, rows, buffer_offset, first_column);
+        return;
+      }
+    }
     if constexpr (kUseTmaC) {
       if constexpr (kUseTma3d) {
         if (ctx.math_thread_id() == 0) {
@@ -251,6 +291,182 @@ public:
     }
   }
 
+  static constexpr uint32_t kOutputWidth = (ProblemShape::N - PadShape::N) / (kIsBinaryActivation ? 2 : 1);
+
+  CUDA_INLINE void set_workspace_slot(uint32_t slot) { workspace_slot = slot; }
+
+  CUDA_INLINE static void initialize_workspace_map(CUtensorMap *descriptor) {
+    static_assert(std::is_same<scalar_t, __nv_bfloat16>::value || std::is_same<scalar_t, __half>::value);
+    constexpr uint32_t kTileColumns = Ctx::kUseUmma && Ctx::kOutputChunkRows ? 128 : BlockShape::N;
+    constexpr uint32_t kElementType = std::is_same<scalar_t, __nv_bfloat16>::value ? 10 : 6;
+    const uint32_t box_dims[3] = {64, kOutputRows, kTileColumns / 64};
+    const uint32_t global_dims[3] = {64, BlockShape::M, BlockShape::N / 64};
+    const uint64_t global_strides[2] = {uint64_t(BlockShape::N) * 2, 128};
+    tensor_map_initialize_3d<kElementType, 3>(descriptor, box_dims, global_dims, global_strides);
+  }
+
+  CUDA_INLINE void prepare_workspace_map() {
+    if constexpr (kUseWorkspaceTma) {
+      if constexpr (Ctx::kUsePdl) griddepcontrol_wait();
+      tma_wait_store_group<0>();
+      ctx.sync_math_threads();
+      if (ctx.math_thread_id() == 0) {
+        auto descriptor = ctx.smem.tensor_map_buffer;
+        initialize_workspace_map(descriptor);
+        auto partial = reinterpret_cast<scalar_t *>(ctx.params.output_workspace);
+        partial += uint64_t(workspace_slot) * BlockShape::M * BlockShape::N;
+        tensor_map_replace_global_address(descriptor, partial);
+        auto destination = ctx.params.tensor_map_buffer + gridDim.x + blockIdx.x;
+        *destination = descriptor[0];
+        tensor_map_release_cta();
+        tensor_map_acquire_cta(destination);
+      }
+      ctx.sync_math_threads();
+    }
+  }
+
+  template <uint32_t kColumns, bool kFromWorkspace>
+  CUDA_INLINE void write_fused(uint32_t first_row, uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
+    using Activation = typename Ctx::LayerConfig::ActivationFunc;
+    using OutputType = typename Ctx::LayerConfig::OutputType;
+    using ScaleType = typename Ctx::LayerConfig::OutputScaleType;
+    constexpr uint32_t kDivisor = (kIsBinaryActivation ? 2 : 1);
+    constexpr uint32_t kColumnsOut = kColumns / kDivisor;
+    constexpr uint32_t kValues = []() {
+      if constexpr (Ctx::kRequantizeOutput) {
+        return kOutputRows * kColumnsOut < kNumMathThreads * 16 ? 8u : 16u;
+      }
+      if constexpr ((kFromWorkspace || !kUseTmaC) && kOutputWidth % 8 == 0) return 8u;
+      return 2u;
+    }();
+    constexpr uint32_t kBits = Ctx::kOutputBits;
+    constexpr uint32_t kRowBytes = kOutputWidth * kBits / 8;
+    constexpr uint32_t kStoreBytes = SharedStorage::kOutputTileColumns / kDivisor * kBits / 8;
+    constexpr uint32_t kGroupSize = Ctx::kInputScaleGroupSize;
+    uint32_t thread = ctx.math_thread_id();
+    uint32_t smem_base = offsetof(SharedStorage, reduce) / 128 % 8;
+    if constexpr (kUseTmaC) tma_wait_store_group<0, true>();
+    ctx.sync_math_threads();
+    constexpr uint32_t kIterations = CEIL_DIV(kOutputRows * kColumnsOut, kNumMathThreads * kValues);
+    scalar_t staged[kUseTmaC && !kFromWorkspace ? kIterations * kValues * kDivisor : 1];
+    if constexpr (kUseTmaC && !kFromWorkspace) {
+      // Preserve this chunk before changing its layout in place for TMA.
+      PRAGMA_UNROLL
+      for (uint32_t iter = 0; iter < kIterations; iter++) {
+        uint32_t index = (thread + iter * kNumMathThreads) * kValues;
+        if (index >= kOutputRows * kColumnsOut) continue;
+        uint32_t row = index / kColumnsOut;
+        uint32_t column = index % kColumnsOut;
+        PRAGMA_UNROLL
+        for (uint32_t item = 0; item < kValues * kDivisor; item++) {
+          uint32_t source_col = first_column + column * kDivisor + item;
+          uint32_t source_row = source_col / 64 * kOutputRows + row;
+          uint32_t word = (source_col % 64 / 8) ^ ((source_row + smem_base) % 8);
+          uint32_t offset = (buffer_offset + source_row * 8 + word) * 8 + source_col % 8;
+          staged[iter * kValues * kDivisor + item] = reinterpret_cast<const scalar_t *>(ctx.smem.reduce)[offset];
+        }
+      }
+      ctx.sync_math_threads();
+    }
+    auto output_smem = reinterpret_cast<uint8_t *>(ctx.smem.reduce + buffer_offset);
+    constexpr uint32_t kOutputUnroll = kUseTmaC && !kFromWorkspace ? kIterations : 1;
+    PRAGMA_UNROLL_COUNT(kOutputUnroll)
+    for (uint32_t index = thread * kValues; index < kOutputRows * kColumnsOut; index += kNumMathThreads * kValues) {
+      uint32_t row = index / kColumnsOut;
+      uint32_t column = index % kColumnsOut;
+      uint32_t output_row = first_row + row;
+      if constexpr (kIsIndexedGemm) output_row = get_output_row_index(output_row);
+      else output_row += row_offset;
+      uint32_t output_column = (col_offset + first_column) / kDivisor + column;
+      bool valid = row < rows && output_row < output_shape_m && output_column < kOutputWidth;
+      float values[kValues] = {};
+      float source_values[kFromWorkspace || !kUseTmaC ? kValues * kDivisor : 1] = {};
+      if constexpr (kFromWorkspace) {
+        auto partial = reinterpret_cast<const scalar_t *>(ctx.params.output_workspace);
+        uint64_t offset = uint64_t(workspace_slot) * BlockShape::M * BlockShape::N;
+        offset += (first_row + row) * BlockShape::N + first_column + column * kDivisor;
+        if (first_row + row < BlockShape::M)
+          load_values<scalar_t, kValues * kDivisor>(source_values, partial + offset);
+      } else if constexpr (!kUseTmaC) {
+        constexpr uint32_t kLoadValues = MIN(8u, kValues * kDivisor);
+        PRAGMA_UNROLL
+        for (uint32_t item = 0; item < kValues * kDivisor; item += kLoadValues) {
+          uint32_t source_col = first_column + column * kDivisor + item;
+          uint32_t source_row = source_col / 64 * kOutputRows + row;
+          uint32_t word = (source_col % 64 / 8) ^ ((source_row + smem_base) % 8);
+          uint32_t offset = (buffer_offset + source_row * 8 + word) * 8 + source_col % 8;
+          auto source = reinterpret_cast<const scalar_t *>(ctx.smem.reduce) + offset;
+          load_values<scalar_t, kLoadValues>(source_values + item, source);
+        }
+      }
+      PRAGMA_UNROLL
+      for (uint32_t item = 0; item < kValues; item++) {
+        float pair[kDivisor];
+        PRAGMA_UNROLL
+        for (uint32_t part = 0; part < kDivisor; part++) {
+          if constexpr (kFromWorkspace || !kUseTmaC) {
+            pair[part] = source_values[item * kDivisor + part];
+          } else {
+            scalar_t value = staged[index / (kNumMathThreads * kValues) * kValues * kDivisor + item * kDivisor + part];
+            pair[part] = static_cast<float>(value);
+          }
+        }
+        if constexpr (!kFromWorkspace && !Ctx::kRequantizeOutput) values[item] = pair[0];
+        else if constexpr (kIsBinaryActivation) values[item] = Activation::apply(pair[0], pair[1]);
+        else if constexpr (Activation::kType == ActivationType::Unary) values[item] = Activation::apply(pair[0]);
+        else values[item] = pair[0];
+        if (!valid) values[item] = 0.f;
+      }
+      uint8_t *destination;
+      if constexpr (kUseTmaC) {
+        uint32_t byte = column * kBits / 8;
+        destination = output_smem + (byte / kStoreBytes * kOutputRows + row) * kStoreBytes + byte % kStoreBytes;
+      } else destination = reinterpret_cast<uint8_t *>(gmem_ptr_raw) + uint64_t(output_row) * kRowBytes + output_column * kBits / 8;
+      if constexpr (Ctx::kRequantizeOutput) {
+        auto result = quant_dynamic_group<OutputType, ScaleType, kValues, kGroupSize, kNumMathThreads / 32>(values, nullptr);
+        if (valid || kUseTmaC) store_packed<kValues * kBits / 8>(destination, result.packed, !valid);
+        if (valid && output_column % kGroupSize == 0) {
+          constexpr uint32_t kGroups = CEIL_DIV(kOutputWidth, kGroupSize);
+          constexpr bool kPackedScale = !std::is_same<ScaleType, Float32>::value;
+          constexpr uint32_t kScaleColumns = kPackedScale ? CEIL_DIV(kGroups, 4) * 4 : kGroups;
+          uint64_t scale_index;
+          uint32_t group = output_column / kGroupSize;
+          uint64_t scale_rows = CEIL_DIV(ctx.params.shape_m * (kIsIndexedGemm ? ctx.params.top_k : 1), 4) * 4;
+          if constexpr (!Ctx::kUseMMajorInputScale) scale_index = uint64_t(output_row) * kScaleColumns + group;
+          else if constexpr (!kPackedScale) scale_index = uint64_t(group) * scale_rows + output_row;
+          else scale_index = uint64_t(group / 4) * scale_rows * 4 + output_row * 4 + group % 4;
+          store_scale<ScaleType>(ctx.params.output_scales, scale_index, result.scale);
+          if constexpr (kPackedScale && kScaleColumns > kGroups) {
+            if (group + 1 == kGroups) {
+              PRAGMA_UNROLL
+              for (uint32_t pad = 1; pad <= kScaleColumns - kGroups; pad++)
+                store_scale<ScaleType>(ctx.params.output_scales, scale_index + pad, ScaleStorage<ScaleType>{});
+            }
+          }
+        }
+      } else if (valid || kUseTmaC) store_values<scalar_t, kValues>(reinterpret_cast<scalar_t *>(destination), values, !valid);
+    }
+    if constexpr (kUseTmaC) {
+      tma_fence_async_shared();
+      ctx.sync_math_threads();
+      if (thread == 0) {
+        PRAGMA_UNROLL
+        for (uint32_t slab = 0; slab < kColumnsOut * kBits / 8 / kStoreBytes; slab++) {
+          uint32_t column_bytes = (col_offset + first_column) / kDivisor * kBits / 8 + slab * kStoreBytes;
+          tma_store_2d(output_smem + slab * kOutputRows * kStoreBytes, tensor_map_ptr, column_bytes, row_offset + first_row);
+        }
+        tma_commit_store_group();
+        tma_wait_store_group<0>();
+      }
+      ctx.sync_math_threads();
+    }
+  }
+
+  CUDA_INLINE void finalize_workspace() {
+    for (uint32_t row = 0; row < BlockShape::M; row += kOutputRows)
+      write_fused<BlockShape::N, true>(row, MIN(kOutputRows, BlockShape::M - row), 0);
+  }
+
   CUDA_INLINE
   void seek(uint32_t m_block_id, uint32_t n_block_id, uint32_t current_shape_m, uint32_t m_offset) {
     if constexpr (kIsGroupedGemm) {
@@ -265,10 +481,13 @@ public:
       uint32_t rows = output_shape_m;
       if constexpr (BlockShape::M % kOutputRows != 0) rows = MIN(rows, row_offset + BlockShape::M);
       if (rows != descriptor_rows) {
+        if constexpr (Ctx::kHasFusedOutput && Ctx::kUsePdl) griddepcontrol_wait();
         // Each issuing thread drains its stores before the CTA descriptor is overwritten.
         tma_wait_store_group<0>();
         ctx.sync_math_threads();
         if (ctx.math_thread_id() == 0) {
+          if constexpr (kUseWorkspaceTma)
+            ctx.smem.tensor_map_buffer[0] = *reinterpret_cast<const CUtensorMap *>(ctx.params.c);
           tensor_map_replace_global_dim<1>(ctx.smem.tensor_map_buffer, rows);
           ctx.params.tensor_map_buffer[blockIdx.x] = ctx.smem.tensor_map_buffer[0];
           tensor_map_release_cta();

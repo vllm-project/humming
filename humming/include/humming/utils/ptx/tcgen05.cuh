@@ -275,6 +275,12 @@ CUDA_INLINE void tcgen05_st_32x32b(uint32_t address, const uint32_t *values) {
 }
 
 
+CUDA_INLINE void tcgen05_ld_16x256b_x2(uint32_t address, uint32_t *values) {
+  asm volatile("tcgen05.ld.sync.aligned.16x256b.x2.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+               : "=r"(values[0]), "=r"(values[1]), "=r"(values[2]), "=r"(values[3]),
+                 "=r"(values[4]), "=r"(values[5]), "=r"(values[6]), "=r"(values[7]) : "r"(address) : "memory");
+}
+
 CUDA_INLINE void tcgen05_ld_16x256b_x4(uint32_t address, uint32_t *values) {
   asm volatile("tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
                : "=r"(values[0]), "=r"(values[1]), "=r"(values[2]), "=r"(values[3]),

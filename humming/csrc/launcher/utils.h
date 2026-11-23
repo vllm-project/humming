@@ -16,6 +16,16 @@ enum class MmaType : uint32_t {
   MXMMA = 3,
 };
 
+enum class ActivationType : uint32_t {
+  None = 0,
+  Unary = 1,
+  BinaryInterleaved = 3,
+};
+
+inline bool is_binary_activation(ActivationType activation_type) {
+  return activation_type == ActivationType::BinaryInterleaved;
+}
+
 inline void check_curesult(const CUresult res, const char *func_name) {
   if (res != CUDA_SUCCESS) {
     const char *errName;
@@ -143,6 +153,11 @@ struct KernelData {
   uint32_t input_scale_group_size;
   uint32_t weight_scale_group_size;
   uint32_t weight_scale_group_size_n;
+  uint32_t output_dtype_id;
+  uint32_t output_scale_dtype_id;
+  ActivationType activation_func_type;
+  bool has_fused_output;
+  bool requantize_output;
   uint32_t num_ctas_per_sm;
   uint32_t umma_cta_group_size;
   uint32_t output_chunk_rows;

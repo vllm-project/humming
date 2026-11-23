@@ -183,6 +183,24 @@ Usually leave this to automatic selection. It determines data layout and cannot 
 
 Fuses bias addition into the epilogue. Defaults to `False`. When enabled, supply bias for the effective output channels; MoE uses the corresponding expert's bias.
 
+### Fused Output Processing
+
+#### `activation_func_type`, `activation_func_impl`
+
+Apply a `process_input`-style expression after GEMM scaling, bias, and Stream-K reduction. Types are `none` (default), `unary`, `binary_split`, and `binary_interleaved`. Expressions use `a` for unary activation and `a`, `b` for binary gate/up values: SiLU is `a / (1.f + expf(-a))`; SwiGLU adds `* b`.
+
+Set these fields before transforming weights. `binary_split` interleaves the weights and associated scales, zero points, and bias; `binary_interleaved` expects alternating gate/up channels already. Binary activation halves the output width; `shape_n` remains the projection width before activation.
+
+Fused output supports Stream-K and TMA C together, but not blockwise weights or output Hadamard. Quantized inputs require group size `16` or `32`; FP16/BF16 inputs support activation without requantization.
+
+#### `requantize_output`
+
+Defaults to `False`. Quantizes activated outputs using the input's `a_dtype`, `as_dtype`, and `input_scale_group_size`, with newly computed scales. Requires `dynamic_group` input quantization and complete output groups. `block_n` must be at least the group size, or twice it for GLU.
+
+`c_dtype` determines precision before activation; activation results stay FP32 until quantization. Output packing and `use_m_major_input_scale` match `process_input`.
+
+With requantization, forward methods and `ops.humming_gemm` return `(outputs, output_scales)`; otherwise they return a tensor. `output_scales` optionally supplies the scale buffer; `ops.humming_gemm` allocates it when omitted. Lower-level `ops.launch_kernel` returns only the data tensor and requires an explicit `output_scales` buffer for requantization.
+
 ## ComputeConfig
 
 ### `gemm_type`
@@ -355,6 +373,8 @@ The number of rows written through SMEM per output chunk. Defaults to `0`.
 - `0`: write the entire tile.
 - Positive values: must be multiples of `32`, no greater than `256`. The actual chunk height is capped at tile M; a partial final chunk is supported.
 
+For UMMA, a valid value at least as large as block M is automatically normalized to `0`, avoiding an unnecessary second output buffer. This also applies without fusion.
+
 This changes output chunking, not the output tensor's logical shape.
 Try `32` or `64` when SMEM pressure is high. Chunking can reduce output buffer requirements and improve overlap on some paths, but may increase synchronization and store overhead.
 
@@ -426,6 +446,10 @@ Try `True` to increase overlap between loading and computation. It extends the l
 The number of warp groups performing weight dequantization in UMMA TS. Supports `1` or `2`.
 
 Usually use `1`. Try `2` when weight conversion is a bottleneck, at the cost of more threads and resource usage. The SS path for raw weights does not need this value increased.
+
+#### `umma_num_epilogue_warpgroups`
+
+UMMA output warp groups: `1` (128 threads, default) or `2` (256 threads). Both support Stream-K, requantization, and the same block M and output chunk sizes. All GEMM layouts and unary/GLU activations are supported. Heuristics select one group; benchmark both settings to weigh activation speed against resource usage.
 
 #### `umma_cta_group_size`
 

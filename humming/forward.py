@@ -149,6 +149,7 @@ def humming_forward(
     bias: torch.Tensor | None = None,
     weight_scale_2: torch.Tensor | None = None,
     outputs: torch.Tensor | None = None,
+    output_scales: torch.Tensor | None = None,
     input_scale: torch.Tensor | None = None,
     input_scale_2: torch.Tensor | None = None,
     sorted_ids: torch.Tensor | None = None,
@@ -162,7 +163,7 @@ def humming_forward(
     tuning_config: dict | list | str | None = None,
     hadamard_block_size: int | None = None,
     use_pdl: bool | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     compute_config, tuning_config, m_major_scale = _prepare_forward_configs(compute_config, tuning_config)
 
     unquantized_dtype = [torch.bfloat16, torch.float16, torch.float32]
@@ -192,6 +193,7 @@ def humming_forward(
         inputs=inputs,
         weight=weight,
         outputs=outputs,
+        output_scales=output_scales,
         input_scale=input_scale,
         input_scale_2=input_scale_2,
         weight_scale=weight_scale,

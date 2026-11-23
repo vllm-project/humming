@@ -3,6 +3,7 @@ import json
 import os
 import re
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,7 +12,14 @@ from filelock import FileLock
 
 import humming.utils.jit as jit_utils
 from humming import dtypes, ops
-from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, TuningConfig
+from humming.config import (
+    ComputeConfig,
+    GemmType,
+    LayerConfig,
+    MmaType,
+    ProcessInputProblemConfig,
+    TuningConfig,
+)
 from humming.config.config import _cuda_compiler_version
 from humming.config.mma import get_default_mma_type, get_mxmma_compiler_error
 from humming.device import current_device
@@ -21,6 +29,11 @@ from humming.testing.data import (
     generate_moe_tensors,
     generate_random_tensor,
     generate_random_topk_ids,
+)
+from humming.testing.process_input import (
+    decode_quantized,
+    quant_input_ref,
+    unpack_group_scales,
 )
 from humming.testing.tuning import (
     NUM_SAMPLED_TUNING_CONFIGS,
@@ -79,6 +92,7 @@ class KernelTestCase:
     input_std_scale: float = 1.0
     weight_std_scale: float = 1.0
     bias_std_scale: float = 1.0
+    output_activation_ref: Callable[[torch.Tensor], torch.Tensor] | None = None
     rtol: float = 0.01
     atol: float = 0.05
 
@@ -479,22 +493,79 @@ class KernelTestRunner:
         if self.compute_config.gemm_type in [GemmType.GROUPED_CONTIGUOUS, GemmType.GROUPED_MASKED]:
             output_shape_m = inputs.shape[0]
 
+        config = self.layer_config
+        output_dtype = config.output_dtype
+        output_columns = config.output_shape_n * min(8, output_dtype.num_bits) // 8
         outputs = torch.zeros(
-            (output_shape_m, self.layer_config.shape_n - self.layer_config.pad_shape_n),
-            dtype=dtypes.torch_dtype_map[self.layer_config.c_dtype],
+            (output_shape_m, output_columns),
+            dtype=dtypes.torch_dtype_map.get(output_dtype, torch.uint8),
             device=inputs.device,
         )
-        return ops.launch_kernel(
+        output_scales = None
+        if config.requantize_output:
+            quant_config = ProcessInputProblemConfig(
+                input_dtype=config.c_dtype,
+                hidden_size=config.output_shape_n,
+                quant_mode=config.input_quant_mode,
+                quant_dtype=config.a_dtype,
+                quant_group_size=config.input_scale_group_size,
+                group_scale_dtype=config.as_dtype,
+                use_m_major_input_scale=self.compute_config.use_m_major_input_scale,
+            )
+            output_scales = torch.zeros(
+                quant_config.get_group_scale_shape(output_shape_m),
+                dtype=quant_config.group_scale_torch_dtype,
+                device=inputs.device,
+            )
+        outputs = ops.launch_kernel(
             configs=kernel_config,
             outputs=outputs,
+            output_scales=output_scales,
             locks=torch.zeros((2048,), dtype=torch.int32, device=inputs.device),
             top_k=self.test_case.top_k,
             **launch_tensors,
             **self.kernel_tensors,
         )
+        if config.requantize_output:
+            values = decode_quantized(outputs, str(output_dtype))
+            scales = unpack_group_scales(
+                output_scales,
+                output_shape_m,
+                config.output_shape_n // config.input_scale_group_size,
+                config.as_dtype,
+                self.compute_config.use_m_major_input_scale,
+            )
+            return values * scales.float().repeat_interleave(config.input_scale_group_size, 1)
+        return outputs
 
     def _assert_close(self, outputs: torch.Tensor, outputs_ref: torch.Tensor, use_stream_k: bool) -> None:
         rtol, atol = self.test_case.rtol, self.test_case.atol
+        config = self.layer_config
+        if config.requantize_output:
+            quantized, scales, _ = quant_input_ref(
+                outputs_ref.float(),
+                config.input_quant_mode,
+                config.a_dtype,
+                config.input_scale_group_size,
+                config.as_dtype,
+            )
+            values = decode_quantized(quantized, str(config.a_dtype))
+            scales = unpack_group_scales(
+                scales, values.shape[0], values.shape[1] // config.input_scale_group_size, config.as_dtype
+            )
+            scales = scales.float().repeat_interleave(config.input_scale_group_size, 1)
+            step = torch.ones_like(values)
+            if config.a_dtype.is_floating_point_type and config.a_dtype.exponent_bits > 0:
+                _, exponent = torch.frexp(values.abs())
+                bias = 2 ** (config.a_dtype.exponent_bits - 1) - 1
+                exponent = exponent.clamp_min(2 - bias) - 1 - config.a_dtype.mantissa_bits
+                step = torch.ldexp(step, exponent)
+            # GEMM rounding can cross quantization thresholds. Allow one output
+            # quantization step in addition to the case's GEMM error tolerance.
+            allowance = step * scales * 1.01 + outputs_ref.abs() * rtol + atol
+            error = (outputs - values * scales).abs() / allowance
+            torch.testing.assert_close(error, torch.zeros_like(error), rtol=0, atol=1)
+            return
         try:
             torch.testing.assert_close(outputs, outputs_ref, rtol=rtol, atol=atol)
         except AssertionError:
@@ -630,6 +701,11 @@ class KernelTestRunner:
                 "input_scale_2": input_scale_2,
             }
             outputs_ref = self.make_reference(inputs_ref, topk_ids, output_ids)
+            if self.layer_config.has_fused_output:
+                assert self.test_case.output_activation_ref is not None
+                outputs_ref = self.test_case.output_activation_ref(outputs_ref.float())
+                if not self.layer_config.requantize_output:
+                    outputs_ref = outputs_ref.to(dtypes.torch_dtype_map[self.layer_config.c_dtype])
 
             for kernel in kernels[shape_m]:
                 kernel_launch_tensors = launch_tensors

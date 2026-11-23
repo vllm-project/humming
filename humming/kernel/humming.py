@@ -10,6 +10,7 @@ import torch
 import humming.utils.jit as jit_utils
 from humming import dtypes
 from humming.config import (
+    ActivationType,
     ComputeConfig,
     GemmType,
     LayerConfig,
@@ -61,8 +62,20 @@ using ElementB = {{mma_b_dtype}};
 {{mma_op_class}}
 };
 
+struct ActivationFunc {
+  static constexpr ActivationType kType = ActivationType::{{activation_func_type}};
+{% if activation_func_type == "Unary" %}
+  CUDA_INLINE static float apply(float a) { return {{activation_func_impl}}; }
+{% elif activation_func_type == "BinaryInterleaved" %}
+  CUDA_INLINE static float apply(float a, float b) { return {{activation_func_impl}}; }
+{% endif %}
+};
+
 class LayerConfig {
 public:
+using ActivationFunc = ::ActivationFunc;
+using OutputType = {{output_dtype}};
+using OutputScaleType = {{output_scale_dtype}};
 {{layer_config}}
 };
 
@@ -113,9 +126,13 @@ extern "C" __constant__ uint32_t WARP_SHAPE_K = {{warp_shape[2]}};
 extern "C" __constant__ uint32_t A_DTYPE_ID = {{a_dtype}}::kId;
 extern "C" __constant__ uint32_t B_DTYPE_ID = {{b_dtype}}::kId;
 extern "C" __constant__ uint32_t C_DTYPE_ID = {{c_dtype}}::kId;
+extern "C" __constant__ uint32_t OUTPUT_DTYPE_ID = {{output_dtype}}::kId;
+extern "C" __constant__ uint32_t OUTPUT_SCALE_DTYPE_ID = {{output_scale_dtype}}::kId;
 extern "C" __constant__ uint32_t BS_DTYPE_ID = {{bs_dtype}}::kId;
 
 {{layer_config_extern}}
+extern "C" __constant__ uint32_t ACTIVATION_FUNC_TYPE =
+    static_cast<uint32_t>(LayerConfig::kActivationFuncType);
 
 {{compute_config_extern}}
 
@@ -133,6 +150,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
 
     def __post_init__(self):
         LayerConfig.__post_init__(self)
+        # Weight transformation has already interleaved split GLU channels.
+        if self.activation_func_type == ActivationType.BinarySplit:
+            self.activation_func_type = ActivationType.BinaryInterleaved
         ComputeConfig.__post_init__(self)
         self.mma_type = MmaType(self.mma_type) if self.mma_type is not None else get_default_mma_type(self)
         self.use_umma_pipeline = self.mma_type == MmaType.UMMA
@@ -140,8 +160,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.use_warp_spec = True
         TuningConfig.__post_init__(self)
         if self.use_umma_pipeline:
-            self.num_threads = 256 if self.use_umma_ss else 256 + 128 * self.umma_num_dequant_warpgroups
-            self.num_math_threads = 128
+            if self.output_chunk_rows >= self.block_shape[0]:
+                self.output_chunk_rows = 0
+            self.num_math_threads = 128 * self.umma_num_epilogue_warpgroups
+            dequant_threads = 0 if self.use_umma_ss else 128 * self.umma_num_dequant_warpgroups
+            self.num_threads = 128 + self.num_math_threads + dequant_threads
             activation_bytes = self.block_shape[0] * self.block_shape[2] * self.a_dtype.num_bits // 8
             # Wider cp.async tiles benefit from a third loading warp. Keep the
             # readiness warp for small tiles and independently loaded TMA operands.
@@ -158,11 +181,20 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         self.check_dtype()
         self.check_scale()
         self.check_config()
+        if self.requantize_output:
+            minimum_n = self.input_scale_group_size
+            if self.activation_func_type.is_binary:
+                minimum_n *= 2
+            if self.block_shape[1] < minimum_n:
+                raise ValueError("block_n must cover a complete output quantization group")
         self.mma_op_class = self.select_mma_op_class()
 
         assert self.bs_dtype is not None
         template_args = self.to_template_args()
         template_args.update(
+            activation_func_type=self.activation_func_type.cpp_name,
+            output_dtype=self.output_dtype.to_cpp_str(),
+            output_scale_dtype=(self.as_dtype or dtypes.float32).to_cpp_str(),
             use_umma_pipeline=self.use_umma_pipeline,
             use_native_ldmatrix_dequant=self.use_native_ldmatrix_dequant,
             mma_op_class=self.mma_op_class.to_cpp_str(),
@@ -235,6 +267,11 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         return has_native_conversion and has_native_target
 
     def postprocess_cubin(self, cubin_path: str):
+        if self.requantize_output and self.a_dtype in (dtypes.float8e3m4, dtypes.float4e0m3):
+            from humming.utils.cubin import patch_cubin
+
+            output_mode = "cvt_e3m4" if self.a_dtype == dtypes.float8e3m4 else "cvt_e0m3"
+            patch_cubin(cubin_path=cubin_path, mode=output_mode)
         if self.use_ldmatrix_dequant and not self.use_native_ldmatrix_dequant:
             from humming.utils.cubin import patch_cubin
 
@@ -538,6 +575,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         assert self.num_threads <= 1024
         if self.gemm_type is None and self.num_experts == 0:
             self.gemm_type = GemmType.DENSE
+        assert self.umma_num_epilogue_warpgroups in (1, 2), "UMMA epilogue warpgroup count must be 1 or 2"
+        if self.umma_num_epilogue_warpgroups == 2:
+            assert self.mma_type == MmaType.UMMA, "two epilogue warpgroups require UMMA"
         if self.mma_type != MmaType.UMMA:
             assert self.umma_cta_group_size == 1, "UMMA cooperative execution requires mma_type=umma"
         if self.use_umma_ss:

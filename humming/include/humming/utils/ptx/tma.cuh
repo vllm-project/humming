@@ -344,6 +344,50 @@ CUDA_INLINE void tma_wait_store_group() {
   }
 };
 
+// Initialize a shared-memory descriptor with unit element strides and no fill or interleave.
+// The caller must set the global address and publish the descriptor before TMA use.
+template <uint32_t kElementType, uint32_t kSwizzleMode>
+CUDA_INLINE void tensor_map_initialize_3d(
+    CUtensorMap *descriptor, const uint32_t (&box_dims)[3],
+    const uint32_t (&global_dims)[3], const uint64_t (&global_strides)[2]) {
+  descriptor[0] = CUtensorMap{};
+  uint32_t address = cast_smem_ptr_to_uint(descriptor);
+  asm volatile(
+      "tensormap.replace.tile.rank.shared::cta.b1024.b32 [%0], %1;\n"
+      "tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [%0], 0, %2;\n"
+      "tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [%0], 1, %3;\n"
+      "tensormap.replace.tile.box_dim.shared::cta.b1024.b32 [%0], 2, %4;\n"
+      "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 0, %11;\n"
+      "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 1, %5;\n"
+      "tensormap.replace.tile.global_dim.shared::cta.b1024.b32 [%0], 2, %6;\n"
+      "tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], 0, %7;\n"
+      "tensormap.replace.tile.global_stride.shared::cta.b1024.b64 [%0], 1, %8;\n"
+      "tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [%0], 0, %9;\n"
+      "tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [%0], 1, %9;\n"
+      "tensormap.replace.tile.element_stride.shared::cta.b1024.b32 [%0], 2, %9;\n"
+      "tensormap.replace.tile.elemtype.shared::cta.b1024.b32 [%0], %10;\n"
+      "tensormap.replace.tile.interleave_layout.shared::cta.b1024.b32 [%0], 0;\n"
+      "tensormap.replace.tile.swizzle_mode.shared::cta.b1024.b32 [%0], %12;\n"
+      "tensormap.replace.tile.fill_mode.shared::cta.b1024.b32 [%0], 0;\n"
+      :
+      : "r"(address), "r"(2u), "r"(box_dims[0]), "r"(box_dims[1]), "r"(box_dims[2]),
+        "r"(global_dims[1]), "r"(global_dims[2]), "l"(global_strides[0]),
+        "l"(global_strides[1]), "r"(1u), "n"(kElementType), "r"(global_dims[0]), "n"(kSwizzleMode)
+      : "memory");
+#if __CUDA_ARCH__ >= 1000
+  asm volatile("tensormap.replace.tile.swizzle_atomicity.shared::cta.b1024.b32 [%0], 0;"
+               :: "r"(address) : "memory");
+#endif
+}
+
+CUDA_INLINE void tensor_map_replace_global_address(void *smem_desc_ptr, const void *address) {
+  uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_desc_ptr);
+  asm volatile("tensormap.replace.tile.global_address.shared::cta.b1024.b64 [%0], %1;\n"
+               :
+               : "r"(smem_int_ptr), "l"(address)
+               : "memory");
+}
+
 template <uint32_t ord>
 CUDA_INLINE void tensor_map_replace_global_dim(void *smem_desc_ptr, uint32_t value) {
   uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_desc_ptr);

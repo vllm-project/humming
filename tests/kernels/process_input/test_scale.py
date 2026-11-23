@@ -28,6 +28,7 @@ from humming.utils.math import ceil_div
         (3, 768, 128, "dynamic_group", "float8e4m3", True),
         (3, 768, 128, "dynamic_group", "float8e8m0", False),
         (3, 768, 128, "dynamic_group", "float8e8m0", True),
+        (3, 96, 32, "dynamic_group", "float8e8m0", True),
         (3, 768, 128, "static_tensor_dynamic_group", "float32", False),
         (3, 768, 128, "static_tensor_dynamic_group", "float8e4m3", True),
         (3, 768, 128, "static_tensor_dynamic_group", "float8e8m0", False),

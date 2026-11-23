@@ -397,7 +397,7 @@ def _fits_device_resources(
     num_threads = num_math_threads + (128 if config["use_warp_spec"] else 0)
     if mma_type == MmaType.UMMA:
         dequant_threads = 0 if layer_config.use_raw_weight else 128 * config["umma_num_dequant_warpgroups"]
-        num_threads = 256 + dequant_threads
+        num_threads = 128 * (1 + config.get("umma_num_epilogue_warpgroups", 1)) + dequant_threads
     num_ctas_per_sm = config["num_ctas_per_sm"]
     max_threads = current_device.max_threads_per_sm
     registers_per_sm = current_device.max_registers_per_sm
@@ -447,9 +447,9 @@ def _try_combine_candidate(
         if config["umma_cta_group_size"] == 2:
             if block_shape[0] % 16 or layer_config.shape_n % (2 * block_shape[1]):
                 return None
-        num_math_threads = 128
+        num_math_threads = 128 * config.get("umma_num_epilogue_warpgroups", 1)
         dequant_threads = 0 if layer_config.use_raw_weight else 128 * config["umma_num_dequant_warpgroups"]
-        num_threads = 256 + dequant_threads
+        num_threads = 128 * (1 + config.get("umma_num_epilogue_warpgroups", 1)) + dequant_threads
     if num_threads > 1024:
         return None
     use_warp_group = config["use_warp_spec"] or mma_type == MmaType.WGMMA

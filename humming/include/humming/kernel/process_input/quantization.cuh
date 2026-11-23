@@ -503,6 +503,52 @@ struct QuantGroupResult {
 };
 
 
+template <class ScaleType, uint32_t kValuesPerLane>
+CUDA_INLINE void apply_quant_scale(float *values, float scale) {
+  float dynamic_multiplier;
+  if constexpr (
+      std::is_same<ScaleType, Float32>::value ||
+      std::is_same<ScaleType, Float8E8M0>::value ||
+      std::is_same<ScaleType, M3BFloat16>::value)
+    dynamic_multiplier = __fdividef(1.f, scale);
+  else
+    dynamic_multiplier = scale > 0.f ? __fdividef(1.f, scale) : 0.f;
+  PRAGMA_UNROLL
+  for (uint32_t value = 0; value < kValuesPerLane; value++)
+    values[value] *= dynamic_multiplier;
+}
+
+
+template <class TargetType, uint32_t kValuesPerLane>
+CUDA_INLINE void pack_quantized_values(float *values, uint8_t *packed) {
+  if constexpr (TargetType::kIsFloatingPointType) {
+    pack_float<TargetType, kValuesPerLane>(values, packed);
+  } else if constexpr (TargetType::kBits == 8) {
+    pack_int8<kValuesPerLane>(values, packed);
+  } else {
+    static_assert(TargetType::kIsIntegerType && TargetType::kIsSigned && TargetType::kBits == 4);
+    // Saturate to INT4 before packing low nibbles; INT8 conversion alone wraps.
+    PRAGMA_UNROLL
+    for (uint32_t value = 0; value < kValuesPerLane; value++)
+      values[value] = fminf(fmaxf(values[value], -8.f), 7.f);
+    pack_int4<kValuesPerLane>(values, packed);
+  }
+}
+
+
+template <class TargetType, class ScaleType, uint32_t kValuesPerLane, uint32_t kGroupSize, uint32_t kNumWarps, uint32_t kWarpOffset = 0>
+CUDA_INLINE auto quant_dynamic_group(float *values, float *shared) {
+  static_assert(supported_scale_type<ScaleType>);
+  float maximum = group_absmax<kValuesPerLane, kGroupSize, kNumWarps, kWarpOffset>(values, shared);
+  float raw_scale = fmaxf(__fdividef(maximum, target_maximum<TargetType>()), 1e-30f);
+  QuantGroupResult<TargetType, ScaleType, kValuesPerLane> result;
+  result.scale = encode_scale<ScaleType>(raw_scale);
+  apply_quant_scale<ScaleType, kValuesPerLane>(values, decode_scale<ScaleType>(result.scale));
+  pack_quantized_values<TargetType, kValuesPerLane>(values, result.packed);
+  return result;
+}
+
+
 template <class Context, uint32_t kWarpOffset = 0>
 CUDA_INLINE auto quant_group(
     float *values,
@@ -518,6 +564,10 @@ CUDA_INLINE auto quant_group(
   static_assert(supported_scale_type<ScaleType>);
   static_assert(Context::kDynamicGroupScale || std::is_same<ScaleType, Float32>::value);
   static_assert(kPhase == ProcessInputQuantizationPhase::Fused || Context::kDynamicTokenMode);
+
+  constexpr bool kPlainDynamicGroup = Context::kDynamicGroupScale && !Context::kStaticTensorScale && !Context::kFusedGroupToken && kPhase == ProcessInputQuantizationPhase::Fused;
+  if constexpr (kPlainDynamicGroup)
+    return quant_dynamic_group<TargetType, ScaleType, kValuesPerLane, kScaleSize, kNumWarps, kWarpOffset>(values, shared);
 
   QuantGroupResult<TargetType, ScaleType, kValuesPerLane> result;
   if constexpr (Context::kStaticTensorScale && !Context::kDynamicGroupScale) {
@@ -537,7 +587,7 @@ CUDA_INLINE auto quant_group(
     // Finish cross-warp reads before the token reduction reuses the same scratch.
     if constexpr (Context::kFusedGroupToken && kGroupLanes > 32)
       sync_slice_threads<kSyncThreads, kNumWarps, kWarpOffset>();
-    float raw_scale = fmaxf(maximum / target_maximum<TargetType>(), 1e-30f);
+    float raw_scale = fmaxf(__fdividef(maximum, target_maximum<TargetType>()), 1e-30f);
     if constexpr (Context::kStaticTensorScale && Context::kDynamicGroupScale)
       raw_scale /= static_scale;
     result.scale = encode_scale<ScaleType>(raw_scale);
@@ -547,33 +597,11 @@ CUDA_INLINE auto quant_group(
     float scale = decode_scale<ScaleType>(result.scale);
     if constexpr (Context::kStaticTensorScale && Context::kDynamicGroupScale)
       scale *= static_scale;
-    float dynamic_multiplier;
-    if constexpr (
-        std::is_same<ScaleType, Float32>::value ||
-        std::is_same<ScaleType, Float8E8M0>::value ||
-        std::is_same<ScaleType, M3BFloat16>::value)
-      dynamic_multiplier = 1.f / scale;
-    else
-      dynamic_multiplier = scale > 0.f ? 1.f / scale : 0.f;
-    PRAGMA_UNROLL
-    for (uint32_t value = 0; value < kValuesPerLane; value++)
-      values[value] *= dynamic_multiplier;
+    apply_quant_scale<ScaleType, kValuesPerLane>(values, scale);
   }
 
-  if constexpr (kPhase != ProcessInputQuantizationPhase::CollectAbsmax) {
-    if constexpr (TargetType::kIsFloatingPointType) {
-      pack_float<TargetType, kValuesPerLane>(values, result.packed);
-    } else if constexpr (TargetType::kBits == 8) {
-      pack_int8<kValuesPerLane>(values, result.packed);
-    } else {
-      static_assert(TargetType::kIsIntegerType && TargetType::kIsSigned && TargetType::kBits == 4);
-      // Saturate to INT4 before packing low nibbles; INT8 conversion alone wraps.
-      PRAGMA_UNROLL
-      for (uint32_t value = 0; value < kValuesPerLane; value++)
-        values[value] = fminf(fmaxf(values[value], -8.f), 7.f);
-      pack_int4<kValuesPerLane>(values, result.packed);
-    }
-  }
+  if constexpr (kPhase != ProcessInputQuantizationPhase::CollectAbsmax)
+    pack_quantized_values<TargetType, kValuesPerLane>(values, result.packed);
 
   return result;
 }

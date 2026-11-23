@@ -125,6 +125,37 @@ public:
       if (ctx.k_warp_id() != 0) return;
     }
     const uint32_t thread_id = GmemWriter::kUseWarpgroupEpilogue ? ctx.math_thread_id() % 128 : ctx.math_thread_id();
+    if constexpr (Ctx::kHasFusedOutput && Ctx::kUseStreamK) {
+      ctx.sync_math_threads();
+      if constexpr (Ctx::kUseTmaC) tma_wait_store_group<0>();
+      else __threadfence();
+      ctx.sync_math_threads();
+      if (thread_id == 0) {
+        bool last = false;
+        if (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3)) {
+          if (slice_id == 0) {
+            atomicExch(&locks[locks_offset], 1 - static_cast<int32_t>(slice_count));
+          } else {
+            int32_t previous;
+            asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;": "=r"(previous) : "l"(&locks[locks_offset]) : "memory");
+            last = previous == -1;
+          }
+        } else last = slice_id == slice_count - 1;
+        ctx.smem.reduce[0].x = last;
+      }
+      ctx.sync_math_threads();
+      bool is_last_slice = ctx.smem.reduce[0].x != 0;
+      ctx.sync_math_threads();
+      if (is_last_slice) {
+        gmem_writer.finalize_workspace();
+        ctx.sync_math_threads();
+        if (thread_id == 0) atomicExch(&locks[locks_offset], 0);
+      } else if (!(Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3))) {
+        barrier_release<kNumStreamKSyncThreads, Ctx::kNumThreads>(&locks[locks_offset], false, thread_id, get_output_barrier_id());
+      }
+      return;
+    }
+
     if (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3)) {
       int32_t val = slice_id == 0 ? 1 - static_cast<int32_t>(slice_count) : 0;
       barrier_release2<kNumStreamKSyncThreads, Ctx::kNumThreads>(&locks[locks_offset], val, thread_id, get_output_barrier_id());
@@ -177,6 +208,10 @@ public:
     slice_count = slice_count_;
     slice_id = slice_id_;
     locks_offset = locks_offset_;
+    if constexpr (Ctx::kHasFusedOutput) {
+      gmem_writer.set_workspace_slot(locks_offset_);
+      if (slice_count_ > 1) gmem_writer.prepare_workspace_map();
+    }
     if constexpr (GmemWriter::kUseWarpgroupEpilogue)
       locks_offset = locks_offset_ * SharedStorage::kNumStreamKLocksPerTile + ctx.math_thread_id() / 128;
   };
