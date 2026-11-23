@@ -265,6 +265,8 @@ public:
       uint32_t rows = output_shape_m;
       if constexpr (BlockShape::M % kOutputRows != 0) rows = MIN(rows, row_offset + BlockShape::M);
       if (rows != descriptor_rows) {
+        // PDL can overlap kernels that reuse the same descriptor allocation.
+        if constexpr (Ctx::kUsePdl) griddepcontrol_wait();
         // Each issuing thread drains its stores before the CTA descriptor is overwritten.
         tma_wait_store_group<0>();
         ctx.sync_math_threads();
