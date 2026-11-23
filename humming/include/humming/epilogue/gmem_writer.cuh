@@ -118,10 +118,6 @@ public:
 
   CUDA_INLINE
   void write(uint32_t slice_id, uint32_t slice_count, uint32_t first_row) {
-    if constexpr (Ctx::kHasFusedOutput) {
-      write_chunk(slice_id, slice_count, first_row, BlockShape::M, 0);
-      return;
-    }
     if constexpr (kUseWarpgroupEpilogue) {
       if (ctx.k_warp_id() != 0) return;
       if constexpr (kUseTmaC) {
@@ -132,10 +128,11 @@ public:
         write_legacy<WarpShape::M, kWarpgroupColumns, kOutputRows, 128>(
             slice_id, slice_count, first_row + first_partition_row, first_column, first_partition_row * 8);
       }
-    } else if constexpr (kUseTmaC) {
-      write_tma(slice_id, slice_count);
     } else {
-      write_legacy(slice_id, slice_count, first_row);
+      write_chunk(slice_id, slice_count, first_row, BlockShape::M, 0);
+      if constexpr (kUseTmaC && kUseStreamK) {
+        if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
+      }
     }
   };
 
@@ -214,11 +211,9 @@ public:
   CUDA_INLINE void write_chunk(uint32_t slice_id, uint32_t slice_count, uint32_t first_row,
       uint32_t rows, uint32_t buffer_offset, uint32_t first_column = 0) {
     constexpr uint32_t kRows = kOutputRows;
-    if constexpr (Ctx::kHasFusedOutput) {
-      if constexpr (Ctx::kRequantizeOutput || kIsBinaryActivation) {
-        write_fused<kColumns>(first_row, rows, buffer_offset, first_column);
-        return;
-      }
+    if constexpr (Ctx::kRequantizeOutput || kIsBinaryActivation) {
+      write_fused<kColumns>(first_row, rows, buffer_offset, first_column);
+      return;
     }
     if constexpr (kUseTmaC) {
       if constexpr (kUseTma3d) {
@@ -252,15 +247,6 @@ public:
     else
       tma_reduce_add_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, column, row);
     tma_commit_store_group();
-  }
-
-  CUDA_INLINE
-  void write_tma(uint32_t slice_id, uint32_t slice_count) {
-    static_assert(!kIsIndexedGemm);
-    write_chunk(slice_id, slice_count, 0, BlockShape::M, 0);
-    if constexpr (kUseStreamK) {
-      if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
-    }
   }
 
   static constexpr uint32_t kOutputWidth = (ProblemShape::N - PadShape::N) / (kIsBinaryActivation ? 2 : 1);

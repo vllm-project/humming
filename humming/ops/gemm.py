@@ -18,33 +18,24 @@ def _get_humming_gemm_output_meta(layer_config: str, compute_config: str | None)
     c_dtype = dtypes.DataType.from_str(layer_obj["c_dtype"])
     divisor = 2 if layer_obj.get("activation_func_type") in ("binary_split", "binary_interleaved") else 1
     shape_n //= divisor
+    scale_meta = None
     if layer_obj.get("requantize_output", False):
-        c_dtype = dtypes.DataType.from_str(layer_obj["a_dtype"])
+        config = LayerConfig(**layer_obj)
+        output_config = ProcessInputProblemConfig(
+            input_dtype=config.c_dtype,
+            hidden_size=config.output_shape_n,
+            quant_mode=config.input_quant_mode,
+            quant_dtype=config.a_dtype,
+            quant_group_size=config.input_scale_group_size,
+            group_scale_dtype=config.as_dtype,
+        )
+        scale_columns = output_config.get_group_scale_shape(1)[1]
+        m_major_scale = bool(compute_obj.get("use_m_major_input_scale", False))
+        scale_meta = scale_columns, output_config.group_scale_torch_dtype, m_major_scale
+        c_dtype = config.a_dtype
         shape_n = shape_n * min(8, c_dtype.num_bits) // 8
     output_dtype = dtypes.torch_dtype_map.get(c_dtype, torch.uint8)
-    return shape_n, output_dtype, compute_obj.get("gemm_type") == "indexed"
-
-
-@torch.compiler.assume_constant_result
-def _get_fused_output_scale_meta(
-    layer_config: str, compute_config: str | None
-) -> tuple[int, torch.dtype, bool] | None:
-    layer_obj = json.loads(layer_config)
-    if not layer_obj.get("requantize_output", False):
-        return None
-
-    config = LayerConfig(**layer_obj)
-    output_config = ProcessInputProblemConfig(
-        input_dtype=config.c_dtype,
-        hidden_size=config.output_shape_n,
-        quant_mode=config.input_quant_mode,
-        quant_dtype=config.a_dtype,
-        quant_group_size=config.input_scale_group_size,
-        group_scale_dtype=config.as_dtype,
-    )
-    compute_obj = json.loads(compute_config or "{}")
-    m_major_scale = bool(compute_obj.get("use_m_major_input_scale", False))
-    return output_config.get_group_scale_shape(1)[1], output_config.group_scale_torch_dtype, m_major_scale
+    return shape_n, output_dtype, compute_obj.get("gemm_type") == "indexed", scale_meta
 
 
 @register_op("humming::prepare_kernels")
@@ -93,19 +84,16 @@ def humming_gemm(
     top_k: int = 1,
     valid_shape_m: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    scale_meta = _get_fused_output_scale_meta(layer_config, compute_config)
+    shape_n, output_dtype, is_indexed, scale_meta = _get_humming_gemm_output_meta(layer_config, compute_config)
+    shape_m = inputs.size(0) * (top_k if is_indexed else 1)
     if scale_meta is not None and output_scales is None:
         scale_columns, scale_dtype, m_major_scale = scale_meta
-        _, _, is_indexed = _get_humming_gemm_output_meta(layer_config, compute_config)
-        rows = inputs.size(0) * (top_k if is_indexed else 1)
-        scale_shape = (scale_columns, (rows + 3) // 4 * 4) if m_major_scale else (rows, scale_columns)
+        scale_shape = (scale_columns, (shape_m + 3) // 4 * 4) if m_major_scale else (shape_m, scale_columns)
         output_scales = torch.empty(scale_shape, dtype=scale_dtype, device=inputs.device)
 
     use_ops = _should_use_torch_op(inputs)
     if use_ops:
         if outputs is None:
-            shape_n, output_dtype, is_indexed = _get_humming_gemm_output_meta(layer_config, compute_config)
-            shape_m = inputs.size(0) * (top_k if is_indexed else 1)
             outputs = inputs.new_empty((shape_m, shape_n), dtype=output_dtype)
         configs = torch.ops.humming.prepare_kernels(inputs, layer_config, compute_config, tuning_config)
     else:

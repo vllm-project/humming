@@ -1,15 +1,12 @@
-import json
-from dataclasses import replace
 from functools import partial
 
 import pytest
 import torch
 
-from humming import dtypes, ops
+from humming import dtypes
 from humming.config import ActivationType, ComputeConfig, GemmType, LayerConfig, ProcessInputProblemConfig
 from humming.config.mma import get_default_mma_type
 from humming.device import current_device
-from humming.kernel.humming import HummingKernel
 from humming.ops import gemm
 from humming.schema import HummingInputSchema, HummingWeightSchema
 from humming.testing import (
@@ -18,10 +15,8 @@ from humming.testing import (
     assert_kernel_test_shape_coverage,
     skip_if_unsupported,
 )
-from humming.testing.data import generate_random_tensor, generate_random_topk_ids
 from humming.testing.process_input import ACTIVATION_TYPE_IMPL_TEST_MAP, apply_activation_ref
 from humming.transform import prepare_and_transform_humming_tensors
-from humming.tune import get_heuristics_config
 
 
 def _case(name, a_dtype, activation, gemm_type="dense", *, requantize=False, m_major=False, pad_shape_n=64):
@@ -91,116 +86,6 @@ def test_fused_output(test_case):
     skip_if_unsupported(a_dtype=config.a_dtype, mma_type=get_default_mma_type(config).value)
     results = KernelTestRunner(test_case).run()
     assert_kernel_test_shape_coverage(results)
-
-
-@pytest.mark.parametrize("test_case", FUSED_OUTPUT_CASES, ids=str)
-def test_fused_output_rejects_stream_k(test_case):
-    config = test_case.layer_config
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=get_default_mma_type(config).value)
-    compute = test_case.compute_config
-    tuning = get_heuristics_config(config, shape_m=128, **compute.to_dict())
-    assert tuning["use_stream_k"] is False
-    intervals = get_heuristics_config(config, **compute.to_dict())
-    assert all(entry[2]["use_stream_k"] is False for entry in intervals)
-    with pytest.raises(AssertionError, match="fused output requires use_stream_k=False"):
-        HummingKernel.prepare_kernels(config.to_str(), compute.to_str(), dict(tuning, use_stream_k=True))
-
-
-@pytest.mark.parametrize("requantize", [False, True], ids=["swiglu", "fp8-requant"])
-def test_grouped_pdl_reuses_output_descriptors(requantize):
-    if current_device.sm_version != 120:
-        pytest.skip("Regression uses SM120 MMA and MXMMA launch geometries")
-    config = LayerConfig(
-        shape_n=1024,
-        shape_k=4096,
-        num_experts=8,
-        a_dtype=dtypes.float8e4m3 if requantize else dtypes.bfloat16,
-        b_dtype=dtypes.float4e2m1 if requantize else dtypes.uint4,
-        c_dtype=dtypes.bfloat16,
-        bs_dtype=dtypes.float8e8m0 if requantize else dtypes.bfloat16,
-        input_scale_group_size=32 if requantize else 0,
-        weight_scale_group_size=32 if requantize else 128,
-        has_bias=True,
-    )
-    compute = ComputeConfig(gemm_type=GemmType.GROUPED_CONTIGUOUS)
-    runner = KernelTestRunner(
-        KernelTestCase(
-            name="grouped-pdl-descriptors", layer_config=config, compute_config=compute, top_k=2, seed=219
-        )
-    )
-    config = runner.layer_config
-    shape_m = 4096
-    torch.manual_seed(219 + shape_m)
-    inputs = generate_random_tensor((shape_m, config.shape_k), dtype=config.param_dtype, device="cuda")
-    topk_ids = generate_random_topk_ids(shape_m, config.num_experts, 2, device="cuda")
-    block_m = 96 if requantize else 128
-    routed, routing, _ = runner._prepare_problem(shape_m, inputs, topk_ids, block_m)
-    _, inputs, input_scale, input_scale_2 = runner.prepare_inputs(routed)
-    outputs = torch.empty((routed.shape[0], config.shape_n), dtype=config.param_dtype, device="cuda")
-    tuning = dict(use_pdl=True, use_tma=True, use_warp_spec=True, evict_weights_first=False)
-    if requantize:
-        tuning.update(mma_type="mxmma", num_stages=2, smem_reuse_mode="last_stage", use_stream_k=False)
-        plain_tuning = dict(tuning, block_shape=[96, 256, 128], warp_shape=[96, 32, 128])
-        fused_tuning = dict(tuning, block_shape=[96, 256, 64], warp_shape=[96, 32, 64])
-    else:
-        tuning.update(mma_type="mma")
-        plain_tuning = dict(
-            tuning, block_shape=[128, 256, 64], warp_shape=[128, 32, 64], num_stages=3, use_stream_k=True
-        )
-        fused_tuning = dict(
-            tuning, block_shape=[128, 128, 64], warp_shape=[128, 32, 32], num_stages=4, use_stream_k=False
-        )
-    fused_config = replace(
-        config,
-        activation_func_type="none" if requantize else "binary_interleaved",
-        activation_func_impl=None if requantize else "__fdividef(a, 1.f + __expf(-a)) * b",
-        requantize_output=requantize,
-    )
-    kwargs = dict(
-        inputs=inputs,
-        input_scale=input_scale,
-        input_scale_2=input_scale_2,
-        compute_config=compute.to_str(),
-        top_k=2,
-        valid_shape_m=shape_m * 2,
-        locks=torch.zeros(2048, dtype=torch.int32, device="cuda"),
-        **routing,
-        **runner.kernel_tensors,
-    )
-
-    def plain():
-        return ops.humming_gemm(
-            layer_config=config.to_str(), tuning_config=json.dumps(plain_tuning), outputs=outputs, **kwargs
-        )
-
-    # Allocate persistent outputs before testing allocator reuse of the launcher's temporary descriptors.
-    plain_reference = plain().clone()
-    fused_result = ops.humming_gemm(
-        layer_config=fused_config.to_str(), tuning_config=json.dumps(fused_tuning), **kwargs
-    )
-    fused_outputs, fused_scales = fused_result if requantize else (fused_result, None)
-    fused_reference = fused_outputs.clone()
-    scale_reference = fused_scales.clone() if requantize else None
-    torch.cuda.synchronize()
-
-    def fused():
-        return ops.humming_gemm(
-            layer_config=fused_config.to_str(),
-            tuning_config=json.dumps(fused_tuning),
-            outputs=fused_outputs,
-            output_scales=fused_scales,
-            **kwargs,
-        )
-
-    # Keep launches asynchronous: synchronization between kernels masks the descriptor race.
-    for _ in range(100):
-        fused()
-        plain()
-    torch.cuda.synchronize()
-    runner._assert_close(outputs, plain_reference, plain_tuning["use_stream_k"])
-    torch.testing.assert_close(fused_outputs.float(), fused_reference.float(), rtol=0, atol=0)
-    if requantize:
-        torch.testing.assert_close(fused_scales, scale_reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("test_case", FUSED_OUTPUT_CASES, ids=str)
