@@ -87,11 +87,14 @@ public:
   uint32_t current_expert_m_blocks = 0;
   uint32_t m_offset = 0;
 
-  CUDA_INLINE
+  // Inlining initialization into a register-constrained kernel can make NVRTC
+  // reuse the stack pointer R1 for a division temporary before a spill store.
+  // Keep only this once-per-CTA setup out of line; tile scheduling stays inlined.
+  __device__ __noinline__
   Scheduler(Ctx &ctx) : ctx(ctx) {
 
     current_shape_m = ctx.params.shape_m;
-    expert_max_num_tokens = ctx.params.shape_m / Ctx::kNumExperts;
+    if constexpr (kIsGroupedGemm) expert_max_num_tokens = ctx.params.shape_m / kNumExperts;
     calc_m_blocks();
     if constexpr (kIsGroupedGemm) {
       current_expert_num_tokens = ctx.smem.expert_tokens[0];
