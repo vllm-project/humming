@@ -30,6 +30,10 @@ uv pip install --python .venv/bin/python \
 uv pip install --python .venv/bin/python --no-deps -e .
 
 echo "--- Run tests"
+if [[ "${HUMMING_TEST_TUNING_SOURCE:-}" == sampled* ]]; then
+  export HUMMING_TEST_TUNING_SEED="${HUMMING_TEST_TUNING_SEED:-${BUILDKITE_BUILD_NUMBER:-0}}"
+  echo "Sampled tuning seed: ${HUMMING_TEST_TUNING_SEED}"
+fi
 mkdir -p test-results
 if [[ $# -eq 0 ]]; then
   set -- tests
