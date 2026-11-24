@@ -30,8 +30,27 @@ uv pip install --python .venv/bin/python \
 uv pip install --python .venv/bin/python --no-deps -e .
 
 echo "--- Run tests"
+if [[ "${HUMMING_TEST_TUNING_SOURCE:-}" == sampled* ]]; then
+  export HUMMING_TEST_TUNING_SEED="${HUMMING_TEST_TUNING_SEED:-${BUILDKITE_BUILD_NUMBER:-0}}"
+  echo "Sampled tuning seed: ${HUMMING_TEST_TUNING_SEED}"
+fi
 mkdir -p test-results
 if [[ $# -eq 0 ]]; then
   set -- tests
+fi
+if [[ "${HUMMING_TEST_TUNING_SOURCE:-}" == sampled* && $# -eq 1 && -d "$1" ]]; then
+  mapfile -d '' test_files < <(find "$1" -type f -name 'test_*.py' -print0 | sort -z)
+  if [[ ${#test_files[@]} -eq 0 ]]; then
+    echo "No test files found in $1" >&2
+    exit 1
+  fi
+  test_status=0
+  for test_file in "${test_files[@]}"; do
+    report_name="${test_file//\//_}"
+    echo "--- Run ${test_file}"
+    .venv/bin/python -m pytest "${test_file}" -v \
+      --junitxml="test-results/pytest-${report_name%.py}.xml" || test_status=1
+  done
+  exit "${test_status}"
 fi
 .venv/bin/python -m pytest "$@" -v --junitxml=test-results/pytest.xml

@@ -91,7 +91,7 @@ public:
   Scheduler(Ctx &ctx) : ctx(ctx) {
 
     current_shape_m = ctx.params.shape_m;
-    expert_max_num_tokens = ctx.params.shape_m / Ctx::kNumExperts;
+    if constexpr (kIsGroupedGemm) expert_max_num_tokens = ctx.params.shape_m / kNumExperts;
     calc_m_blocks();
     if constexpr (kIsGroupedGemm) {
       current_expert_num_tokens = ctx.smem.expert_tokens[0];

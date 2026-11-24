@@ -363,20 +363,32 @@ def _get_seed(layer_config: LayerConfig, compute_config: ComputeConfig) -> int:
 def _select_pairwise(
     candidates: list[tuple[dict, dict]], rng: random.Random, max_count: int | None = None
 ) -> list[tuple[dict, dict]]:
-    pair_sets = [frozenset(_get_covered_pairs(candidate)) for candidate in candidates]
-    uncovered = set().union(*pair_sets)
+    pair_masks = {}
+    masks = []
+    uncovered = 0
+    for candidate in candidates:
+        mask = 0
+        for pair in _get_covered_pairs(candidate):
+            pair_mask = pair_masks.get(pair)
+            if pair_mask is None:
+                pair_mask = 1 << len(pair_masks)
+                pair_masks[pair] = pair_mask
+            mask |= pair_mask
+        masks.append(mask)
+        uncovered |= mask
+
     remaining = list(range(len(candidates)))
     rng.shuffle(remaining)
     selected = []
     while uncovered and remaining:
         if max_count is not None and len(selected) >= max_count:
             break
-        candidate_index = max(remaining, key=lambda index: len(pair_sets[index] & uncovered))
-        covered = pair_sets[candidate_index] & uncovered
+        candidate_index = max(remaining, key=lambda index: (masks[index] & uncovered).bit_count())
+        covered = masks[candidate_index] & uncovered
         if not covered:
             break
         selected.append(candidates[candidate_index])
-        uncovered.difference_update(covered)
+        uncovered &= ~covered
         remaining.remove(candidate_index)
     return selected
 
@@ -404,10 +416,14 @@ def _fits_device_resources(
     if num_threads * num_ctas_per_sm > max_threads:
         return False
     tuning_config = create_tuning_config(config)
-    if (
-        get_register_budget_error(layer_config, tuning_config, compute_config.use_f16_accum, registers_per_sm)
-        is not None
-    ):
+    register_error = get_register_budget_error(
+        layer_config,
+        tuning_config,
+        compute_config.use_f16_accum,
+        registers_per_sm,
+        wgmma_register_reserve=16,
+    )
+    if register_error is not None:
         return False
     if mma_type == MmaType.UMMA:
         from humming.tune.sm100 import Sm100UmmaHeuristics
@@ -479,6 +495,8 @@ def _enumerate_backend_candidates(
     mma_type: MmaType,
     sample_size: int,
 ) -> list[tuple[dict, dict]]:
+    if sample_size <= 0:
+        return []
     rng = random.Random(_get_seed(layer_config, compute_config))
     pipeline_options = ("producer_stage_unroll", "consumer_stage_unroll")
     if mma_type != MmaType.UMMA:
@@ -490,34 +508,52 @@ def _enumerate_backend_candidates(
         _generate_scheduling_candidates(layer_config, compute_config, mma_type),
         [(config, config) for config in pipeline_candidates],
     )
+    if not all(groups):
+        return []
     candidates = []
     signatures = set()
+    target_pool_size = max(512, sample_size * 10)
 
     def add(items):
         candidate = _try_combine_candidate(layer_config, compute_config, items)
         if candidate is None:
-            return
+            return False
         key = json.dumps(candidate[1], sort_keys=True)
-        if key not in signatures:
-            signatures.add(key)
-            candidates.append(candidate)
+        if key in signatures:
+            return False
+        signatures.add(key)
+        candidates.append(candidate)
+        return True
 
+    # Anchor every pairwise representative before filling the pool randomly.
+    # A bounded search avoids enumerating the full Cartesian product, while
+    # rare geometry, transfer and scheduling choices still get dedicated trials.
     reduced_groups = tuple(_select_pairwise(group, rng) for group in groups)
-    for items in itertools.product(*reduced_groups):
-        add(items)
+    for group_index, group in enumerate(reduced_groups):
+        for anchor in group:
+            accepted = 0
+            for _ in range(32):
+                items = [rng.choice(other) for other in reduced_groups]
+                items[group_index] = anchor
+                accepted += add(items)
+                if accepted == 2 or len(candidates) >= target_pool_size:
+                    break
+            if len(candidates) >= target_pool_size:
+                break
+        if len(candidates) >= target_pool_size:
+            break
 
-    target_pool_size = sample_size * 5
     product_size = math.prod(len(group) for group in groups)
-    trial_count = min(product_size, target_pool_size * 500)
+    trial_count = min(product_size, target_pool_size * 100)
     for flat_index in rng.sample(range(product_size), trial_count):
+        if len(candidates) >= target_pool_size:
+            break
         indices = []
         for group in reversed(groups):
             flat_index, index = divmod(flat_index, len(group))
             indices.append(index)
         items = tuple(group[index] for group, index in zip(groups, reversed(indices), strict=True))
         add(items)
-        if len(candidates) >= target_pool_size:
-            break
     return candidates
 
 

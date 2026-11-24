@@ -75,7 +75,7 @@ public:
     }
     if constexpr (BlockShape::K > WarpShape::K) smem_reducer.reduce(regs_c_ptr);
     if (slice_count > 1) acquire_gmem_barrier();
-    PRAGMA_UNROLL
+    PRAGMA_UNROLL_COUNT(1)
     for (uint32_t first_row = 0; first_row < BlockShape::M; first_row += kOutputRows) {
       smem_writer.write(regs_c_ptr, slice_count, first_row);
       if constexpr (Ctx::kUseTmaC) {

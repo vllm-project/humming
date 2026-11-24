@@ -5,6 +5,7 @@ from torch._dynamo.testing import CompileCounterWithBackend
 from humming import dtypes
 from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType, WeightScale2Type
 from humming.config.mma import get_default_mma_type
+from humming.device import current_device
 from humming.forward import humming_forward
 from humming.testing import (
     KernelTestCase,
@@ -354,3 +355,54 @@ def test_output_chunk_rows(
     shape_ms = (17, 13 * block_m + 1)
     results = KernelTestRunner(case).run(shape_ms)
     assert_kernel_test_shape_coverage(results, shape_ms)
+
+
+@pytest.mark.parametrize("num_stages", (2, 8))
+@pytest.mark.parametrize("num_sms", (12, 16))
+@pytest.mark.parametrize("multicast", (1, 2))
+def test_streamk_scheduler_spill(num_stages, num_sms, multicast, monkeypatch):
+    if current_device.sm_version != 90:
+        pytest.skip("SM90 scheduler initialization regression")
+    layer = LayerConfig(
+        shape_n=2048,
+        shape_k=2048,
+        a_dtype=dtypes.int8,
+        b_dtype=dtypes.uint1,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        input_scale_group_size=0,
+        weight_scale_group_size=0,
+    )
+    config = dict(
+        mma_type="mma",
+        block_shape=(192, 64, 64),
+        warp_shape=(96, 32, 64),
+        num_stages=num_stages,
+        num_sms=num_sms,
+        num_ctas_per_sm=2,
+        use_tma=True,
+        use_tma_as=False,
+        use_tma_as2=False,
+        use_tma_bs=False,
+        use_tma_bs2=False,
+        use_warp_spec=True,
+        use_stream_k=True,
+        multi_cast_size_a=multicast,
+        raster_group_m=5,
+        smem_reuse_mode="all_stages",
+        output_chunk_rows=32,
+        producer_stage_unroll=1,
+        producer_registers=96,
+        evict_weights_first=False,
+    )
+    monkeypatch.setenv("HUMMING_TEST_TUNING_SOURCE", "heuristic")
+    monkeypatch.setattr("humming.testing.tuning.get_heuristics_config", lambda *args, **kwargs: config)
+    case = KernelTestCase(
+        name="streamk-scheduler-spill",
+        layer_config=layer,
+        compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        seed=2026,
+    )
+    shapes = (1, 193)
+    results = KernelTestRunner(case).run(shapes)
+    assert_kernel_test_shape_coverage(results, shapes)
