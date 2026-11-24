@@ -2,6 +2,7 @@
 
 #include <humming/utils/base.cuh>
 #include <humming/utils/enum.cuh>
+#include <humming/utils/ptx/arithmetic.cuh>
 #include <humming/utils/ptx/barrier.cuh>
 #include <humming/utils/ptx/legacy_load.cuh>
 #include <humming/utils/ptx/math.cuh>
