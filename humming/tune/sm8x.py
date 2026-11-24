@@ -71,7 +71,6 @@ class Sm80Heuristics(DeviceHeuristics):
         if cls._should_use_decode_tile(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type):
             config = cls._get_decode_tile_config(config, layer_config, shape_m)
 
-        # Set after the decode tile is chosen: the hint depends on the final block_m.
         tokens_per_expert = shape_m / (layer_config.num_experts or 1)
         block_m = config["block_shape"][0]
         config["evict_weights_first"] = tokens_per_expert <= block_m
