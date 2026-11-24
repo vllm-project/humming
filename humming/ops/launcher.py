@@ -1,6 +1,6 @@
 import torch
 
-from humming.ops.utils import _prepare_output_arg, _select_output, init_humming_launcher
+from humming.ops.utils import _prepare_output_arg, init_humming_launcher
 
 
 def register_kernel(cubin_path: str) -> tuple[int, str]:
@@ -65,9 +65,6 @@ def launch_kernel(
         valid_shape_m,
     )
     if outputs.nelement() == 0:
-        returned_outputs = torch.ops.humming.launch_kernel.default(*launch_args)
-    else:
-        torch.ops.humming.launch_kernel.out(*launch_args)
-        returned_outputs = outputs.new_empty((0,))
-
-    return _select_output(outputs, returned_outputs)
+        return torch.ops.humming.launch_kernel.default(*launch_args)
+    torch.ops.humming.launch_kernel.out(*launch_args)
+    return outputs

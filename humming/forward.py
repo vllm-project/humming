@@ -1,3 +1,4 @@
+import functools
 import json
 
 import torch
@@ -5,6 +6,12 @@ import torch
 from humming import ops
 from humming.config import LayerConfig
 from humming.tune import get_heuristics_class
+
+
+@functools.lru_cache(maxsize=1024)
+def _m_major_scale_from_str(compute_config: str) -> bool:
+    parsed = json.loads(compute_config)
+    return isinstance(parsed, dict) and bool(parsed.get("use_m_major_input_scale", False))
 
 
 @torch.compiler.assume_constant_result
@@ -19,13 +26,11 @@ def _prepare_forward_configs(
     metadata to avoid Dynamo guards on parsed dictionaries. Tensor- or
     shape-dependent work must stay outside this helper.
     """
-    parsed_compute_config = compute_config
-    if isinstance(parsed_compute_config, str) and parsed_compute_config:
-        parsed_compute_config = json.loads(parsed_compute_config)
-
     m_major_scale = False
-    if isinstance(parsed_compute_config, dict):
-        m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
+    if isinstance(compute_config, str) and compute_config:
+        m_major_scale = _m_major_scale_from_str(compute_config)
+    elif isinstance(compute_config, dict):
+        m_major_scale = bool(compute_config.get("use_m_major_input_scale", False))
 
     if isinstance(compute_config, dict):
         compute_config = json.dumps(compute_config)
