@@ -106,6 +106,14 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
         producer.prefetch_stage();
         producer.wait_math_epilogue();
       }
+      if constexpr (Ctx::kIsIndexedGemm) {
+        producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
+        producer.template load_weight_stage<true, true>(0);
+        scheduler.fetch_moe_index_block();
+        producer.seek_activation(
+            scheduler.expert_id, scheduler.m_block_id, scheduler.k_block_id,
+            scheduler.current_shape_m, scheduler.m_offset);
+      }
       if constexpr (kUsePdl) {
         if (!pdl_waited) {
           griddepcontrol_wait();
@@ -113,16 +121,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           pdl_waited = true;
         }
       }
-      producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
       if constexpr (Ctx::kIsIndexedGemm) {
-        producer.template load_weight_stage<true, true>(0);
-        scheduler.fetch_moe_index_block();
-        producer.seek_activation(
-            scheduler.expert_id, scheduler.m_block_id, scheduler.k_block_id,
-            scheduler.current_shape_m, scheduler.m_offset);
         producer.template load_activation_stage<true, true>(0);
         producer.template commit_stage<true>(0);
       } else {
+        producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
         producer.template load_stage<true, true>(0);
       }
       unroll_for<1, MAX(kNumStages - 1, 2), TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
