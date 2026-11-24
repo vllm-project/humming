@@ -416,10 +416,14 @@ def _fits_device_resources(
     if num_threads * num_ctas_per_sm > max_threads:
         return False
     tuning_config = create_tuning_config(config)
-    if (
-        get_register_budget_error(layer_config, tuning_config, compute_config.use_f16_accum, registers_per_sm)
-        is not None
-    ):
+    register_error = get_register_budget_error(
+        layer_config,
+        tuning_config,
+        compute_config.use_f16_accum,
+        registers_per_sm,
+        wgmma_register_reserve=16,
+    )
+    if register_error is not None:
         return False
     if mma_type == MmaType.UMMA:
         from humming.tune.sm100 import Sm100UmmaHeuristics

@@ -9,7 +9,7 @@ steps:
     concurrency_group: humming/b200
     command: HUMMING_TEST_TUNING_SOURCE=heuristic+batch_invariant bash .buildkite/run-tests.sh
     artifact_paths:
-      - "test-results/pytest.xml"
+      - "test-results/pytest*.xml"
     plugins:
       - kubernetes:
           podSpec:
@@ -38,7 +38,7 @@ steps:
     concurrency_group: humming/dgx-spark
     command: HUMMING_TEST_TUNING_SOURCE=heuristic+batch_invariant bash .buildkite/run-tests.sh
     artifact_paths:
-      - "test-results/pytest.xml"
+      - "test-results/pytest*.xml"
     plugins:
       - docker#v5.2.0:
           # NGC 26.07 multi-arch: PyTorch 2.13 development snapshot and CUDA 13.3.
@@ -104,7 +104,7 @@ steps:
       BUILDKITE_PLUGIN_DOCKER_IMAGE: *test_image
     command: HUMMING_TEST_TUNING_SOURCE=heuristic+batch_invariant bash .buildkite/run-tests.sh
     artifact_paths:
-      - "test-results/pytest.xml"
+      - "test-results/pytest*.xml"
     plugins:
       # Use the GPU visibility assigned by the MIG agent, as in vLLM ci-infra.
       - docker#v5.2.0:

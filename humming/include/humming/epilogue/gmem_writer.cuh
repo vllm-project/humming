@@ -105,7 +105,8 @@ public:
     if constexpr (kUseTmaC) {
       tensor_map_ptr = reinterpret_cast<const CUtensorMap *>(ptr);
       if constexpr (SharedStorage::kUseDynamicOutputMap) {
-        if (ctx.math_thread_id() == 0) ctx.smem.tensor_map_buffer[0] = tensor_map_ptr[0];
+        if (ctx.is_math_thread() && ctx.math_thread_id() == 0)
+          ctx.smem.tensor_map_buffer[0] = tensor_map_ptr[0];
       }
     } else {
       gmem_ptr_raw = reinterpret_cast<int4 *>(const_cast<void *>(ptr));

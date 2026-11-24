@@ -623,6 +623,7 @@ def test_device_register_budget(registers_per_sm, expected, monkeypatch):
     )
     assert (get_register_budget_error(layer, config) is None) == expected
     assert tuning._fits_device_resources(layer, ComputeConfig(), (config.to_dict(), {})) == expected
+
     problem = _problem(layer_config=layer)
     problem = dataclasses.replace(
         problem,
@@ -639,6 +640,29 @@ def test_device_register_budget(registers_per_sm, expected, monkeypatch):
         reason.startswith("register budget exceeded:") for reason in analysis.rejection_reasons
     )
     assert has_register_error == (not expected)
+
+
+@pytest.mark.parametrize("num_ctas,expected", [(3, True), (4, False)])
+def test_sampled_wgmma_register_headroom(num_ctas, expected, monkeypatch):
+    from humming.config import ComputeConfig, TuningConfig
+    from humming.config.mma import get_register_budget_error
+    from humming.device import DeviceInfo
+    from humming.testing import tuning
+
+    monkeypatch.setattr(DeviceInfo, "max_registers_per_sm", property(lambda self: 65536))
+    monkeypatch.setattr(DeviceInfo, "max_threads_per_sm", property(lambda self: 2048))
+    monkeypatch.setattr(tuning, "fits_device_smem", lambda *args: True)
+    layer = _layer(a_dtype=dtypes.float8e4m3)
+    config = TuningConfig(
+        mma_type="wgmma",
+        block_shape=(192, 256, 128),
+        warp_shape=(192, 64, 128),
+        num_stages=4,
+        num_ctas_per_sm=num_ctas,
+        use_warp_spec=False,
+    )
+    assert get_register_budget_error(layer, config) is None
+    assert tuning._fits_device_resources(layer, ComputeConfig(), (config.to_dict(), {})) == expected
 
 
 @pytest.mark.parametrize("sm_version", (120, 121))
