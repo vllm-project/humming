@@ -41,7 +41,7 @@ CUDA_INLINE uint32_t uint_to_f16(uint32_t val, const uint32_t &zp_val) {
   uint32_t final_zp_val = kHasZeroPoint ? zp_val : fixed_zp_val;
   if constexpr (kIsFpZeroPoint) final_zp_val = base;
   const scalar_t2 zp_half2 = *reinterpret_cast<const scalar_t2 *>(&final_zp_val);
-  extracted_val_half2 = __hsub2(extracted_val_half2, zp_half2);
+  extracted_val_half2 = sub_f162(extracted_val_half2, zp_half2);
 
   return *reinterpret_cast<uint32_t *>(&extracted_val_half2);
 };
