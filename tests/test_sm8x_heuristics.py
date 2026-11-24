@@ -95,6 +95,11 @@ def _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint4, sm_version=80):
     )
 
 
+def _without_evict_hint(config):
+    # evict_weights_first is set by Sm80Heuristics.get_config on top of the tile choice.
+    return {name: value for name, value in config.items() if name != "evict_weights_first"}
+
+
 def _assert_legal_on_a100(layer_config, shape_m, config):
     device = DeviceProfile(
         name="A100", sm_version=80, num_sms=108, max_smem_size=Sm80Heuristics.max_smem_size
@@ -163,7 +168,7 @@ def test_sm80_keeps_heuristic_outside_decode_range(shape_n, shape_k, shape_m, b_
     base_config = DeviceHeuristics.get_config.__func__(
         Sm80Heuristics, layer_config, shape_m, gemm_type=GemmType.DENSE, **kwargs
     )
-    assert config == base_config
+    assert _without_evict_hint(config) == base_config
 
 
 @pytest.mark.usefixtures("_mock_a100_device")
@@ -174,7 +179,7 @@ def test_sm87_keeps_heuristic():
     base_config = DeviceHeuristics.get_config.__func__(
         Sm87Heuristics, layer_config, 1, gemm_type=GemmType.DENSE
     )
-    assert config == base_config
+    assert _without_evict_hint(config) == base_config
 
 
 @pytest.mark.usefixtures("_mock_a100_device")
@@ -204,7 +209,28 @@ def test_sm80_decode_uses_only_block_n_dividing_n(monkeypatch, num_sms, shape_n,
         Sm80Heuristics, layer_config, 1, gemm_type=GemmType.DENSE
     )
     if expected_block_n is None:
-        assert config == base_config
+        assert _without_evict_hint(config) == base_config
         return
     assert not config["use_stream_k"] and config["block_shape"][1] == expected_block_n
     assert config["num_sms"] * config["num_ctas_per_sm"] >= shape_n // expected_block_n
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize("heuristics_cls,sm_version", [(Sm80Heuristics, 80), (Sm87Heuristics, 87)])
+@pytest.mark.parametrize(
+    "shape_n,shape_k,shape_m,should_evict",
+    [
+        (6144, 4096, 1, True),  # SM80 decode tile
+        (4096, 12288, 1, True),  # long K keeps the default heuristic
+        (6144, 4096, 4096, False),
+    ],
+)
+def test_sm8x_dense_evicts_weights_when_one_m_block(
+    heuristics_cls, sm_version, shape_n, shape_k, shape_m, should_evict
+):
+    layer_config = _w4a16_layer_config(shape_n, shape_k, sm_version=sm_version)
+
+    config = heuristics_cls.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
+
+    assert config["evict_weights_first"] == should_evict
+    assert (shape_m <= config["block_shape"][0]) == should_evict

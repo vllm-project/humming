@@ -16,33 +16,6 @@ class Sm80Heuristics(DeviceHeuristics):
     b4_allowed_dtypes: list[dtypes.DataType] = [dtypes.int4]
 
     @classmethod
-    def get_config(
-        cls,
-        layer_config,
-        shape_m: int,
-        use_f16_accum: bool = False,
-        use_batch_invariant: bool = False,
-        gemm_type: GemmType = GemmType.DENSE,
-        use_m_major_input_scale: bool = False,
-    ):
-        config = super().get_config(
-            layer_config,
-            shape_m,
-            use_f16_accum,
-            use_batch_invariant,
-            gemm_type,
-            use_m_major_input_scale,
-        )
-
-        if cls.sm_version < 90:
-            tokens_per_expert = shape_m / (layer_config.num_experts or 1)
-            block_m = config["block_shape"][0]
-            config["evict_weights_first"] = tokens_per_expert <= block_m
-            if gemm_type != GemmType.DENSE:
-                config["evict_weights_first"] = tokens_per_expert <= block_m * 0.5 <= 8
-        return config
-
-    @classmethod
     def get_base_config(
         cls,
         a_dtype: dtypes.DataType,
@@ -96,7 +69,13 @@ class Sm80Heuristics(DeviceHeuristics):
             use_m_major_input_scale=use_m_major_input_scale,
         )
         if cls._should_use_decode_tile(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type):
-            return cls._get_decode_tile_config(config, layer_config, shape_m)
+            config = cls._get_decode_tile_config(config, layer_config, shape_m)
+
+        tokens_per_expert = shape_m / (layer_config.num_experts or 1)
+        block_m = config["block_shape"][0]
+        config["evict_weights_first"] = tokens_per_expert <= block_m
+        if gemm_type != GemmType.DENSE:
+            config["evict_weights_first"] = tokens_per_expert <= block_m * 0.5 <= 8
         return config
 
     @classmethod
