@@ -28,10 +28,7 @@ class Sm80Heuristics(DeviceHeuristics):
             gemm_type,
             use_m_major_input_scale,
         )
-        # A single M tile reads each weight tile once; keep the stream from evicting reused data in L2.
-        # Dense: exact, the layer has one M tile. MoE: the rows per expert vary around their average,
-        # so require the average to be at most half an M tile, and only for small tiles. Measured on
-        # SM80 only: subclasses for later architectures (Sm100MmaHeuristics) keep the default.
+
         if cls.sm_version < 90:
             tokens_per_expert = shape_m / (layer_config.num_experts or 1)
             block_m = config["block_shape"][0]
