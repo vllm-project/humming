@@ -117,3 +117,54 @@ def test_small_mxfp4_grouped_contiguous_keeps_small_expert_tiles(a_dtype):
     )
 
     assert config["block_shape"][0] == 32
+
+
+def _packed_mxfp4_layer(shape_n: int, shape_k: int, num_experts: int = 384) -> LayerConfig:
+    layer = LayerConfig(
+        shape_n=shape_n,
+        shape_k=shape_k,
+        num_experts=num_experts,
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float4e2m1,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.float8e8m0,
+        weight_scale_group_size=32,
+        input_scale_group_size=128,
+        sm_version=90,
+    )
+    assert layer.use_packed_k_layout
+    return layer
+
+
+@pytest.mark.parametrize("shape_n", [512, 768, 1024])
+@pytest.mark.parametrize("gemm_type", [GemmType.INDEXED, GemmType.GROUPED_CONTIGUOUS])
+@pytest.mark.parametrize("shape_m", [1, 6, 8, 16, 24, 32, 64])
+def test_packed_mxfp4_sub_wave_decode_avoids_oversized_block_m(shape_n, gemm_type, shape_m):
+    layer = _packed_mxfp4_layer(shape_n, 5120, num_experts=384)
+    config = Sm90H20Heuristics.get_config(layer, shape_m, gemm_type=gemm_type)
+
+    assert config["block_shape"][0] == 8
+
+
+def test_packed_mxfp4_indexed_w13_matches_w2_small_m_progression():
+    w13 = _packed_mxfp4_layer(768, 5120, num_experts=384)
+    w2 = _packed_mxfp4_layer(5120, 384, num_experts=384)
+
+    for shape_m, expected_block_m in [
+        (1, 8),
+        (6, 8),
+        (12, 8),
+        (24, 8),
+        (32, 8),
+        (288, 8),
+        (2464, 8),
+        (2480, 16),
+        (4992, 16),
+    ]:
+        w13_config = Sm90H20Heuristics.get_config(w13, shape_m, gemm_type=GemmType.INDEXED)
+        w2_config = Sm90H20Heuristics.get_config(w2, shape_m, gemm_type=GemmType.INDEXED)
+        assert w13_config["block_shape"][0] == expected_block_m
+        assert w2_config["block_shape"][0] == expected_block_m
+
+    large_w13 = Sm90H20Heuristics.get_config(w13, 10240, gemm_type=GemmType.INDEXED)
+    assert large_w13["block_shape"][0] == 40

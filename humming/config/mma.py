@@ -175,7 +175,9 @@ def get_warp_spec_registers(layer_config, tuning_config, registers_per_sm=None):
     return producer_registers, consumer_registers
 
 
-def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False, registers_per_sm=None):
+def get_register_budget_error(
+    layer_config, tuning_config, use_f16_accum=False, registers_per_sm=None, wgmma_register_reserve=0
+):
     mma_type = tuning_config.mma_type or get_default_mma_type(layer_config)
     if registers_per_sm is None:
         registers_per_sm = current_device.max_registers_per_sm
@@ -203,7 +205,7 @@ def get_register_budget_error(layer_config, tuning_config, use_f16_accum=False, 
         # setmaxnreg cannot relax this per-instruction compile limit.
         instruction_accumulators = warp_m // (4 if use_f16_accum else 2)
         instruction_overhead = 26 if use_wgmma_ss else 32
-        instruction_registers = instruction_accumulators + instruction_overhead
+        instruction_registers = instruction_accumulators + instruction_overhead + wgmma_register_reserve
         if layer_config.use_packed_k_layout and tuning_config.wgmma_split_issue_wait:
             # Split packed-K keeps all RS K slabs live across prefetch. The
             # per-instruction overhead already includes four operand registers.

@@ -362,6 +362,9 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
     def check_shape(self):
         assert self.problem_shape[1] % self.block_shape[1] == 0
         assert self.problem_shape[2] % self.block_shape[2] == 0
+        # Compact storage still requires aligned input/output vectors.
+        assert (self.problem_shape[1] - self.pad_shape[1]) % 8 == 0
+        assert (self.problem_shape[2] - self.pad_shape[2]) % (128 // self.a_dtype.num_bits) == 0
         assert self.block_shape[0] % self.warp_shape[0] == 0
         assert self.block_shape[1] % self.warp_shape[1] == 0
         assert self.block_shape[2] % self.warp_shape[2] == 0

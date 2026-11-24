@@ -40,6 +40,7 @@ private:
 
   static constexpr bool kUseStreamK = Ctx::kUseStreamK;
   static constexpr bool kUseTmaC = Ctx::kUseTmaC;
+  static constexpr uint32_t kClusterShapeN = BlockShape::N * Ctx::kMultiCastSizeA * Ctx::kUmmaCtaGroupSize;
 
   static constexpr bool kIsIndexedGemm = Ctx::kIsIndexedGemm;
   static constexpr bool kIsGroupedGemm = Ctx::kIsGroupedGemm;
@@ -104,7 +105,8 @@ public:
     if constexpr (kUseTmaC) {
       tensor_map_ptr = reinterpret_cast<const CUtensorMap *>(ptr);
       if constexpr (SharedStorage::kUseDynamicOutputMap) {
-        if (ctx.math_thread_id() == 0) ctx.smem.tensor_map_buffer[0] = tensor_map_ptr[0];
+        if (ctx.is_math_thread() && ctx.math_thread_id() == 0)
+          ctx.smem.tensor_map_buffer[0] = tensor_map_ptr[0];
       }
     } else {
       gmem_ptr_raw = reinterpret_cast<int4 *>(const_cast<void *>(ptr));
@@ -187,7 +189,7 @@ public:
         if constexpr (kIsIndexedGemm) gmem_row = get_output_row_index(gmem_row);
         uint32_t gmem_col = first_column / 8 + column_block * 8 + smem_col;
         bool valid_row = gmem_row < (kIsIndexedGemm ? output_shape_m : block_output_shape_m);
-        bool valid_column = PadShape::N == 0 || col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N;
+        bool valid_column = (ProblemShape::N - PadShape::N) % kClusterShapeN == 0 || col_offset + gmem_col * 8 < ProblemShape::N - PadShape::N;
         if (!valid_row || !valid_column) continue;
 
         int4 val = ctx.smem.reduce[smem_offset];
@@ -264,6 +266,8 @@ public:
       uint32_t rows = output_shape_m;
       if constexpr (BlockShape::M % kOutputRows != 0) rows = MIN(rows, row_offset + BlockShape::M);
       if (rows != descriptor_rows) {
+        // PDL can overlap kernels that reuse the same descriptor allocation.
+        if constexpr (Ctx::kUsePdl) griddepcontrol_wait();
         // Each issuing thread drains its stores before the CTA descriptor is overwritten.
         tma_wait_store_group<0>();
         ctx.sync_math_threads();

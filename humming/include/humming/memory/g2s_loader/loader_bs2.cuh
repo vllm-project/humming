@@ -24,7 +24,8 @@ public:
   const int4 *gmem_ptr_raw;
   const int4 *gmem_ptr;
 
-  uint32_t offset;
+  uint32_t expert_index;
+  uint32_t column_offset;
 
   CUDA_INLINE
   G2SMemoryLoaderBS2(Ctx &ctx) : ctx(ctx) {
@@ -44,24 +45,30 @@ public:
 
   CUDA_INLINE
   void load_tma(int4 *smem_ptr, void *mbar_ptr) {
-    if (ctx.load_thread_id() == 0) tma_load_2d(tensor_map_ptr, smem_ptr, mbar_ptr, 0, offset);
+    if (ctx.load_thread_id() == 0) tma_load_3d(tensor_map_ptr, smem_ptr, mbar_ptr, 0, column_offset / 4, expert_index);
   }
 
   CUDA_INLINE
   void prefetch_tma() {
     if constexpr (kUseTma) {
-      if (ctx.load_thread_id() == 0) tma_prefetch_2d(tensor_map_ptr, 0, offset);
+      if (ctx.load_thread_id() == 0) tma_prefetch_3d(tensor_map_ptr, 0, column_offset / 4, expert_index);
     }
   }
 
   CUDA_INLINE
   void load_legacy(int4 *smem_ptr) {
-    legacy_load_1d<kUseCpAsync, kNumInt4s, kNumLoadThreads, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+    if constexpr (ProblemShape::N % BlockShape::N == 0) {
+      legacy_load_1d<kUseCpAsync, kNumInt4s, kNumLoadThreads, kLoadThreadOffset>(gmem_ptr, smem_ptr);
+    } else {
+      legacy_load_2d_zfill<kUseCpAsync, kNumInt4s, kNumLoadThreads, kGmemStride, kSmemStride, kLoadThreadOffset>(
+          gmem_ptr, smem_ptr, 0, column_offset, 1, kGmemStride);
+    }
   }
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t n_block_id) {
-    offset = expert_id * (ProblemShape::N / 64) + n_block_id * (BlockShape::N / 64);
+    expert_index = expert_id;
+    column_offset = n_block_id * kSmemStride;
     uint32_t gmem_offset = expert_id * kGmemStride + n_block_id * kSmemStride;
     gmem_ptr = gmem_ptr_raw + gmem_offset;
   }

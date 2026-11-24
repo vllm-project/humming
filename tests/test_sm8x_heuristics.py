@@ -5,7 +5,9 @@ import pytest
 from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import DeviceInfo
-from humming.tune.sm8x import Sm86Heuristics, Sm89Heuristics
+from humming.tune.base import DeviceHeuristics
+from humming.tune.candidate import DeviceProfile, ScheduleCandidate, TuningProblem, analyze_candidate
+from humming.tune.sm8x import Sm80Heuristics, Sm86Heuristics, Sm87Heuristics, Sm89Heuristics
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -69,3 +71,166 @@ def test_config_fits_in_smem(heuristics_cls, a_dtype, b_dtype, weight_scale_grou
         same_type_layer = dataclasses.replace(layer_config, b_dtype=a_dtype)
         same_type_config = heuristics_cls.get_config(same_type_layer, shape_m, gemm_type=GemmType.DENSE)
         assert config == same_type_config
+
+
+@pytest.fixture
+def _mock_a100_device(monkeypatch):
+    tensorcore_tops = {"float16": 312.0, "bfloat16": 312.0, "int8": 624.0, "int4": 1248.0}
+    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: 108))
+    monkeypatch.setattr(DeviceInfo, "sm_version", property(lambda self: 80))
+    monkeypatch.setattr(DeviceInfo, "memory_bandwidth_gbps", property(lambda self: 2039.0))
+    monkeypatch.setattr(DeviceInfo, "tensorcore_tops", property(lambda self: tensorcore_tops))
+
+
+def _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint4, sm_version=80):
+    return LayerConfig(
+        sm_version=sm_version,
+        shape_n=shape_n,
+        shape_k=shape_k,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=b_dtype,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=128,
+    )
+
+
+def _without_evict_hint(config):
+    # evict_weights_first is set by Sm80Heuristics.get_config on top of the tile choice.
+    return {name: value for name, value in config.items() if name != "evict_weights_first"}
+
+
+def _assert_legal_on_a100(layer_config, shape_m, config):
+    device = DeviceProfile(
+        name="A100", sm_version=80, num_sms=108, max_smem_size=Sm80Heuristics.max_smem_size
+    )
+    problem = TuningProblem(
+        layer_config=layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE, device=device
+    )
+    schedule_fields = ("block_shape", "warp_shape", "use_stream_k", "num_stages", "num_ctas_per_sm")
+    candidate = ScheduleCandidate.from_config("decode", {name: config[name] for name in schedule_fields})
+    analysis = analyze_candidate(problem, candidate)
+    assert analysis.legal, analysis.rejection_reasons
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize(
+    "shape_n,shape_k,shape_m",
+    [
+        (6144, 4096, 1),
+        (4096, 4096, 8),
+        (24576, 4096, 16),
+        (5120, 5120, 16),
+        (6144, 4096, 32),
+        (2560, 4096, 4),
+    ],
+)
+def test_sm80_decode_uses_one_wave_data_parallel_tiles(shape_n, shape_k, shape_m):
+    layer_config = _w4a16_layer_config(shape_n, shape_k)
+
+    config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
+
+    block_m, block_n, _ = config["block_shape"]
+    num_tiles = shape_n // block_n
+    assert not config["use_stream_k"]
+    assert block_m >= min(shape_m, 8) and block_m <= 32
+    assert block_n in (64, 128)
+    assert num_tiles <= config["num_sms"] * config["num_ctas_per_sm"] <= 108 * config["num_ctas_per_sm"]
+    _assert_legal_on_a100(layer_config, shape_m, config)
+    smem_size = estimate_smem_size_layer(
+        layer_config,
+        config["block_shape"],
+        GemmType.DENSE,
+        config["num_stages"],
+        warp_shape=config["warp_shape"],
+    )
+    assert smem_size * config["num_ctas_per_sm"] <= Sm80Heuristics.max_smem_size
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize(
+    "shape_n,shape_k,shape_m,b_dtype,kwargs",
+    [
+        (4096, 12288, 1, dtypes.uint4, {}),
+        (6144, 4096, 64, dtypes.uint4, {}),
+        (5120, 5120, 32, dtypes.uint4, {}),
+        (2560, 4096, 32, dtypes.uint4, {}),
+        (28672, 4096, 1, dtypes.uint4, {}),
+        (4096, 4096, 1, dtypes.int8, {}),
+        (4096, 4096, 1, dtypes.uint4, {"use_batch_invariant": True}),
+        (4096, 4096, 1, dtypes.uint4, {"use_f16_accum": True}),
+    ],
+)
+def test_sm80_keeps_heuristic_outside_decode_range(shape_n, shape_k, shape_m, b_dtype, kwargs):
+    layer_config = _w4a16_layer_config(shape_n, shape_k, b_dtype)
+
+    config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE, **kwargs)
+    base_config = DeviceHeuristics.get_config.__func__(
+        Sm80Heuristics, layer_config, shape_m, gemm_type=GemmType.DENSE, **kwargs
+    )
+    assert _without_evict_hint(config) == base_config
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+def test_sm87_keeps_heuristic():
+    layer_config = _w4a16_layer_config(6144, 4096, sm_version=87)
+
+    config = Sm87Heuristics.get_config(layer_config, shape_m=1, gemm_type=GemmType.DENSE)
+    base_config = DeviceHeuristics.get_config.__func__(
+        Sm87Heuristics, layer_config, 1, gemm_type=GemmType.DENSE
+    )
+    assert _without_evict_hint(config) == base_config
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+def test_sm80_interval_table_uses_data_parallel_tiles_for_decode():
+    layer_config = _w4a16_layer_config(6144, 4096)
+
+    intervals = Sm80Heuristics.get_configs(layer_config, gemm_type=GemmType.DENSE)
+
+    decode_intervals = [config for _, max_shape_m, config in intervals if max_shape_m <= 32]
+    larger_intervals = [config for min_shape_m, _, config in intervals if 32 <= min_shape_m < 4096]
+    assert decode_intervals and not any(config["use_stream_k"] for config in decode_intervals)
+    assert larger_intervals and all(config["use_stream_k"] for config in larger_intervals)
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize(
+    "num_sms,shape_n,expected_block_n",
+    [(108, 6208, 64), (74, 9536, None), (74, 19008, None), (108, 13888, None), (108, 27712, None)],
+)
+def test_sm80_decode_uses_only_block_n_dividing_n(monkeypatch, num_sms, shape_n, expected_block_n):
+    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: num_sms))
+    layer_config = _w4a16_layer_config(shape_n, 4096)
+
+    config = Sm80Heuristics.get_config(layer_config, shape_m=1, gemm_type=GemmType.DENSE)
+
+    base_config = DeviceHeuristics.get_config.__func__(
+        Sm80Heuristics, layer_config, 1, gemm_type=GemmType.DENSE
+    )
+    if expected_block_n is None:
+        assert _without_evict_hint(config) == base_config
+        return
+    assert not config["use_stream_k"] and config["block_shape"][1] == expected_block_n
+    assert config["num_sms"] * config["num_ctas_per_sm"] >= shape_n // expected_block_n
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize("heuristics_cls,sm_version", [(Sm80Heuristics, 80), (Sm87Heuristics, 87)])
+@pytest.mark.parametrize(
+    "shape_n,shape_k,shape_m,should_evict",
+    [
+        (6144, 4096, 1, True),  # SM80 decode tile
+        (4096, 12288, 1, True),  # long K keeps the default heuristic
+        (6144, 4096, 4096, False),
+    ],
+)
+def test_sm8x_dense_evicts_weights_when_one_m_block(
+    heuristics_cls, sm_version, shape_n, shape_k, shape_m, should_evict
+):
+    layer_config = _w4a16_layer_config(shape_n, shape_k, sm_version=sm_version)
+
+    config = heuristics_cls.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
+
+    assert config["evict_weights_first"] == should_evict
+    assert (shape_m <= config["block_shape"][0]) == should_evict

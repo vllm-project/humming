@@ -317,10 +317,12 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
             PRAGMA_UNROLL
             for (uint32_t fragment_index = 0; fragment_index < kFragmentsPerGroup; fragment_index += kPreparedFragments) {
               uint32_t fragment = first_fragment + fragment_index;
+              bool has_valid_k = MMA::is_valid_k_offset(scheduler.k_block_id + iter, fragment * Ctx::kPartMmaShapeK);
               // Prepare a wider store while UMMA still owns the TMEM buffer.
               uint32_t prepared[kPreparedFragments][kFragmentWords];
               PRAGMA_UNROLL
               for (uint32_t part = 0; part < kPreparedFragments; part++) {
+                if (!has_valid_k) continue;
                 uint32_t register_buffer = (fragment + part) % 2;
                 s2r.template load_stage_iter<true>(stage, fragment + part);
                 mma.transform_b(register_buffer, fragment + part);
@@ -330,9 +332,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
                   prepared[part][word] = values[word];
                 }
               }
+              // Padding-only dequant warpgroups still participate in operand-buffer synchronization.
               if (group_index == 0 && fragment_index == 0) wait_for_operand();
               if (fragment_index == 0) mma.store_weight_scales(stage, scheduler.k_block_id + iter, scheduler.n_block_id);
-              mma.store_b(prepared, fragment);
+              if (has_valid_k) mma.store_b(prepared, fragment);
               if constexpr (kEarlyWeightReuse) {
                 if (group_index + 1 == kGroupsPerWarpgroup && fragment_index + kPreparedFragments >= kFragmentsPerGroup) {
                   // Include scale reads and native operand stores before

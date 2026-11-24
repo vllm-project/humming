@@ -7,6 +7,7 @@ class Scheduler {
 private:
   using ProblemShape = typename Ctx::ProblemShape;
   using BlockShape = typename Ctx::BlockShape;
+  using PadShape = typename Ctx::PadShape;
 
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
@@ -32,8 +33,8 @@ private:
   static constexpr bool kUseBlockScaledMma = Ctx::kUseBlockScaledMma;
   static constexpr uint32_t kAsBlocksPerWord = kUseBlockScaledMma ? MAX(1u, 4 * kInputScaleGroupSize / BlockShape::K) : 1;
 
-  static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N / kNumCtasDimN;
-  static constexpr uint32_t K_BLOCKS = ProblemShape::K / BlockShape::K;
+  static constexpr uint32_t N_BLOCKS = CEIL_DIV(ProblemShape::N - PadShape::N, BlockShape::N * kNumCtasDimN);
+  static constexpr uint32_t K_BLOCKS = Ctx::kNumKBlocks;
   static constexpr uint32_t kStreamKBlockAlignment = MAX(1u, MAX(kMaxGroupSize / BlockShape::K, kAsBlocksPerWord));
   // Pad the scheduling space so every output tile starts at a complete input-scale word.
   // The padding contributes no MMA iterations.
@@ -89,7 +90,7 @@ public:
   Scheduler(Ctx &ctx) : ctx(ctx) {
 
     current_shape_m = ctx.params.shape_m;
-    expert_max_num_tokens = ctx.params.shape_m / Ctx::kNumExperts;
+    if constexpr (kIsGroupedGemm) expert_max_num_tokens = ctx.params.shape_m / kNumExperts;
     calc_m_blocks();
     if constexpr (kIsGroupedGemm) {
       current_expert_num_tokens = ctx.smem.expert_tokens[0];
