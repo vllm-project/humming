@@ -75,7 +75,7 @@ public:
         PRAGMA_UNROLL
         for (uint32_t j = 0; j < num_scalars_per_value; j++) {
           if constexpr (sizeof(MmaTypeC) == 2) {
-            reg_ptr[j] = __hadd2(reg_ptr[j], sval_ptr[j]);
+            reg_ptr[j] = add_f162(reg_ptr[j], sval_ptr[j]);
           } else {
             reg_ptr[j] += sval_ptr[j];
           }

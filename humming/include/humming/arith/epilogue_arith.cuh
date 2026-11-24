@@ -103,7 +103,7 @@ public:
     if constexpr (kExpOffset.x) {
       const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.x>();
       scalar_t2 &packed = *reinterpret_cast<scalar_t2 *>(&value);
-      packed = __hmul2(packed, scale_factor);
+      packed = mul_f162(packed, scale_factor);
     }
   }
 
@@ -168,7 +168,7 @@ public:
         for (uint32_t i = 0; i < kNumInputScales; i++) {
           reinterpret_cast<scalar_t2 *>(as)[i] = this->float2num2(reinterpret_cast<float *>(as)[i]);
           if constexpr (kHasTensorWeightScale)
-            reinterpret_cast<scalar_t2 *>(as)[i] = __hmul2(reinterpret_cast<scalar_t2 *>(as)[i], gs_scalar2);
+            reinterpret_cast<scalar_t2 *>(as)[i] = mul_f162(reinterpret_cast<scalar_t2 *>(as)[i], gs_scalar2);
         };
       };
     }
@@ -185,7 +185,7 @@ public:
 
         PRAGMA_UNROLL
         for (uint32_t j = 0; j < CEIL_DIV(WarpShape::N, 8); j++) {
-          dq_bs_scalar2_ptr[j] = __hmul2(dq_bs_scalar2_ptr[j], scale_factor);
+          dq_bs_scalar2_ptr[j] = mul_f162(dq_bs_scalar2_ptr[j], scale_factor);
         }
       };
     };
@@ -209,23 +209,23 @@ public:
     scalar_t2 *cs_half2 = kIsChannelWeightScale2 ? reinterpret_cast<scalar_t2 *>(bs2) : bs_half2;
 
     if constexpr (kHasEpilogueInputScale && kIsF16Accum) {
-      regs_half2[0] = __hmul2(regs_half2[0], as_half2[kIsTensorInputScale ? 0 : row]);
+      regs_half2[0] = mul_f162(regs_half2[0], as_half2[kIsTensorInputScale ? 0 : row]);
     } else if constexpr (kHasTensorWeightScale && kIsF16Accum) {
-      regs_half2[0] = __hmul2(regs_half2[0], gs_half2[0]);
+      regs_half2[0] = mul_f162(regs_half2[0], gs_half2[0]);
     }
 
     if constexpr (kHasChannelWeightScale && !kUseNativeChannelScale && kHasBias && !kIsF16Accum) {
-      regs_half2[0] = __hfma2(regs_half2[0], cs_half2[col], bias_half2[col]);
+      regs_half2[0] = fma_f162(regs_half2[0], cs_half2[col], bias_half2[col]);
     } else if constexpr (kHasChannelWeightScale && !kUseNativeChannelScale) {
-      regs_half2[0] = __hmul2(regs_half2[0], cs_half2[col]);
+      regs_half2[0] = mul_f162(regs_half2[0], cs_half2[col]);
     } else if constexpr (kHasBias && !kIsF16Accum) {
-      regs_half2[0] = __hadd2(regs_half2[0], bias_half2[col]);
+      regs_half2[0] = add_f162(regs_half2[0], bias_half2[col]);
     };
 
     if constexpr (kIsF16Accum) apply_exp_offset();
 
     if constexpr (kIsF16Accum && kHasBias) {
-      regs_half2[0] = __hadd2(regs_half2[0], bias_half2[col]);
+      regs_half2[0] = add_f162(regs_half2[0], bias_half2[col]);
     }
   };
 

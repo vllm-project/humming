@@ -181,7 +181,7 @@ CUDA_INLINE void dequant_scale_float32(const uint32_t *src, uint32_t *dst, uint3
       if constexpr (kExponentOffset != 0) {
         constexpr uint32_t kFactorBits = ((127 + kExponentOffset) * 0x00010001u) << 7;
         const nv_bfloat162 factor = *reinterpret_cast<const nv_bfloat162 *>(&kFactorBits);
-        values = __hmul2(values, factor);
+        values = mul_f162(values, factor);
       }
       float2 converted = __bfloat1622float2(values);
       if constexpr (kNativeScaleDequantSupported<SourceType, BFloat16>) {

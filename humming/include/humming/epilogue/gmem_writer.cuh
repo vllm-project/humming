@@ -10,7 +10,7 @@ CUDA_INLINE T reduce_add_f162(T &a, T &b) {
 
   PRAGMA_UNROLL
   for (uint32_t i = 0; i < sizeof(T) / 4; i++) {
-    a_half2_ptr[i] = __hadd2(a_half2_ptr[i], b_half2_ptr[i]);
+    a_half2_ptr[i] = add_f162(a_half2_ptr[i], b_half2_ptr[i]);
   };
   return a;
 };
