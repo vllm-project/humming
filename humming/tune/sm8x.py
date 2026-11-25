@@ -71,12 +71,18 @@ class Sm80Heuristics(DeviceHeuristics):
         if cls._should_use_decode_tile(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type):
             config = cls._get_decode_tile_config(config, layer_config, shape_m)
 
+        config["evict_weights_first"] = cls._evict_weights_first(config, layer_config, shape_m, gemm_type)
+        return config
+
+    @staticmethod
+    def _evict_weights_first(
+        config: dict, layer_config: LayerConfig, shape_m: int, gemm_type: GemmType
+    ) -> bool:
         tokens_per_expert = shape_m / (layer_config.num_experts or 1)
         block_m = config["block_shape"][0]
-        config["evict_weights_first"] = tokens_per_expert <= block_m
         if gemm_type != GemmType.DENSE:
-            config["evict_weights_first"] = tokens_per_expert <= block_m * 0.5 <= 8
-        return config
+            return tokens_per_expert <= block_m * 0.5 <= 8
+        return tokens_per_expert <= block_m
 
     @classmethod
     def _should_use_decode_tile(
@@ -219,7 +225,70 @@ class Sm86Heuristics(DeviceHeuristics):
 
 
 class Sm87Heuristics(Sm80Heuristics):
+    """Jetson AGX Orin: SM80's tiles, except for 16-bit-activation NVFP4 MoE, whose expert GEMMs are
+    bound by the 204.8 GB/s LPDDR5 on 16 SMs. There, measured tiles replace SM80's choice up to 64
+    tokens per expert."""
+
     sm_version: int = 87
+
+    # (max tokens per expert, block shape, warp shape, stages, CTAs per SM), in increasing order. The
+    # ranges between 1.125 and 7.125 tokens per expert and above 64 keep SM80's tiles (no consistent
+    # gain measured there).
+    _NVFP4_MOE_TILES = (
+        (1.125, (8, 128, 128), (8, 32, 64), 4, 2),
+        (7.125, None, None, 0, 0),
+        (14.375, (16, 256, 64), (16, 64, 64), 4, 2),
+        (29.75, (32, 256, 64), (32, 64, 64), 4, 2),
+        (64.0, (64, 256, 64), (64, 32, 64), 4, 1),
+    )
+
+    @classmethod
+    def _get_nvfp4_moe_tile(cls, layer_config: LayerConfig, shape_m: int, gemm_type: GemmType) -> dict | None:
+        is_nvfp4 = layer_config.b_dtype == dtypes.float4e2m1 and layer_config.weight_scale_group_size == 16
+        is_a16_moe = gemm_type != GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        if not (is_nvfp4 and is_a16_moe and layer_config.num_experts) or shape_m <= 2:
+            return None
+        tokens_per_expert = shape_m / layer_config.num_experts
+        tile = next((entry for entry in cls._NVFP4_MOE_TILES if tokens_per_expert <= entry[0]), None)
+        if tile is None or tile[1] is None:
+            return None
+        _, block_shape, warp_shape, num_stages, num_ctas_per_sm = tile
+        fits_shape = layer_config.shape_n % block_shape[1] == 0 and layer_config.shape_k % block_shape[2] == 0
+        smem_size = estimate_smem_size_layer(layer_config, block_shape, gemm_type, num_stages)
+        if not fits_shape or smem_size * num_ctas_per_sm > cls.max_smem_size:
+            return None
+        return {
+            "block_shape": block_shape,
+            "warp_shape": warp_shape,
+            "num_stages": num_stages,
+            "num_ctas_per_sm": num_ctas_per_sm,
+        }
+
+    @classmethod
+    def get_config(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        use_f16_accum: bool = False,
+        use_batch_invariant: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
+    ):
+        config = super().get_config(
+            layer_config,
+            shape_m,
+            use_f16_accum=use_f16_accum,
+            use_batch_invariant=use_batch_invariant,
+            gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        if use_f16_accum or use_batch_invariant:
+            return config
+        tile = cls._get_nvfp4_moe_tile(layer_config, shape_m, gemm_type)
+        if tile is not None:
+            config.update(tile)
+            config["evict_weights_first"] = cls._evict_weights_first(config, layer_config, shape_m, gemm_type)
+        return config
 
 
 class Sm89Heuristics(Sm86Heuristics):
