@@ -9,6 +9,7 @@ from humming.device import DeviceInfo
 from humming.tune import _get_heuristics_config
 from humming.tune.sm90 import Sm90Heuristics
 from humming.tune.sm90_h20 import Sm90H20Heuristics
+from humming.tune.sm90_policies import get_small_m_packed_fp4_config
 
 
 @pytest.fixture(autouse=True)
@@ -314,6 +315,134 @@ def test_mxfp4_a16_short_k_limits_wide_n_tile_before_block_m48(shape_k, shape_m,
     tuning_fields = TuningConfig.get_field_names()
     tuning = TuningConfig(**{key: value for key, value in config.items() if key in tuning_fields})
     assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
+
+
+@pytest.mark.parametrize(
+    ("shape_n", "shape_k", "num_experts"),
+    [
+        (4608, 5120, 384),  # DeepSeek-V4.1-Flash W13
+        (5120, 2304, 384),  # DeepSeek-V4.1-Flash W2
+        (6144, 3584, 896),  # Kimi-K3 W13
+        (3584, 3072, 896),  # Kimi-K3 W2
+    ],
+)
+def test_small_m_grouped_fp4_a8_uses_wide_non_stream_k_tile(
+    shape_n,
+    shape_k,
+    num_experts,
+):
+    layer = _layer(
+        shape_n,
+        shape_k,
+        num_experts=num_experts,
+        input_scale_group_size=32,
+    )
+    config = get_small_m_packed_fp4_config(
+        layer,
+        shape_m=2 * num_experts,
+        gemm_type=GemmType.GROUPED_CONTIGUOUS,
+        use_f16_accum=False,
+        use_batch_invariant=False,
+    )
+
+    assert config == {
+        "mma_type": "wgmma",
+        "block_shape": (8, 256, 128),
+        "warp_shape": (8, 32, 128),
+        "num_stages": 4,
+        "num_ctas_per_sm": 2,
+        "use_stream_k": False,
+        "use_tma": True,
+        "use_warp_spec": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("shape_n", "shape_k", "num_experts", "block_n", "num_ctas"),
+    [
+        (4608, 5120, 384, 128, 4),
+        (5120, 2304, 384, 256, 2),
+        (6144, 3584, 896, 128, 4),
+        (3584, 3072, 896, 128, 4),
+    ],
+)
+def test_small_m_grouped_fp4_a16_uses_mma_without_stream_k(
+    shape_n,
+    shape_k,
+    num_experts,
+    block_n,
+    num_ctas,
+):
+    layer = _layer(
+        shape_n,
+        shape_k,
+        num_experts=num_experts,
+        a_dtype=dtypes.bfloat16,
+        as_dtype=None,
+        input_scale_group_size=0,
+    )
+    config = get_small_m_packed_fp4_config(
+        layer,
+        shape_m=2 * num_experts,
+        gemm_type=GemmType.GROUPED_CONTIGUOUS,
+        use_f16_accum=False,
+        use_batch_invariant=False,
+    )
+
+    assert config == {
+        "mma_type": "mma",
+        "block_shape": (8, block_n, 128),
+        "warp_shape": (8, 64, 64),
+        "num_stages": 4,
+        "num_ctas_per_sm": num_ctas,
+        "use_stream_k": False,
+        "use_tma": False,
+        "use_warp_spec": False,
+    }
+
+
+def test_small_m_grouped_fp4_policy_is_narrowly_scoped():
+    a8_layer = _layer(4608, 5120, num_experts=384, input_scale_group_size=32)
+    kwargs = {
+        "gemm_type": GemmType.GROUPED_CONTIGUOUS,
+        "use_f16_accum": False,
+        "use_batch_invariant": False,
+    }
+    indexed_kwargs = kwargs | {"gemm_type": GemmType.INDEXED}
+    f16_accum_kwargs = kwargs | {"use_f16_accum": True}
+
+    assert (
+        get_small_m_packed_fp4_config(
+            a8_layer,
+            shape_m=512,
+            **kwargs,
+        )
+        is None
+    )
+    assert (
+        get_small_m_packed_fp4_config(
+            a8_layer,
+            shape_m=8 * a8_layer.num_experts + 8,
+            **kwargs,
+        )
+        is None
+    )
+    assert (
+        get_small_m_packed_fp4_config(
+            a8_layer,
+            shape_m=768,
+            **indexed_kwargs,
+        )
+        is None
+    )
+    assert (
+        get_small_m_packed_fp4_config(
+            a8_layer,
+            shape_m=768,
+            **f16_accum_kwargs,
+        )
+        is None
+    )
 
 
 def test_nvfp4_a16_uses_narrow_first_wave_only():
