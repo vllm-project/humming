@@ -20,7 +20,6 @@ private:
   static constexpr uint32_t kNumThreads = Ctx::kNumThreads;
   static constexpr uint32_t kNumMathThreads = Ctx::kNumMathThreads;
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = Ctx::kLoadThreadOffset;
   // Multicast shares A; cooperative UMMA loads distinct halves of A.
   // Both group adjacent output tiles along N.
   static constexpr uint32_t kNumCtasDimN = Ctx::kMultiCastSizeA * Ctx::kUmmaCtaGroupSize;
@@ -251,6 +250,7 @@ public:
     }
   }
 
+  template <bool kDeferMoeIndexFetch = false>
   CUDA_INLINE
   bool get_next_block() {
     bool has_next_block = false;
@@ -275,7 +275,10 @@ public:
     }
 
     if constexpr (kIsIndexedGemm) {
-      if (has_next_block) fetch_moe_index_block();
+      if (has_next_block) {
+        expert_id = ctx.params.expert_ids_ptr[m_block_id];
+        if constexpr (!kDeferMoeIndexFetch) fetch_moe_index_block();
+      }
     }
     if constexpr (kIsGroupedGemm) {
       if (has_next_block) fetch_moe_group_block();
@@ -393,48 +396,22 @@ public:
 
   CUDA_INLINE
   void fetch_moe_index_block() {
-    expert_id = ctx.params.expert_ids_ptr[m_block_id];
     if (kUseWarpSpec && !ctx.is_load_thread()) return;
 
     const uint32_t *gmem_ptr = ctx.params.sorted_ids_ptr + m_block_id * BlockShape::M;
-    const int4 *gmem_ptr_load = reinterpret_cast<const int4 *>(gmem_ptr);
     uint32_t *wr_row_index = ctx.get_wr_row_index();
     uint32_t *rd_row_index = ctx.get_rd_row_index();
-    int4 *smem_ptr_load = reinterpret_cast<int4 *>(wr_row_index);
-
-    constexpr bool kUseRegisterIndices = Ctx::kUseUmmaSs && Ctx::kOutputChunkRows == 32;
-    if constexpr (kUseRegisterIndices) {
-      // Keep activation loads in flight across output tiles. Loading the small
-      // routing table through registers avoids draining them with wait_group<0>
-      // and publishes both index tables with a single producer synchronization.
-      PRAGMA_UNROLL
-      for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
-        uint32_t index = i * kNumLoadThreads + ctx.load_thread_id();
-        if (index < BlockShape::M) {
-          uint32_t token = gmem_ptr[index];
-          wr_row_index[index] = token;
-          rd_row_index[index] = token / ctx.params.top_k;
-        }
-      }
-      ctx.sync_load_threads();
-      return;
-    }
-
-    legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumLoadThreads, kLoadThreadOffset>(gmem_ptr_load, smem_ptr_load);
-    if constexpr (kUseCpAsync) cp_async_commit_group();
-    if constexpr (kUseCpAsync) cp_async_wait_group<0>();
-
-    ctx.sync_load_threads();
-
     uint32_t thread_id = threadIdx.x;
     if constexpr (kUseWarpSpec) thread_id = ctx.load_thread_id();
+
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
       uint32_t index = kNumLoadThreads * i + thread_id;
       if (index < BlockShape::M) {
-        uint32_t idx = wr_row_index[index];
+        uint32_t idx = gmem_ptr[index];
+        wr_row_index[index] = idx;
         rd_row_index[index] = idx / ctx.params.top_k;
-      };
+      }
     }
 
     ctx.sync_load_threads();

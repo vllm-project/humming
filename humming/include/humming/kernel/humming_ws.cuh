@@ -93,14 +93,26 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
     auto producer = ProducerPipeline(ctx);
     if constexpr (Ctx::kIsIndexedGemm) producer.wait_math_epilogue();
-    while (scheduler.get_next_block()) {
+    while (scheduler.template get_next_block<Ctx::kIsIndexedGemm>()) {
       debug_kernel_timeout_check(debug_start_clock);
       uint32_t &slice_iters = scheduler.slice_iters;
 
-      producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
+      if constexpr (Ctx::kIsIndexedGemm) {
+        producer.seek_weight(scheduler.expert_id, scheduler.n_block_id, scheduler.k_block_id);
+      } else {
+        producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
+      }
       if constexpr (!Ctx::kIsIndexedGemm) {
         producer.prefetch_stage();
         producer.wait_math_epilogue();
+      }
+      if constexpr (Ctx::kIsIndexedGemm) {
+        producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
+        producer.template load_weight_stage<true, true>(0);
+        scheduler.fetch_moe_index_block();
+        producer.seek_activation(
+            scheduler.expert_id, scheduler.m_block_id, scheduler.k_block_id,
+            scheduler.current_shape_m, scheduler.m_offset);
       }
       if constexpr (kUsePdl) {
         if (!pdl_waited) {
@@ -109,8 +121,13 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           pdl_waited = true;
         }
       }
-      producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
-      producer.load_stage<true, true>(0);
+      if constexpr (Ctx::kIsIndexedGemm) {
+        producer.template load_activation_stage<true, true>(0);
+        producer.template commit_stage<true>(0);
+      } else {
+        producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
+        producer.template load_stage<true, true>(0);
+      }
       unroll_for<1, MAX(kNumStages - 1, 2), TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
         producer.wait_stage(stage_id, ProducerPipeline::kUseContinuousRing && stage_id < slice_iters);
         producer.load_stage(stage_id, stage_id < slice_iters);
