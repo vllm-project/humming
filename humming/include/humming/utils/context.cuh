@@ -22,6 +22,7 @@ struct KernelParams {
   const uint32_t *expert_layout_ptr;
   CUtensorMap *tensor_map_buffer;
   int32_t *locks;
+  float *fp32_partials;
 };
 
 template <
@@ -214,7 +215,8 @@ struct UmmaPipelineContext : KernelContext<ContextArgs...> {
       else sync_part_threads<128, Base::kNumThreads, 4>();
     } else {
       uint32_t barrier_id = threadIdx.x < 256 ? 1 : (threadIdx.x < 384 ? 3 : 4);
-      asm volatile("bar.sync %0, 128;" ::"r"(barrier_id) : "memory");
+      asm volatile("bar.sync %0, 128;" ::"r"(barrier_id)
+                   : "memory");
     }
   }
 

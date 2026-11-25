@@ -7,7 +7,7 @@
 
 #include "./torch_api.h"
 
-#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+#define CEIL_DIV(a, b) (((a) + (b)-1) / (b))
 
 enum class MmaType : uint32_t {
   MMA = 0,
@@ -155,6 +155,7 @@ struct KernelData {
   MmaType mma_type;
 
   bool use_stream_k;
+  bool use_fp32_stream_k_reduce;
   bool is_fp_zero_point;
   bool is_channel_weight_scale;
   bool is_group_weight_scale;

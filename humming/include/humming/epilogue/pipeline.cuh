@@ -77,12 +77,15 @@ public:
     if (slice_count > 1) acquire_gmem_barrier();
     PRAGMA_UNROLL_COUNT(1)
     for (uint32_t first_row = 0; first_row < BlockShape::M; first_row += kOutputRows) {
-      smem_writer.write(regs_c_ptr, slice_count, first_row);
+      smem_writer.write(regs_c_ptr, slice_count, first_row, slice_id,
+          gmem_writer.row_offset, gmem_writer.col_offset);
       if constexpr (Ctx::kUseTmaC) {
         if (ctx.is_math_thread()) tma_fence_async_shared();
       }
       sync_output_threads();
-      if constexpr (Ctx::kOutputChunkRows) {
+      if constexpr (Ctx::kUseFp32StreamKReduce) {
+        // The register writer has published FP32 partials or the final FP16 C.
+      } else if constexpr (Ctx::kOutputChunkRows) {
         gmem_writer.write_chunk(slice_id, slice_count, first_row, MIN(kOutputRows, BlockShape::M - first_row), 0);
         // This path reuses one buffer. Wait before the next chunk overwrites it.
         if constexpr (Ctx::kUseTmaC) tma_wait_store_group<0, true>();
@@ -111,7 +114,7 @@ public:
       if (ctx.k_warp_id() != 0) return;
     }
     const uint32_t thread_id = GmemWriter::kUseWarpgroupEpilogue ? ctx.math_thread_id() % 128 : ctx.math_thread_id();
-    if (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3)) {
+    if (!Ctx::kUseFp32StreamKReduce && (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3))) {
       int32_t val = slice_id == 0 ? 0 : -1;
       barrier_acquire2<kNumStreamKSyncThreads, Ctx::kNumThreads>(&locks[locks_offset], val, thread_id, get_output_barrier_id());
     } else {
@@ -125,7 +128,7 @@ public:
       if (ctx.k_warp_id() != 0) return;
     }
     const uint32_t thread_id = GmemWriter::kUseWarpgroupEpilogue ? ctx.math_thread_id() % 128 : ctx.math_thread_id();
-    if (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3)) {
+    if (!Ctx::kUseFp32StreamKReduce && (Ctx::kUseTmaC || (GmemWriter::kHasNativeAtomicAdd && slice_count > 3))) {
       int32_t val = slice_id == 0 ? 1 - static_cast<int32_t>(slice_count) : 0;
       barrier_release2<kNumStreamKSyncThreads, Ctx::kNumThreads>(&locks[locks_offset], val, thread_id, get_output_barrier_id());
     } else {

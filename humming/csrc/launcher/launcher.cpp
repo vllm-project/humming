@@ -147,6 +147,14 @@ Tensor launch_kernel_impl(
   KernelData &kernel_data = kernel_launch_data.metadata;
   int64_t &num_sms = kernel_launch_data.num_sms;
   Tensor c = may_make_tensor_c(c_, a, kernel_data, top_k);
+  // Allocate per invocation on the current stream, including during graph capture.
+  // Slice zero initializes every valid output element before subsequent slices.
+  std::optional<Tensor> fp32_partials;
+  if (kernel_data.use_fp32_stream_k_reduce) {
+    ASSERT_CHECK(kernel_data.gemm_type_id == 0 && !kernel_data.use_tma_c,
+        "FP32 Stream-K reduction requires dense non-TMA output");
+    fp32_partials = torch_empty({c.size(0), c.size(1)}, ScalarType::Float, a.device());
+  }
   uint32_t num_ctas = kernel_data.num_ctas_per_sm * get_num_sms(num_sms, dev);
   Tensor tensor_map_buffer = make_tensor_map_buffer(a, kernel_data, num_ctas);
   a = torch_contiguous(a);
@@ -179,6 +187,7 @@ Tensor launch_kernel_impl(
   void *num_tokens_padded_ptr = num_tokens_padded_.has_value() ? num_tokens_padded_->data_ptr() : nullptr;
   void *expert_layout_ptr = expert_layout_.has_value() ? expert_layout_->data_ptr() : nullptr;
   void *locks_ptr = locks_.has_value() ? locks_->data_ptr() : nullptr;
+  void *fp32_partials_ptr = fp32_partials.has_value() ? fp32_partials->data_ptr() : nullptr;
   void *tensor_map_buffer_ptr = tensor_map_buffer.data_ptr();
 
   auto tensor_map_a = make_tma_desc_a(a, kernel_data);
@@ -217,6 +226,7 @@ Tensor launch_kernel_impl(
       &expert_layout_ptr,
       &tensor_map_buffer_ptr,
       &locks_ptr,
+      &fp32_partials_ptr,
       &shape_m_u32,
       &top_k_u32,
       &use_int64_expert_layout};
@@ -312,6 +322,7 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       static_cast<MmaType>(reader.getUint32("MMA_TYPE_ID")),
 
       reader.getBool("USE_STREAM_K"),
+      reader.getBool("USE_FP32_STREAM_K_REDUCE"),
       reader.getBool("IS_FP_ZERO_POINT"),
       reader.getBool("IS_CHANNEL_WEIGHT_SCALE"),
       reader.getBool("IS_GROUP_WEIGHT_SCALE"),
@@ -385,9 +396,9 @@ Tensor launch_kernel(
   ASSERT_CHECK(configs_t.is_contiguous(), "configs must be contiguous.");
   ASSERT_CHECK(configs_t.get_device() < 0, "configs must be a CPU tensor.");
   IntArrayRef configs(static_cast<int64_t *>(configs_t.data_ptr()),
-                      static_cast<size_t>(configs_t.numel()));
+      static_cast<size_t>(configs_t.numel()));
   return launch_kernel_impl(configs, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c_, sorted_ids_, expert_ids_,
-                            num_tokens_padded_, expert_layout_, locks_, top_k, valid_shape_m, should_check_tensor);
+      num_tokens_padded_, expert_layout_, locks_, top_k, valid_shape_m, should_check_tensor);
 }
 
 void launch_kernel_out(
@@ -411,7 +422,7 @@ void launch_kernel_out(
     bool should_check_tensor = true) {
   if (!a.is_cuda()) return;
   (void)launch_kernel(configs_t, a, b, bs, bs2_, as_, as2_, bzp_, bias_, c, sorted_ids_, expert_ids_,
-                      num_tokens_padded_, expert_layout_, locks, top_k, valid_shape_m, should_check_tensor);
+      num_tokens_padded_, expert_layout_, locks, top_k, valid_shape_m, should_check_tensor);
 }
 
 COMMON_TORCH_LIBRARY(humming, m) {

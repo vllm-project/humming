@@ -44,11 +44,12 @@ private:
       kIsGroupWeightScale && !Ctx::kUseFusedE8m0Scale &&
       kNativeScaleDequantSupported<ElementBS, ElementA>;
 
-  static constexpr uint2 kExpOffset = get_epilogue_exp_offset<
-      ElementA, ElementQB, ElementB, ElementC, ElementBS, kHasZeroPoint,
-      kIsF16Accum, kIsGroupInputScale,
-      kIsGroupOrBlockWeightScale && !Ctx::kUseFusedE8m0Scale,
-      MmaOpClass::kNativeMixed, kUseNativeDequantB, kUseNativeDequantBS>();
+  static constexpr uint2 kExpOffset = get_epilogue_exp_offset <
+                                      ElementA,
+                         ElementQB, ElementB, ElementC, ElementBS, kHasZeroPoint,
+                         kIsF16Accum, kIsGroupInputScale,
+                         kIsGroupOrBlockWeightScale && !Ctx::kUseFusedE8m0Scale,
+                         MmaOpClass::kNativeMixed, kUseNativeDequantB, kUseNativeDequantBS > ();
 
   static constexpr uint32_t kSizeAS = WarpShape::M / 8;
   static constexpr uint32_t kSizeBS = WarpShape::N / 4 * ElementBS::kBits / 32;
@@ -233,6 +234,27 @@ public:
   CUDA_INLINE T *regs_bs_as_ptr() {
     return reinterpret_cast<T *>(bs);
   };
+
+  CUDA_INLINE void apply_fp32_stream_k_output(float2 &values, uint32_t row, uint32_t col) {
+    static_assert(!kIsF16Accum);
+    static_assert(!kHasChannelWeightScale);
+    may_apply_f32_on_smem_write(values, row, col);
+    if constexpr (!kHasTensorWeightScale && kExpOffset.x) {
+      constexpr float factor = prepare_exp_scale_factor<float, kExpOffset.x>();
+      values.x *= factor;
+      values.y *= factor;
+    }
+  }
+
+  CUDA_INLINE void apply_fp32_stream_k_bias(float2 &values, uint32_t col) {
+    // Add bias after all FP32 partials cancel, before the only output conversion.
+    if constexpr (kHasBias) {
+      const auto *packed_bias = reinterpret_cast<const scalar_t2 *>(bias);
+      float2 bias_values = this->num22float2(packed_bias[col]);
+      values.x += bias_values.x;
+      values.y += bias_values.y;
+    }
+  }
 
   template <class T = uint32_t>
   CUDA_INLINE T *regs_as_as_ptr() {
