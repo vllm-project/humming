@@ -131,7 +131,10 @@ def register_op(
             device_guard = args[0] if args else kwargs[first_arg_name]
             if isinstance(device_guard, FakeTensor) or not device_guard.is_cuda:
                 return impl_func(*args, **kwargs)
-            with torch.cuda.device(device_guard.device):
+            index = device_guard.get_device()
+            if index == torch.cuda.current_device():
+                return impl_func(*args, **kwargs)
+            with torch.cuda.device(index):
                 return impl_func(*args, **kwargs)
 
         if lib_name not in _libs:
