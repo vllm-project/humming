@@ -161,6 +161,7 @@ int64_t get_fp16_tensorcore_ops_per_clock(int64_t sm_version, bool is_ppu) {
   if (sm_major == 10 || sm_major == 11) return 8192;
 
   switch (sm_version) {
+    case 70: return 1024; // Volta: 8 tensor cores per SM, 64 FMA each per clock
     case 75: return 1024;
     case 80: return 2048;
     case 86: return 1024;
@@ -180,7 +181,7 @@ PyObject *make_tensorcore_tops(const DeviceData &info) {
     int64_t min_sm_version;
   };
   static constexpr TensorCoreType types[] = {
-      {"float16", 1.0, 75},
+      {"float16", 1.0, 70},
       {"bfloat16", 1.0, 80},
       {"float8e3m4", 2.0, 100},
       {"float8e4m3", 2.0, 89},

@@ -68,6 +68,31 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kUseMxmma = TuningConfig::kMmaType == MmaType::MXMMA;
 
   static constexpr bool kUseBlockScaledMma = LayerConfig::kUseBlockScaledMma;
+#if HUMMING_VOLTA
+  // Enumerators, not static constexpr members: those are emitted as symbols in every cubin (review #1).
+  // Volta decode path (utils/ptx/volta.cuh): 8-row tiles, fp16 activations, dequantized 4- or 8-bit integer weights,
+  // no zero point, no fused e8m0 scale, full-width warp tiles. Everything else keeps the shuffle path.
+  enum : bool { kVoltaDecode = HUMMING_VOLTA && !USE_PPU && MmaShape::M == 8 && WarpShape::M == 8 && ElementA::kBits == 16 &&
+                ElementQB::kIsIntegerType && (ElementQB::kBits == 4 || ElementQB::kBits == 8) &&
+                !LayerConfig::kHasZeroPoint && !LayerConfig::kUseFusedE8m0Scale &&
+                !LayerConfig::kUseLdmatrixDequant && !LayerConfig::kUseRawWeight &&
+                !LayerConfig::kUseFlatWeight && !LayerConfig::kUsePackedKLayout &&
+                WarpShape::N != ElementA::kBits * 2 };
+  // The same for 16-row tiles (prompts): one m8n8k4 per m tile, n tile and k step, no shuffles.
+  enum : bool { kVoltaPrefill = HUMMING_VOLTA && !USE_PPU && MmaShape::M == 16 && MmaShape::N == 8 &&
+                ElementA::kBits == 16 && ElementQB::kIsIntegerType &&
+                (ElementQB::kBits == 4 || ElementQB::kBits == 8) && !LayerConfig::kHasZeroPoint &&
+                !LayerConfig::kUseFusedE8m0Scale && !LayerConfig::kUseLdmatrixDequant &&
+                !LayerConfig::kUseRawWeight && !LayerConfig::kUseFlatWeight &&
+                !LayerConfig::kUsePackedKLayout && WarpShape::N != ElementA::kBits * 2 };
+  enum : bool { kVoltaNative = kVoltaDecode || kVoltaPrefill };
+#else
+  // Non-Volta builds: no expression here may mention MmaShape or Element* members, or the dead data symbols
+  // of the cubin come out in a different order than upstream's (review #1).
+  enum : bool { kVoltaDecode = false,
+    kVoltaPrefill = false,
+    kVoltaNative = false };
+#endif
   static constexpr bool kUseMmaGroupScaleLayout1 = !USE_PPU && kUseWmma && ElementA::kBits < 16 &&
                                                    LayerConfig::kIsGroupWeightScale && !LayerConfig::kUseFusedE8m0Scale;
   static constexpr bool kUseUmmaSplitLoads = false;
