@@ -4,7 +4,8 @@ import math
 import numpy as np
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig
+from humming.config import GemmType, LayerConfig, TuningConfig
+from humming.config.mma import get_register_budget_error
 from humming.device import current_device
 from humming.tune.raster import get_moe_raster_group_m
 from humming.utils.math import round_up
@@ -274,7 +275,15 @@ class DeviceHeuristics:
                 max(min_warp_shape_k, block_shape_k // target_k_warps),
             )
             num_warps_k = block_shape_k // fitted_warp_shape_k
-            if num_warps_m * num_warps_n * num_warps_k < 4:
+            # A fitted M tile that is not a multiple of 32 keeps a single M warp,
+            # whose accumulators can exceed the register budget (e.g. 208 rows).
+            fitted_tuning_config = TuningConfig(
+                block_shape=(fitted_block_m, block_shape_n, block_shape_k),
+                warp_shape=(fitted_block_m // num_warps_m, fitted_warp_shape_n, fitted_warp_shape_k),
+                num_ctas_per_sm=num_ctas_per_sm,
+            )
+            register_error = get_register_budget_error(layer_config, fitted_tuning_config, use_f16_accum)
+            if num_warps_m * num_warps_n * num_warps_k < 4 or register_error is not None:
                 fitted_block_m = block_shape_m
             else:
                 block_shape_m = fitted_block_m
