@@ -91,11 +91,12 @@ class Sm80Heuristics(DeviceHeuristics):
         shape_k = layer_config.shape_k
         b_dtype = layer_config.b_dtype
         is_dense_a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
-        is_int4_g128 = b_dtype.num_bits == 4 and group_size == 128
+        # INT3 and INT4 g128 share the INT4 range: INT3 measured 1.16x median (0.97-1.31x) on A100.
+        is_int_g128 = b_dtype.num_bits in (3, 4) and group_size == 128
         is_fp8 = b_dtype == dtypes.float8e4m3
         is_nvfp4 = b_dtype == dtypes.float4e2m1 and group_size == 16
         # FP8 and NVFP4 regress on some shapes at M = 12-16 (and NVFP4 at long K), so they stop at M = 8.
-        if is_int4_g128:
+        if is_int_g128:
             is_decode_size = (shape_m <= 16 and shape_k <= 5120) or (shape_m <= 32 and shape_k <= 4096)
         elif is_fp8:
             is_decode_size = shape_m <= 8

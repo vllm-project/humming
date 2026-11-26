@@ -82,8 +82,9 @@ def _mock_a100_device(monkeypatch):
     monkeypatch.setattr(DeviceInfo, "tensorcore_tops", property(lambda self: tensorcore_tops))
 
 
-# Weight formats as vLLM passes them: int4 g128, FP8 per-tensor, NVFP4 (group 16, FP8 scales).
+# Weight formats as vLLM passes them: int3/int4 g128, FP8 per-tensor, NVFP4 (group 16, FP8 scales).
 _A16_WEIGHTS = {
+    "int3": (dtypes.uint3, dtypes.bfloat16, 128),
     "int4": (dtypes.uint4, dtypes.bfloat16, 128),
     "fp8": (dtypes.float8e4m3, dtypes.float32, 0),
     "nvfp4": (dtypes.float4e2m1, dtypes.float8e4m3, 16),
@@ -134,6 +135,9 @@ def _assert_legal_on_a100(layer_config, shape_m, config):
         (5120, 5120, 16, "int4"),
         (6144, 4096, 32, "int4"),
         (2560, 4096, 4, "int4"),
+        (4096, 4096, 1, "int3"),
+        (6144, 4096, 32, "int3"),
+        (12288, 5120, 16, "int3"),
         (4096, 4096, 1, "fp8"),
         (2560, 4096, 8, "fp8"),
         (24576, 4096, 4, "fp8"),
@@ -177,6 +181,8 @@ def test_sm80_decode_uses_one_wave_data_parallel_tiles(shape_n, shape_k, shape_m
         (4096, 4096, 1, dtypes.int8, {}),
         (4096, 4096, 1, dtypes.uint4, {"use_batch_invariant": True}),
         (4096, 4096, 1, dtypes.uint4, {"use_f16_accum": True}),
+        (34816, 5120, 1, "int3", {}),
+        (5120, 17408, 1, "int3", {}),
         (4096, 4096, 12, "fp8", {}),
         (7168, 5120, 16, "fp8", {}),
         (4096, 4096, 12, "nvfp4", {}),
