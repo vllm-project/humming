@@ -37,6 +37,10 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         if use_batch_invariant:
             return config
 
+        decode_config = cls._select_decode_tile(layer_config, shape_m, config, use_f16_accum, gemm_type)
+        if decode_config is not None:
+            return decode_config
+
         if block_m > 32:
             is_a16_fp32 = layer_config.a_dtype.num_bits == 16 and not use_f16_accum
             use_long_stream_k = layer_config.shape_k > 4096 and config["use_stream_k"]
@@ -184,6 +188,71 @@ class Sm100MmaHeuristics(Sm80Heuristics):
             if smem_size * 4 <= cls.max_smem_size and fits_registers:
                 return candidate
         return config
+
+    @classmethod
+    def _select_decode_tile(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        config: dict,
+        use_f16_accum: bool,
+        gemm_type: GemmType,
+    ) -> dict | None:
+        """Give each CTA one whole output tile for decode-size W4A16 GEMMs on B200.
+
+        Stream-K's splits and fixups cost more than these layers take to stream
+        their weights: at M=1 a 4096x4096 int4 layer takes 10.1 us with Stream-K
+        and 6.4 us as one wave of 64-column tiles. Each data-parallel CTA reads
+        its whole K range, so the grid needs more than K / 128 tiles; narrower
+        layers keep Stream-K.
+        """
+        group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
+        shape_n, shape_k = layer_config.shape_n, layer_config.shape_k
+        is_dense_w4a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        is_dense_w4a16 &= layer_config.b_dtype.num_bits == 4 and group_size == 128
+        is_decode_size = (shape_m <= 16 and shape_k <= 8192) or (shape_m <= 32 and shape_k <= 5120)
+        is_tile_aligned = shape_n % 64 == 0 and shape_k % 256 == 0
+        # Measured on B200 only; SM103 and SM110 share this class.
+        is_sm100 = layer_config.sm_version == 100
+        if not (is_sm100 and is_dense_w4a16 and is_decode_size and is_tile_aligned) or use_f16_accum:
+            return None
+
+        num_sms = current_device.sm_count
+        num_tiles = shape_n // 64
+        if num_tiles * 128 <= shape_k:
+            return None
+        if num_tiles <= num_sms:
+            # One CTA per SM: eight warps, two along N and four along K.
+            num_ctas_per_sm, warp_k = 1, 64
+        elif shape_m <= 16 and num_tiles <= 4 * num_sms:
+            # Wider layers share SMs between CTAs of four warps, two along N and two along K.
+            num_ctas_per_sm, warp_k = math.ceil(num_tiles / num_sms), 128
+        else:
+            return None
+
+        block_m = 8 if shape_m <= 8 else 16 if shape_m <= 16 else 32
+        block_shape = (block_m, 64, 256)
+        warp_shape = (block_m, 32, warp_k)
+        for num_stages in range(6, 1, -1):
+            smem_size = estimate_smem_size_layer(
+                layer_config,
+                block_shape,
+                GemmType.DENSE,
+                num_stages,
+                mma_type=MmaType.MMA,
+                warp_shape=warp_shape,
+                output_chunk_rows=config["output_chunk_rows"],
+            )
+            if smem_size * num_ctas_per_sm <= cls.max_smem_size:
+                return config | {
+                    "block_shape": block_shape,
+                    "warp_shape": warp_shape,
+                    "use_stream_k": False,
+                    "num_stages": num_stages,
+                    "num_ctas_per_sm": num_ctas_per_sm,
+                    "num_sms": math.ceil(num_tiles / num_ctas_per_sm),
+                }
+        return None
 
 
 class Sm100UmmaHeuristics(DeviceHeuristics):
