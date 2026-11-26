@@ -89,24 +89,37 @@ class Sm80Heuristics(DeviceHeuristics):
     ) -> bool:
         group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
         shape_k = layer_config.shape_k
-        is_dense_w4a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
-        is_dense_w4a16 &= layer_config.b_dtype.num_bits == 4 and group_size == 128
-        is_decode_size = (shape_m <= 16 and shape_k <= 5120) or (shape_m <= 32 and shape_k <= 4096)
+        b_dtype = layer_config.b_dtype
+        is_dense_a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        # INT3 and INT4 g128 share the INT4 range: INT3 measured 1.16x median (0.97-1.31x) on A100.
+        is_int_g128 = b_dtype.num_bits in (3, 4) and group_size == 128
+        is_fp8 = b_dtype == dtypes.float8e4m3
+        is_nvfp4 = b_dtype == dtypes.float4e2m1 and group_size == 16
+        # FP8 and NVFP4 regress on some shapes at M = 12-16 (and NVFP4 at long K), so they stop at M = 8.
+        if is_int_g128:
+            is_decode_size = (shape_m <= 16 and shape_k <= 5120) or (shape_m <= 32 and shape_k <= 4096)
+        elif is_fp8:
+            is_decode_size = shape_m <= 8
+        elif is_nvfp4:
+            is_decode_size = shape_m <= 8 and shape_k <= 5120
+        else:
+            is_decode_size = False
         is_tile_aligned = layer_config.shape_n % 64 == 0 and shape_k % 128 == 0
         uses_default_math = not use_f16_accum and not use_batch_invariant
         is_sm80 = cls.sm_version == 80
-        return is_sm80 and is_dense_w4a16 and is_decode_size and is_tile_aligned and uses_default_math
+        return is_sm80 and is_dense_a16 and is_decode_size and is_tile_aligned and uses_default_math
 
     @classmethod
     def _get_decode_tile_config(cls, config: dict, layer_config: LayerConfig, shape_m: int) -> dict:
-        """Give each CTA one whole output tile for decode-size W4A16 GEMMs.
+        """Give each CTA one whole output tile for decode-size A16 GEMMs (int4, FP8 and NVFP4 weights).
 
         Stream-K splits a tile's K range across CTAs, and every split adds a
         pipeline refill and a global-memory reduction: about 5 us on A100,
         while the weights of a 4096x4096 layer stream in about 6 us. A
         data-parallel grid of one wave is faster even when some SMs idle.
-        Layers with K > 5120 keep Stream-K: their tiles are long enough to
-        hide the reduction, and the data-parallel grid lost there.
+        4-bit layers with K > 5120 keep Stream-K: their tiles are long enough
+        to hide the reduction, and the data-parallel grid lost there. FP8
+        tiles carry twice the bytes per column and still gained at K = 14336.
         """
         num_sms = current_device.sm_count
         num_ctas_per_sm = 2

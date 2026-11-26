@@ -82,7 +82,19 @@ def _mock_a100_device(monkeypatch):
     monkeypatch.setattr(DeviceInfo, "tensorcore_tops", property(lambda self: tensorcore_tops))
 
 
-def _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint4, sm_version=80):
+# Weight formats as vLLM passes them: int3/int4 g128, FP8 per-tensor, NVFP4 (group 16, FP8 scales).
+_A16_WEIGHTS = {
+    "int3": (dtypes.uint3, dtypes.bfloat16, 128),
+    "int4": (dtypes.uint4, dtypes.bfloat16, 128),
+    "fp8": (dtypes.float8e4m3, dtypes.float32, 0),
+    "nvfp4": (dtypes.float4e2m1, dtypes.float8e4m3, 16),
+}
+
+
+def _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint4, sm_version=80, weights=None):
+    bs_dtype, weight_scale_group_size = dtypes.bfloat16, 128
+    if weights is not None:
+        b_dtype, bs_dtype, weight_scale_group_size = _A16_WEIGHTS[weights]
     return LayerConfig(
         sm_version=sm_version,
         shape_n=shape_n,
@@ -90,8 +102,8 @@ def _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint4, sm_version=80):
         a_dtype=dtypes.bfloat16,
         b_dtype=b_dtype,
         c_dtype=dtypes.bfloat16,
-        bs_dtype=dtypes.bfloat16,
-        weight_scale_group_size=128,
+        bs_dtype=bs_dtype,
+        weight_scale_group_size=weight_scale_group_size,
     )
 
 
@@ -115,18 +127,28 @@ def _assert_legal_on_a100(layer_config, shape_m, config):
 
 @pytest.mark.usefixtures("_mock_a100_device")
 @pytest.mark.parametrize(
-    "shape_n,shape_k,shape_m",
+    "shape_n,shape_k,shape_m,weights",
     [
-        (6144, 4096, 1),
-        (4096, 4096, 8),
-        (24576, 4096, 16),
-        (5120, 5120, 16),
-        (6144, 4096, 32),
-        (2560, 4096, 4),
+        (6144, 4096, 1, "int4"),
+        (4096, 4096, 8, "int4"),
+        (24576, 4096, 16, "int4"),
+        (5120, 5120, 16, "int4"),
+        (6144, 4096, 32, "int4"),
+        (2560, 4096, 4, "int4"),
+        (4096, 4096, 1, "int3"),
+        (6144, 4096, 32, "int3"),
+        (12288, 5120, 16, "int3"),
+        (4096, 4096, 1, "fp8"),
+        (2560, 4096, 8, "fp8"),
+        (24576, 4096, 4, "fp8"),
+        (4096, 14336, 8, "fp8"),
+        (4096, 4096, 1, "nvfp4"),
+        (6144, 4096, 8, "nvfp4"),
+        (5120, 5120, 4, "nvfp4"),
     ],
 )
-def test_sm80_decode_uses_one_wave_data_parallel_tiles(shape_n, shape_k, shape_m):
-    layer_config = _w4a16_layer_config(shape_n, shape_k)
+def test_sm80_decode_uses_one_wave_data_parallel_tiles(shape_n, shape_k, shape_m, weights):
+    layer_config = _w4a16_layer_config(shape_n, shape_k, weights=weights)
 
     config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
 
@@ -159,10 +181,20 @@ def test_sm80_decode_uses_one_wave_data_parallel_tiles(shape_n, shape_k, shape_m
         (4096, 4096, 1, dtypes.int8, {}),
         (4096, 4096, 1, dtypes.uint4, {"use_batch_invariant": True}),
         (4096, 4096, 1, dtypes.uint4, {"use_f16_accum": True}),
+        (34816, 5120, 1, "int3", {}),
+        (5120, 17408, 1, "int3", {}),
+        (4096, 4096, 12, "fp8", {}),
+        (7168, 5120, 16, "fp8", {}),
+        (4096, 4096, 12, "nvfp4", {}),
+        (4096, 12288, 1, "nvfp4", {}),
+        (4096, 4096, 1, "fp8", {"use_batch_invariant": True}),
     ],
 )
 def test_sm80_keeps_heuristic_outside_decode_range(shape_n, shape_k, shape_m, b_dtype, kwargs):
-    layer_config = _w4a16_layer_config(shape_n, shape_k, b_dtype)
+    if isinstance(b_dtype, str):
+        layer_config = _w4a16_layer_config(shape_n, shape_k, weights=b_dtype)
+    else:
+        layer_config = _w4a16_layer_config(shape_n, shape_k, b_dtype)
 
     config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE, **kwargs)
     base_config = DeviceHeuristics.get_config.__func__(
