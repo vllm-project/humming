@@ -290,3 +290,16 @@ def test_sm80_stream_k_keeps_stages_otherwise(shape_n, shape_k, shape_m, b_dtype
     config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
 
     assert _without_evict_hint(config) == _base_sm80_config(layer_config, shape_m)
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+def test_sm80_stream_k_empty_tail_keeps_stages(monkeypatch):
+    # 140 tiles on 70 CTAs: two data-parallel tiles each and no Stream-K tail, whatever the stage count.
+    monkeypatch.setattr(DeviceInfo, "sm_count", property(lambda self: 70))
+    layer_config = _w4a16_layer_config(35840, 2048, b_dtype=dtypes.uint3)
+    config = _base_sm80_config(layer_config, 32)
+    assert config["block_shape"] == (32, 256, 64) and config["num_ctas_per_sm"] == 1
+    assert config["use_stream_k"] and config["num_stages"] == 5
+    for num_stages in (4, 5):
+        assert Sm80Heuristics._stream_k_longest_iters(layer_config, config, 32, num_stages) == (64, True)
+    assert not Sm80Heuristics._should_drop_stream_k_stage(layer_config, config, 32, GemmType.DENSE)

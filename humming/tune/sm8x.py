@@ -104,6 +104,9 @@ class Sm80Heuristics(DeviceHeuristics):
         slice_iters = max(ceil_div(stream_k_mn_blocks * stream_k_blocks, num_ctas), min_slice_iters)
         align_iters = blocks_per_group // math.gcd(blocks_per_group, num_stages) * num_stages
         slice_iters = ceil_div(slice_iters, align_iters) * align_iters
+        # Slices past the last Stream-K tile are empty: with no tail (stream_k_mn_blocks == 0) no CTA
+        # runs a Stream-K slice, and the busiest CTA never runs more than the whole tail.
+        slice_iters = min(slice_iters, stream_k_mn_blocks * stream_k_blocks)
         return data_parallel_iters + slice_iters, slice_iters % stream_k_blocks == 0
 
     @classmethod
