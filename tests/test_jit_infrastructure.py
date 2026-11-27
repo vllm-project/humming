@@ -715,16 +715,20 @@ def test_compile_many_obeys_worker_limit(monkeypatch, limit):
     ],
 )
 def test_resolve_configs_propagates_use_pdl(
-    monkeypatch, sm_version, heuristic_use_pdl, requested_use_pdl, expected_use_pdl
+    monkeypatch, mock_device_info, sm_version, heuristic_use_pdl, requested_use_pdl, expected_use_pdl
 ):
     from contextlib import nullcontext
 
+    from humming import device as device_module
     from humming import dtypes
     from humming.config import LayerConfig
     from humming.device import DeviceInfo
     from humming.kernel import humming as humming_kernel_module
     from humming.kernel.humming import HummingKernel
 
+    monkeypatch.setattr(device_module, "_get_device_info_extension", lambda: mock_device_info)
+    monkeypatch.setattr(DeviceInfo, "_instances", {})
+    monkeypatch.setattr(device_module.current_device, "_value", None)
     monkeypatch.setattr(DeviceInfo, "sm_version", property(lambda self: sm_version))
     monkeypatch.setattr(humming_kernel_module, "get_device_index", lambda device=None: 0)
     monkeypatch.setattr(humming_kernel_module.torch.cuda, "device", lambda device: nullcontext())
@@ -769,16 +773,20 @@ def test_resolve_configs_propagates_use_pdl(
     assert explicit_dict["use_pdl"] is heuristic_use_pdl
 
 
-def test_prepare_kernels_caches_use_pdl_separately(monkeypatch):
+def test_prepare_kernels_caches_use_pdl_separately(monkeypatch, mock_device_info):
     from contextlib import nullcontext
     from types import SimpleNamespace
 
+    from humming import device as device_module
     from humming import dtypes
     from humming.config import LayerConfig
     from humming.device import DeviceInfo
     from humming.kernel import humming as humming_kernel_module
     from humming.kernel.humming import HummingKernel
 
+    monkeypatch.setattr(device_module, "_get_device_info_extension", lambda: mock_device_info)
+    monkeypatch.setattr(DeviceInfo, "_instances", {})
+    monkeypatch.setattr(device_module.current_device, "_value", None)
     monkeypatch.setattr(DeviceInfo, "sm_version", property(lambda self: 100))
     monkeypatch.setattr(humming_kernel_module, "get_device_index", lambda device=None: 0)
     monkeypatch.setattr(humming_kernel_module.torch.cuda, "device", lambda device: nullcontext())
