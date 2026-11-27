@@ -234,3 +234,59 @@ def test_sm8x_dense_evicts_weights_when_one_m_block(
 
     assert config["evict_weights_first"] == should_evict
     assert (shape_m <= config["block_shape"][0]) == should_evict
+
+
+def _base_sm80_config(layer_config, shape_m):
+    return DeviceHeuristics.get_config.__func__(
+        Sm80Heuristics, layer_config, shape_m, gemm_type=GemmType.DENSE
+    )
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+def test_sm80_stream_k_longest_iters_matches_scheduler():
+    # 34816 x 5120, block (8, 256, 64), 216 CTAs: 136 tiles x 80 K blocks over 216 CTAs is 51 iterations,
+    # rounded up to lcm(2, 5) = 10 with 5 stages and to lcm(2, 4) = 4 with 4.
+    layer_config = _w4a16_layer_config(34816, 5120, b_dtype=dtypes.uint3)
+    config = _base_sm80_config(layer_config, 1)
+    assert config["block_shape"] == (8, 256, 64) and config["num_sms"] * config["num_ctas_per_sm"] == 216
+    assert Sm80Heuristics._stream_k_longest_iters(layer_config, config, 1, 5) == (60, False)
+    assert Sm80Heuristics._stream_k_longest_iters(layer_config, config, 1, 4) == (52, False)
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize(
+    "shape_n,shape_k,shape_m",
+    [
+        (34816, 5120, 1),  # 60 -> 52 iterations
+        (34816, 5120, 16),
+        (28672, 4096, 8),
+        (17408, 5120, 1),
+        (24576, 4096, 1),  # 4 stages makes every slice one whole tile
+    ],
+)
+def test_sm80_int3_stream_k_drops_unbalancing_stage(shape_n, shape_k, shape_m):
+    layer_config = _w4a16_layer_config(shape_n, shape_k, b_dtype=dtypes.uint3)
+
+    config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
+    base_config = _base_sm80_config(layer_config, shape_m)
+
+    assert base_config["use_stream_k"] and base_config["num_stages"] == 5
+    assert _without_evict_hint(config) == dict(base_config, num_stages=4)
+
+
+@pytest.mark.usefixtures("_mock_a100_device")
+@pytest.mark.parametrize(
+    "shape_n,shape_k,shape_m,b_dtype",
+    [
+        (20480, 5120, 1, dtypes.uint3),  # 4 stages would round 30 iterations up to 32
+        (40960, 5120, 1, dtypes.uint3),  # same iterations either way
+        (34816, 5120, 1, dtypes.uint4),  # INT4 is bandwidth-bound there; rebalancing barely helps
+        (34816, 5120, 1, dtypes.uint8),
+    ],
+)
+def test_sm80_stream_k_keeps_stages_otherwise(shape_n, shape_k, shape_m, b_dtype):
+    layer_config = _w4a16_layer_config(shape_n, shape_k, b_dtype=b_dtype)
+
+    config = Sm80Heuristics.get_config(layer_config, shape_m=shape_m, gemm_type=GemmType.DENSE)
+
+    assert _without_evict_hint(config) == _base_sm80_config(layer_config, shape_m)

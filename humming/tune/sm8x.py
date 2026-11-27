@@ -70,6 +70,8 @@ class Sm80Heuristics(DeviceHeuristics):
         )
         if cls._should_use_decode_tile(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type):
             config = cls._get_decode_tile_config(config, layer_config, shape_m)
+        if cls._should_drop_stream_k_stage(layer_config, config, shape_m, gemm_type):
+            config = dict(config, num_stages=config["num_stages"] - 1)
 
         tokens_per_expert = shape_m / (layer_config.num_experts or 1)
         block_m = config["block_shape"][0]
@@ -77,6 +79,55 @@ class Sm80Heuristics(DeviceHeuristics):
         if gemm_type != GemmType.DENSE:
             config["evict_weights_first"] = tokens_per_expert <= block_m * 0.5 <= 8
         return config
+
+    @classmethod
+    def _stream_k_longest_iters(cls, layer_config: LayerConfig, config: dict, shape_m: int, num_stages: int):
+        """K iterations of the busiest CTA, as Scheduler (scheduler.cuh) splits a dense Stream-K GEMM on SM80.
+
+        Returns the iterations and whether every Stream-K slice covers whole tiles (no partial-sum fixup).
+        """
+        block_m, block_n, block_k = config["block_shape"]
+        num_ctas = config["num_sms"] * config["num_ctas_per_sm"]
+        group_size = max(layer_config.input_scale_group_size, layer_config.weight_scale_group_size, 1)
+        blocks_per_group = max(1, group_size // block_k)
+        k_blocks = ceil_div(layer_config.shape_k, block_k)
+        stream_k_blocks = ceil_div(k_blocks, blocks_per_group) * blocks_per_group
+        mn_blocks = ceil_div(shape_m, block_m) * ceil_div(layer_config.shape_n, block_n)
+        stream_k_mn_blocks = mn_blocks
+        if mn_blocks > num_ctas:
+            stream_k_mn_blocks = mn_blocks % num_ctas
+            if stream_k_mn_blocks and stream_k_mn_blocks * 10 <= num_ctas:
+                stream_k_mn_blocks += num_ctas
+        data_parallel_iters = (mn_blocks - stream_k_mn_blocks) // num_ctas * stream_k_blocks
+        # At most 10 slices per tile, as in Scheduler.
+        min_slice_iters = ceil_div(stream_k_blocks - 1, 9)
+        slice_iters = max(ceil_div(stream_k_mn_blocks * stream_k_blocks, num_ctas), min_slice_iters)
+        align_iters = blocks_per_group // math.gcd(blocks_per_group, num_stages) * num_stages
+        slice_iters = ceil_div(slice_iters, align_iters) * align_iters
+        return data_parallel_iters + slice_iters, slice_iters % stream_k_blocks == 0
+
+    @classmethod
+    def _should_drop_stream_k_stage(
+        cls, layer_config: LayerConfig, config: dict, shape_m: int, gemm_type: GemmType
+    ) -> bool:
+        """Use 4 stages instead of 5 when that balances an INT3 Stream-K grid better.
+
+        Scheduler rounds each CTA's Stream-K slice up to a multiple of
+        lcm(group_size / block_k, num_stages). With 5 stages and block_k 64
+        that is 10 iterations, so e.g. a 34816 x 5120 layer gives its busiest
+        CTA 60 iterations instead of 52. INT3 weights are bound by each CTA's
+        work, not by DRAM bandwidth, so that imbalance costs time directly
+        (INT4 and wider weights barely gain from rebalancing).
+        """
+        is_dense_w3a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        is_dense_w3a16 &= layer_config.b_dtype.num_bits == 3
+        is_five_stage_stream_k = config["use_stream_k"] and config["num_stages"] == 5
+        if cls.sm_version != 80 or not is_dense_w3a16 or not is_five_stage_stream_k:
+            return False
+        iters_5, whole_tiles_5 = cls._stream_k_longest_iters(layer_config, config, shape_m, 5)
+        iters_4, whole_tiles_4 = cls._stream_k_longest_iters(layer_config, config, shape_m, 4)
+        # A slice of whole tiles also skips the cross-CTA reduction, worth a few more iterations.
+        return iters_5 >= 1.04 * iters_4 or (whole_tiles_4 and not whole_tiles_5 and iters_5 >= 0.9 * iters_4)
 
     @classmethod
     def _should_use_decode_tile(
