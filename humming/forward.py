@@ -205,4 +205,5 @@ def humming_forward(
         locks=locks,
         top_k=top_k,
         valid_shape_m=valid_shape_m,
+        use_pdl=use_pdl,
     )

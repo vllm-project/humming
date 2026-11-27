@@ -242,6 +242,62 @@ def test_forward_fullgraph(a_dtype):
     assert counter.frame_count == 1
 
 
+@pytest.mark.filterwarnings(r"ignore:`torch\.jit\.script_method` is deprecated\. ")
+@pytest.mark.parametrize("a_dtype", [dtypes.bfloat16, dtypes.float8e4m3], ids=str)
+@pytest.mark.parametrize("use_pdl", [False, True])
+def test_forward_propagates_use_pdl(a_dtype, use_pdl):
+    """Ensure humming_forward propagates use_pdl to the consumer GEMM kernel."""
+    from humming.kernel.humming import HummingKernel
+
+    torch._dynamo.reset()
+    skip_if_unsupported(a_dtype=a_dtype)
+    b_dtype = dtypes.float8e4m3 if a_dtype == dtypes.float8e4m3 else dtypes.uint4
+    config = _layer_config(
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        bs_dtype=dtypes.bfloat16,
+    )
+    runner = KernelTestRunner(
+        KernelTestCase(
+            name="forward-use-pdl",
+            layer_config=config,
+            compute_config=ComputeConfig(gemm_type=GemmType.DENSE),
+        )
+    )
+    compute_config = runner.compute_config.to_str()
+    locks = torch.zeros(1024, device="cuda", dtype=torch.int32)
+
+    def forward(inputs):
+        return humming_forward(
+            config,
+            inputs,
+            **runner.kernel_tensors,
+            locks=locks,
+            compute_config=compute_config,
+            tuning_config={},
+            use_pdl=use_pdl,
+        )
+
+    counter = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(forward, backend=counter, fullgraph=True, dynamic=True)
+    for shape_m in (17, 257):
+        torch.manual_seed(runner.test_case.seed + shape_m)
+        inputs = generate_random_tensor((shape_m, SHAPE_K), dtype=torch.bfloat16, device="cuda")
+        inputs_ref, _, _, _ = runner.prepare_inputs(inputs)
+        expected = (inputs_ref @ runner.weight_ref.T).to(torch.bfloat16)
+        torch.testing.assert_close(forward(inputs), expected, rtol=0.01, atol=0.05)
+        torch.testing.assert_close(compiled(inputs), expected, rtol=0.01, atol=0.05)
+    assert counter.frame_count == 1
+
+    device_index = torch.cuda.current_device()
+    cache_key = (config.to_str(), compute_config, "{}", use_pdl, device_index)
+    prepared_configs = HummingKernel._str2kernel_cache[cache_key]
+    expected_use_pdl = use_pdl and current_device.sm_version >= 90
+    kernel_ids = [int(prepared_configs[index + 2]) for index in range(0, len(prepared_configs), 4)]
+    assert kernel_ids
+    assert all(HummingKernel._id2kernel[kernel_id].use_pdl is expected_use_pdl for kernel_id in kernel_ids)
+
+
 @pytest.mark.parametrize(
     "required_features,test_case",
     SPECIAL_WEIGHT_CASES,

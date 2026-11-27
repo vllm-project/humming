@@ -609,6 +609,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             self.use_stream_k = False
         if self.mma_type == MmaType.WGMMA:
             assert self.num_stages >= 3, "WGMMA requires at least three pipeline stages"
+        if self.sm_version < 90:
+            self.use_pdl = False
         if self.use_batch_invariant:
             assert not self.use_stream_k, "batch-invariant kernels require use_stream_k=False"
             assert self.warp_shape[2] == self.block_shape[2], (
@@ -706,8 +708,24 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             return {}
         return json.loads(config) if isinstance(config, str) else config
 
+    @staticmethod
+    def _apply_use_pdl(tuning_obj, use_pdl: bool | None, sm_version: int):
+        if use_pdl is None:
+            return tuning_obj
+        resolved_use_pdl = bool(use_pdl) and sm_version >= 90
+        if isinstance(tuning_obj, dict):
+            return tuning_obj | {"use_pdl": resolved_use_pdl}
+        return [[entry[0], entry[1], entry[2] | {"use_pdl": resolved_use_pdl}] for entry in tuning_obj]
+
     @classmethod
-    def _resolve_configs(cls, layer_config, compute_config, tuning_config, device=None):
+    def _resolve_configs(
+        cls,
+        layer_config,
+        compute_config,
+        tuning_config,
+        device=None,
+        use_pdl: bool | None = None,
+    ):
         device_index = get_device_index(device)
         layer_obj = dict(cls._prepare_config_obj(layer_config))
         compute_obj = dict(cls._prepare_config_obj(compute_config))
@@ -719,6 +737,7 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             layer_obj["sm_version"] = layer_config_obj.sm_version
             if not tuning_obj:
                 tuning_obj = get_heuristics_config(layer_config_obj, **compute_obj, device=device_index)
+            tuning_obj = cls._apply_use_pdl(tuning_obj, use_pdl, layer_config_obj.sm_version)
         return layer_obj, compute_obj, tuning_obj
 
     @classmethod
@@ -728,16 +747,26 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         compute_config: str | dict | None = None,
         tuning_config: str | dict | list | None = None,
         device: int | torch.device | None = None,
+        use_pdl: bool | None = None,
     ) -> "torch.Tensor":
         device_index = get_device_index(device)
         layer_config_str = cls._prepare_config_str(layer_config)
         compute_config_str = cls._prepare_config_str(compute_config)
         tuning_config_str = cls._prepare_config_str(tuning_config)
-        cache_key = (layer_config_str, compute_config_str, tuning_config_str, device_index)
+        normalized_use_pdl = None if use_pdl is None else bool(use_pdl)
+        cache_key = (
+            layer_config_str,
+            compute_config_str,
+            tuning_config_str,
+            normalized_use_pdl,
+            device_index,
+        )
         if cache_key in cls._str2kernel_cache:
             return cls._str2kernel_cache[cache_key]
 
-        config_objs = cls._resolve_configs(layer_config, compute_config, tuning_config, device_index)
+        config_objs = cls._resolve_configs(
+            layer_config, compute_config, tuning_config, device_index, use_pdl=normalized_use_pdl
+        )
         layer_config_obj, compute_config_obj, tuning_config_obj = config_objs
 
         if isinstance(tuning_config_obj, dict):
