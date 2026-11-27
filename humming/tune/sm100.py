@@ -29,6 +29,25 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         gemm_type: GemmType = GemmType.DENSE,
         use_m_major_input_scale: bool = False,
     ):
+        config = cls._get_default_config(
+            layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
+        )
+        if use_batch_invariant:
+            return config
+        decode_config = cls._select_decode_tile(layer_config, shape_m, config, use_f16_accum, gemm_type)
+        return config if decode_config is None else decode_config
+
+    @classmethod
+    def _get_default_config(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        use_f16_accum: bool,
+        use_batch_invariant: bool,
+        gemm_type: GemmType,
+        use_m_major_input_scale: bool,
+    ):
+        """The schedule before the decode tile is considered."""
         config = super().get_config(
             layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
         )
@@ -36,10 +55,6 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         warp_m = config["warp_shape"][0]
         if use_batch_invariant:
             return config
-
-        decode_config = cls._select_decode_tile(layer_config, shape_m, config, use_f16_accum, gemm_type)
-        if decode_config is not None:
-            return decode_config
 
         if block_m > 32:
             is_a16_fp32 = layer_config.a_dtype.num_bits == 16 and not use_f16_accum
@@ -198,41 +213,56 @@ class Sm100MmaHeuristics(Sm80Heuristics):
         use_f16_accum: bool,
         gemm_type: GemmType,
     ) -> dict | None:
-        """Give each CTA one whole output tile for decode-size W4A16 GEMMs on B200.
+        """Give each CTA one whole output tile for decode-size A16 GEMMs on B200.
 
         Stream-K's splits and fixups cost more than these layers take to stream
-        their weights: at M=1 a 4096x4096 int4 layer takes 10.1 us with Stream-K
-        and 6.4 us as one wave of 64-column tiles. Each data-parallel CTA reads
-        its whole K range, so the grid needs more than K / 128 tiles; narrower
-        layers keep Stream-K.
+        their weights: at M=1 a 4096x4096 layer takes 10.1 us with Stream-K and
+        6.4 us as one wave of 64-column tiles with int4 weights (FP8 10.6 and
+        7.0 us, NVFP4 10.0 and 6.0 us). Each data-parallel CTA reads its whole
+        K range, so the grid needs more than K / 128 tiles; narrower layers keep
+        Stream-K.
         """
         group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
         shape_n, shape_k = layer_config.shape_n, layer_config.shape_k
-        is_dense_w4a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
-        is_dense_w4a16 &= layer_config.b_dtype.num_bits == 4 and group_size == 128
+        b_dtype = layer_config.b_dtype
+        is_dense_a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        is_4bit_g128 = b_dtype.num_bits == 4 and group_size == 128
+        is_nvfp4 = b_dtype == dtypes.float4e2m1 and group_size == 16
+        is_fp8 = b_dtype == dtypes.float8e4m3
+        has_measured_weights = is_4bit_g128 or is_nvfp4 or is_fp8
         is_decode_size = (shape_m <= 16 and shape_k <= 8192) or (shape_m <= 32 and shape_k <= 5120)
+        if is_fp8:
+            # FP8 tiles carry twice the bytes of 4-bit tiles; block-scaled ones lost at K = 8192.
+            is_decode_size = shape_m <= 32 and shape_k <= 5120
         is_tile_aligned = shape_n % 64 == 0 and shape_k % 256 == 0
         # Measured on B200 only; SM103 and SM110 share this class.
         is_sm100 = layer_config.sm_version == 100
-        if not (is_sm100 and is_dense_w4a16 and is_decode_size and is_tile_aligned) or use_f16_accum:
+        is_measured_layer = is_sm100 and is_dense_a16 and has_measured_weights
+        if not (is_measured_layer and is_decode_size and is_tile_aligned) or use_f16_accum:
             return None
 
         num_sms = current_device.sm_count
         num_tiles = shape_n // 64
         if num_tiles * 128 <= shape_k:
             return None
+        # Wider layers share SMs between CTAs of four warps; FP8 gained there only at M <= 8.
+        can_share_sms = num_tiles <= 4 * num_sms and shape_m <= (8 if is_fp8 else 16)
+        num_shared_ctas = math.ceil(num_tiles / num_sms)
         if num_tiles <= num_sms:
             # One CTA per SM: eight warps, two along N and four along K.
-            num_ctas_per_sm, warp_k = 1, 64
-        elif shape_m <= 16 and num_tiles <= 4 * num_sms:
-            # Wider layers share SMs between CTAs of four warps, two along N and two along K.
-            num_ctas_per_sm, warp_k = math.ceil(num_tiles / num_sms), 128
+            num_ctas_per_sm, block_k, warp_n, warp_k = 1, 256, 32, 64
+        elif can_share_sms and not is_fp8:
+            # Two warps along N and two along K.
+            num_ctas_per_sm, block_k, warp_n, warp_k = num_shared_ctas, 256, 32, 128
+        elif can_share_sms and not cls._fills_stream_k_waves(config, shape_m, shape_n):
+            # FP8 halves the K tile to keep the weight bytes per stage and puts all four warps along K.
+            num_ctas_per_sm, block_k, warp_n, warp_k = num_shared_ctas, 128, 64, 32
         else:
             return None
 
         block_m = 8 if shape_m <= 8 else 16 if shape_m <= 16 else 32
-        block_shape = (block_m, 64, 256)
-        warp_shape = (block_m, 32, warp_k)
+        block_shape = (block_m, 64, block_k)
+        warp_shape = (block_m, warp_n, warp_k)
         for num_stages in range(6, 1, -1):
             smem_size = estimate_smem_size_layer(
                 layer_config,
@@ -253,6 +283,18 @@ class Sm100MmaHeuristics(Sm80Heuristics):
                     "num_sms": math.ceil(num_tiles / num_ctas_per_sm),
                 }
         return None
+
+    @staticmethod
+    def _fills_stream_k_waves(config: dict, shape_m: int, shape_n: int) -> bool:
+        """Whether Stream-K splits no tile: its tiles fill whole waves of resident CTAs.
+
+        FP8 layers like that already stream weights at about 5.8 TB/s on B200 and gained
+        nothing from 64-column tiles (Qwen2.5-7B gate_up, 37888x3584: 0.99-1.01x).
+        """
+        block_m, block_n, _ = config["block_shape"]
+        num_tiles = math.ceil(shape_m / block_m) * (shape_n // block_n)
+        resident_ctas = config["num_sms"] * config["num_ctas_per_sm"]
+        return config["use_stream_k"] and num_tiles % resident_ctas == 0
 
 
 class Sm100UmmaHeuristics(DeviceHeuristics):
