@@ -16,10 +16,9 @@ class ModeloptWeightSchema(BaseWeightSchema):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ModeloptWeightSchema":
-        algo_cls = cls
+        algo_cls: type[ModeloptWeightSchema] = cls
         if cls is ModeloptWeightSchema:
             quant_algo = config["quant_algo"].lower()
-            algo_cls: type[ModeloptWeightSchema]
             if quant_algo == "nvfp4":
                 algo_cls = ModeloptNvfp4WeightSchema
             elif quant_algo == "mxfp8":
@@ -28,7 +27,7 @@ class ModeloptWeightSchema(BaseWeightSchema):
                 raise ValueError(f"unsupported modelopt algo: {quant_algo}")
 
         kwargs = {}
-        for field in dataclasses.fields(cls):
+        for field in dataclasses.fields(algo_cls):
             name = field.name
             if name in config:
                 kwargs[name] = config[name]
@@ -180,7 +179,7 @@ class ModeloptMxfp8WeightSchema(ModeloptWeightSchema):
         return tensor_meta
 
     def infer_shape(self, tensors: dict[str, torch.Tensor]) -> tuple[int, int, int | None, bool]:
-        shape_n, shape_k = tensors["weight"].shape[:-2]
+        shape_n, shape_k = tensors["weight"].shape[-2:]
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
@@ -219,15 +218,18 @@ class ModeloptInputSchema(BaseInputSchema):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ModeloptInputSchema":
+        algo_cls: type[ModeloptInputSchema] = cls
         if cls is ModeloptInputSchema:
             quant_algo = config["quant_algo"].lower()
             if quant_algo == "nvfp4":
                 algo_cls = ModeloptNvfp4InputSchema
+            elif quant_algo == "mxfp8":
+                algo_cls = ModeloptMxfp8InputSchema
             else:
                 raise ValueError(f"unsupported modelopt algo: {quant_algo}")
 
         kwargs = {}
-        for field in dataclasses.fields(cls):
+        for field in dataclasses.fields(algo_cls):
             name = field.name
             if name in config:
                 kwargs[name] = config[name]
@@ -237,6 +239,8 @@ class ModeloptInputSchema(BaseInputSchema):
 
 @dataclasses.dataclass(kw_only=True)
 class ModeloptNvfp4InputSchema(ModeloptInputSchema):
+    quant_method: str = "modelopt"
+    quant_algo: str = "nvfp4"
     dynamic: bool = False
     num_bits: int = 4
     type: str = "float"
@@ -286,3 +290,43 @@ class ModeloptNvfp4InputSchema(ModeloptInputSchema):
             target_name=schema.static_tensor_scale_name,
         )
         return schema, output_tensors
+
+
+@dataclasses.dataclass(kw_only=True)
+class ModeloptMxfp8InputSchema(ModeloptInputSchema):
+    quant_method: str = "modelopt"
+    quant_algo: str = "mxfp8"
+    dynamic: bool = True
+    num_bits: int = 8
+    type: str = "float"
+    group_size: int = 32
+
+    def get_activation_bits(self) -> int:
+        return 8
+
+    def get_tensors_attrs(
+        self,
+        shape_k: int,
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        stack_size: int = 1,
+    ) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingInputSchema:
+        return HummingInputSchema(
+            a_dtype=dtypes.float8e4m3,
+            input_scale_group_size=32,
+            input_quant_mode=InputQuantizationMode.DynamicGroup,
+        )
+
+    def _convert_humming(
+        self,
+        tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
+        shape_k_stacks: list[int],
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        allow_inplace: bool = False,
+    ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
+        return self.to_humming_schema(param_dtype), {}
