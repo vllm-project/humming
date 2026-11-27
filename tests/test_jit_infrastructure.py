@@ -480,9 +480,7 @@ def test_background_nvrtc_build_skips_usable_precompiled_artifact(monkeypatch):
     from humming.utils import nvrtc
 
     monkeypatch.setenv("HUMMING_DISABLE_PARALLEL_BUILD", "0")
-    monkeypatch.setattr(
-        nvrtc, "_get_precompiled_nvrtc_compile_binary_path", lambda: Path("nvrtc_compile")
-    )
+    monkeypatch.setattr(nvrtc, "_get_precompiled_nvrtc_compile_binary_path", lambda: Path("nvrtc_compile"))
 
     def fail_if_spawned(*args, **kwargs):
         raise AssertionError("a usable precompiled NVRTC helper should skip the child process")
@@ -530,9 +528,7 @@ def test_nvrtc_compile_unicode_paths(tmp_path, unicode_library_path, emit_ptx):
         encoding="utf-8",
     )
     header.write_text("#define VALUE 1.0f\n", encoding="utf-8")
-    environment = {
-        name: value for name, value in os.environ.items() if not name.upper().startswith("CUDA")
-    }
+    environment = {name: value for name, value in os.environ.items() if not name.upper().startswith("CUDA")}
     environment["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
     result = subprocess.run(
         [
@@ -704,3 +700,177 @@ def test_compile_many_obeys_worker_limit(monkeypatch, limit):
     assert runtime.KernelRuntime.compile_many(specs, device=0) == list(range(5))
     assert worker_counts == ([] if limit == 1 else [min(limit, len(specs))])
     assert runtime.KernelRuntime.compile_many([], device=0) == []
+
+
+@pytest.mark.parametrize(
+    "sm_version,heuristic_use_pdl,requested_use_pdl,expected_use_pdl",
+    [
+        (100, False, None, False),
+        (100, False, True, True),
+        (100, False, False, False),
+        (90, False, True, True),
+        (120, True, None, True),
+        (120, True, False, False),
+        (89, False, True, False),
+    ],
+)
+def test_resolve_configs_propagates_use_pdl(
+    monkeypatch, mock_device_info, sm_version, heuristic_use_pdl, requested_use_pdl, expected_use_pdl
+):
+    from contextlib import nullcontext
+
+    from humming import device as device_module
+    from humming import dtypes
+    from humming.config import LayerConfig
+    from humming.device import DeviceInfo
+    from humming.kernel import humming as humming_kernel_module
+    from humming.kernel.humming import HummingKernel
+
+    monkeypatch.setattr(device_module, "_get_device_info_extension", lambda: mock_device_info)
+    monkeypatch.setattr(DeviceInfo, "_instances", {})
+    monkeypatch.setattr(device_module.current_device, "_value", None)
+    monkeypatch.setattr(DeviceInfo, "sm_version", property(lambda self: sm_version))
+    monkeypatch.setattr(humming_kernel_module, "get_device_index", lambda device=None: 0)
+    monkeypatch.setattr(humming_kernel_module.torch.cuda, "device", lambda device: nullcontext())
+
+    heuristic_entry = {
+        "block_shape": (128, 128, 64),
+        "warp_shape": (128, 32, 64),
+        "use_pdl": heuristic_use_pdl,
+    }
+    heuristic_intervals = [[0, 1 << 30, heuristic_entry]]
+    monkeypatch.setattr(
+        humming_kernel_module,
+        "get_heuristics_config",
+        lambda *args, **kwargs: heuristic_intervals,
+    )
+
+    layer_config = LayerConfig(
+        sm_version=sm_version,
+        shape_n=1024,
+        shape_k=1024,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+    ).to_str()
+
+    _, _, resolved_intervals = HummingKernel._resolve_configs(
+        layer_config, None, None, device=0, use_pdl=requested_use_pdl
+    )
+    assert resolved_intervals[0][2]["use_pdl"] is expected_use_pdl
+    assert heuristic_entry["use_pdl"] is heuristic_use_pdl
+
+    explicit_dict = {
+        "block_shape": (64, 128, 64),
+        "warp_shape": (64, 32, 64),
+        "use_pdl": heuristic_use_pdl,
+    }
+    _, _, resolved_dict = HummingKernel._resolve_configs(
+        layer_config, None, explicit_dict, device=0, use_pdl=requested_use_pdl
+    )
+    assert resolved_dict["use_pdl"] is expected_use_pdl
+    assert explicit_dict["use_pdl"] is heuristic_use_pdl
+
+
+def test_prepare_kernels_caches_use_pdl_separately(monkeypatch, mock_device_info):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from humming import device as device_module
+    from humming import dtypes
+    from humming.config import LayerConfig
+    from humming.device import DeviceInfo
+    from humming.kernel import humming as humming_kernel_module
+    from humming.kernel.humming import HummingKernel
+
+    monkeypatch.setattr(device_module, "_get_device_info_extension", lambda: mock_device_info)
+    monkeypatch.setattr(DeviceInfo, "_instances", {})
+    monkeypatch.setattr(device_module.current_device, "_value", None)
+    monkeypatch.setattr(DeviceInfo, "sm_version", property(lambda self: 100))
+    monkeypatch.setattr(humming_kernel_module, "get_device_index", lambda device=None: 0)
+    monkeypatch.setattr(humming_kernel_module.torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(HummingKernel, "_str2kernel_cache", {})
+
+    heuristic_intervals = [
+        [0, 1 << 30, {"block_shape": (128, 128, 64), "warp_shape": (128, 32, 64), "use_pdl": False}]
+    ]
+    monkeypatch.setattr(
+        humming_kernel_module,
+        "get_heuristics_config",
+        lambda *args, **kwargs: heuristic_intervals,
+    )
+
+    compiled_pdl_flags = []
+
+    def fake_compile_many(kernel_specs, device):
+        kernels = []
+        for _, config in kernel_specs:
+            flag = bool(config.get("use_pdl", False))
+            compiled_pdl_flags.append(flag)
+            kernels.append(SimpleNamespace(kernel_id=100 + int(flag)))
+        return kernels
+
+    monkeypatch.setattr(HummingKernel, "compile_many", staticmethod(fake_compile_many))
+
+    layer_config = LayerConfig(
+        sm_version=100,
+        shape_n=1024,
+        shape_k=1024,
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+    ).to_str()
+
+    default_configs = HummingKernel.prepare_kernels(layer_config, None, None, device=0, use_pdl=None)
+    pdl_configs = HummingKernel.prepare_kernels(layer_config, None, None, device=0, use_pdl=True)
+    no_pdl_configs = HummingKernel.prepare_kernels(layer_config, None, None, device=0, use_pdl=False)
+
+    assert int(default_configs[2]) == 100
+    assert int(pdl_configs[2]) == 101
+    assert int(no_pdl_configs[2]) == 100
+    assert compiled_pdl_flags == [False, True, False]
+
+
+@pytest.mark.parametrize("a_dtype_name", ["bfloat16", "int8"])
+@pytest.mark.parametrize("use_pdl", [None, False, True])
+def test_humming_forward_forwards_use_pdl(monkeypatch, a_dtype_name, use_pdl):
+    from humming import dtypes as humming_dtypes
+    from humming import forward as forward_module
+    from humming.config import LayerConfig
+
+    a_dtype = humming_dtypes.DataType.from_str(a_dtype_name)
+    config = LayerConfig(
+        sm_version=100,
+        shape_n=1024,
+        shape_k=1024,
+        a_dtype=a_dtype,
+        b_dtype=humming_dtypes.uint4,
+        c_dtype=humming_dtypes.bfloat16,
+        bs_dtype=humming_dtypes.bfloat16,
+    )
+
+    recorded = {}
+
+    def fake_may_process_input(*args, **kwargs):
+        recorded["input_use_pdl"] = kwargs["use_pdl"]
+        inputs = kwargs["inputs"]
+        return torch.empty_like(inputs, dtype=torch.int8), None, torch.ones((inputs.shape[0], 1))
+
+    def fake_humming_gemm(**kwargs):
+        recorded["gemm_use_pdl"] = kwargs["use_pdl"]
+        return torch.empty((kwargs["inputs"].shape[0], config.shape_n), dtype=torch.bfloat16)
+
+    monkeypatch.setattr(forward_module, "may_process_input", fake_may_process_input)
+    monkeypatch.setattr(forward_module.ops, "humming_gemm", fake_humming_gemm)
+
+    inputs = torch.zeros((4, 1024), dtype=torch.bfloat16)
+    weight = torch.zeros((1, 1), dtype=torch.int32)
+    forward_module.humming_forward(config, inputs, weight, use_pdl=use_pdl)
+
+    assert recorded["gemm_use_pdl"] is use_pdl
+    if a_dtype == humming_dtypes.int8:
+        assert recorded["input_use_pdl"] is use_pdl
+    else:
+        assert "input_use_pdl" not in recorded

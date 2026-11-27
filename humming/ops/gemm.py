@@ -25,6 +25,7 @@ def _prepare_kernels_op(
     layer_config: str,
     compute_config: str | None = None,
     tuning_config: str | None = None,
+    use_pdl: bool | None = None,
 ) -> torch.Tensor:
     device = device_guard.device
     if isinstance(device_guard, FakeTensor):
@@ -35,11 +36,12 @@ def _prepare_kernels_op(
                 compute_config,
                 tuning_config,
                 device,
+                use_pdl=use_pdl,
             )
         num_configs = len(tuning_obj) if isinstance(tuning_obj, list) else 1
         return torch.empty((num_configs * 4,), dtype=torch.int64, device="cpu")
 
-    return HummingKernel.prepare_kernels(layer_config, compute_config, tuning_config, device)
+    return HummingKernel.prepare_kernels(layer_config, compute_config, tuning_config, device, use_pdl=use_pdl)
 
 
 def humming_gemm(
@@ -63,6 +65,7 @@ def humming_gemm(
     locks: torch.Tensor | None = None,
     top_k: int = 1,
     valid_shape_m: int = 0,
+    use_pdl: bool | None = None,
 ) -> torch.Tensor:
     """Run GEMM with FP8 input group scales packed four per int32.
 
@@ -75,9 +78,11 @@ def humming_gemm(
             shape_n, output_dtype, is_indexed = _get_humming_gemm_output_meta(layer_config, compute_config)
             shape_m = inputs.size(0) * (top_k if is_indexed else 1)
             outputs = inputs.new_empty((shape_m, shape_n), dtype=output_dtype)
-        configs = torch.ops.humming.prepare_kernels(inputs, layer_config, compute_config, tuning_config)
+        configs = torch.ops.humming.prepare_kernels(
+            inputs, layer_config, compute_config, tuning_config, use_pdl
+        )
     else:
-        configs = _prepare_kernels_op(inputs, layer_config, compute_config, tuning_config)
+        configs = _prepare_kernels_op(inputs, layer_config, compute_config, tuning_config, use_pdl)
 
     return launch_kernel(
         configs=configs,
