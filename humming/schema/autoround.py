@@ -18,6 +18,7 @@ class AutoRoundWeightSchema(BaseWeightSchema):
     data_type: str = "int"
     packing_format: str = "auto_round:auto_gptq"
     act_bits: int = 16
+    checkpoint_format: str | None = None
 
     def __post_init__(self):
         fmt = self.packing_format
@@ -40,12 +41,16 @@ class AutoRoundWeightSchema(BaseWeightSchema):
                 zero_point=not self.sym,
             )
         elif "gptq" in fmt or "auto_round" in fmt:
-            # Covers auto_gptq / gptqmodel (gptqv2) and the native auto_round format,
-            # all of which serialize weights with the GPTQ packing layout.
+            # auto_gptq and native auto_round pack qzeros as (zp - 1) (GPTQ v1),
+            # whereas gptq_v2 stores true unsigned zero points directly.
+            fmt_lower = fmt.lower()
+            is_gptq_v2 = "gptq_v2" in fmt_lower or "gptqv2" in fmt_lower
+            checkpoint_format = self.checkpoint_format or ("gptq_v2" if is_gptq_v2 else "gptq")
             self._delegate = GPTQWeightSchema(
                 bits=self.bits,
                 group_size=self.group_size,
                 sym=self.sym,
+                checkpoint_format=checkpoint_format,
             )
         else:
             raise ValueError(f"unsupported autoround packing_format: {fmt!r}")
